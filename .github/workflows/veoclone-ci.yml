@@ -58,7 +58,7 @@ jobs:
             ffmpeg libvulkan1 mesa-vulkan-drivers
 
       # Same version as rust-toolchain.toml (which cargo would install anyway).
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt, clippy
 

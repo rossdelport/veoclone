@@ -605,6 +605,12 @@ main {
   max-width: 360px;
   margin-top: 4px;
 }
+.match-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
 .match-actions {
   display: flex;
   gap: 6px;
@@ -802,6 +808,9 @@ dialog {
   background: var(--surface);
   box-shadow: var(--shadow);
 }
+.dialog-wide {
+  width: min(580px, calc(100vw - 32px));
+}
 .dialog::backdrop,
 .drawer::backdrop {
   background: rgba(3, 6, 10, 0.65);
@@ -836,6 +845,30 @@ dialog {
 .form-section > .input,
 .lens-host {
   margin-top: 10px;
+}
+.field-label-small {
+  display: block;
+  font-weight: 650;
+  margin: 16px 0 6px;
+}
+.lens-picker > .field-label-small:first-child {
+  margin-top: 0;
+}
+.lens-picker .choice-grid {
+  margin-top: 0;
+}
+.lens-note:not(:empty) {
+  margin-top: 8px;
+}
+.dialog-text > p + .lens-picker,
+.dialog-text > .lens-picker + p {
+  margin-top: 14px;
+}
+.fix-picture h2 {
+  font-size: 17px;
+}
+.fix-picture .row {
+  margin-top: 12px;
 }
 .zones {
   display: grid;
@@ -1330,7 +1363,8 @@ body.editor-mode #page {
 .side-section > p.muted {
   margin-bottom: 10px;
 }
-.editor-side > .notice {
+.editor-side > .notice,
+.editor-notes > .notice {
   margin: 12px 18px;
 }
 .overview-box {

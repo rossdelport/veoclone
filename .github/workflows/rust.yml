@@ -1,10 +1,8 @@
 name: Rust CI
 
+# Upstream Reco workflow: in VeoClone it only runs by hand (VeoClone's own are veoclone-*.yml).
 on:
-  push:
-    branches: [v2, main, v2-consolidation]
-  pull_request:
-    branches: [v2, main]
+  workflow_dispatch:
 
 # Restrict default permissions to read-only. Jobs that need more
 # declare their own permissions block.

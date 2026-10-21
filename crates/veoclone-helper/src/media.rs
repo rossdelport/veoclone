@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -56,9 +56,9 @@ fn find_tool(name: &str) -> Option<PathBuf> {
     next_to_exe.into_iter().chain(on_path).find(|p| p.is_file())
 }
 
-/// A `Command` that never opens a console window on Windows.
+/// A `Command` that never opens a console window on Windows. Start it
+/// with [`spawn`] or [`output`].
 pub fn command(program: &Path) -> Command {
-    #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
@@ -66,8 +66,86 @@ pub fn command(program: &Path) -> Command {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // Killed when the thread that started it ends; that is the job
+        // thread, which only ends with VeoClone itself.
+        // SAFETY: prctl is async-signal-safe, as pre_exec requires.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+    }
     cmd.stdin(Stdio::null());
     cmd
+}
+
+/// Start a tool so that it stops when VeoClone stops, even when VeoClone
+/// crashes or its window is closed. Otherwise a long ffmpeg run would go on
+/// for many minutes and keep its files locked for the next try.
+pub fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
+    let child = cmd.spawn()?;
+    #[cfg(windows)]
+    stop_with_veoclone(&child);
+    Ok(child)
+}
+
+/// Like `Command::output`, started with [`spawn`].
+pub fn output(cmd: &mut Command) -> std::io::Result<Output> {
+    spawn(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))?.wait_with_output()
+}
+
+/// Put the child into a Windows job object that ends everything in it when
+/// its last handle closes, which happens when VeoClone ends in any way.
+#[cfg(windows)]
+fn stop_with_veoclone(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    struct Job(HANDLE);
+    // SAFETY: a job handle may be used from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    static JOB: OnceLock<Option<Job>> = OnceLock::new();
+    // SAFETY: plain Win32 calls; `info` outlives the call that reads it.
+    let job = JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast(),
+            std::mem::size_of_val(&info) as u32,
+        );
+        if ok == 0 {
+            CloseHandle(job);
+            return None;
+        }
+        Some(Job(job))
+    });
+    if let Some(job) = job {
+        // SAFETY: both handles are open for the duration of the call.
+        if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) } == 0 {
+            log::warn!(
+                "Could not tie a tool to VeoClone: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -76,18 +154,19 @@ pub fn command(program: &Path) -> Command {
 
 /// Run ffprobe on one file.
 pub fn probe(tools: &Tools, path: &Path) -> Result<ProbeInfo, String> {
-    let out = command(tools.ffprobe()?)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-show_format",
-        ])
-        .arg(path)
-        .output()
-        .map_err(|e| format!("could not run ffprobe: {e}"))?;
+    let out = output(
+        command(tools.ffprobe()?)
+            .args([
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-show_format",
+            ])
+            .arg(path),
+    )
+    .map_err(|e| format!("could not run ffprobe: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -217,7 +296,33 @@ pub fn check_pair(left: &ProbeInfo, right: &ProbeInfo) -> Result<Vec<String>, St
     if left.fps.as_f64() > 31.0 {
         warnings.push("60 fps works but 30 fps is recommended.".into());
     }
+    if frames_missing(left) || frames_missing(right) {
+        warnings.push(
+            "One phone's video has missing or slowed-down frames (usually the iPhone's \
+             low-light setting). The two halves may drift apart during the match. Next time \
+             turn off Settings › Camera › Record Video › Auto FPS (called Auto Low Light FPS \
+             on older iPhones)."
+                .into(),
+        );
+    }
+    if !left.has_audio || !right.has_audio {
+        warnings.push(
+            "One video has no sound, so the two videos could not be lined up by their sound. \
+             If players look doubled or cut off at the join, start both phones at the same \
+             moment next time."
+                .into(),
+        );
+    }
     Ok(warnings)
+}
+
+/// The phone recorded fewer (or more) frames than its length and frame rate
+/// promise: dropped frames, or stretches at a lower rate (iPhone Auto FPS in
+/// dim light). Frames are paired by count, so the cameras drift apart. A
+/// few dropped frames are below the limit on purpose.
+fn frames_missing(p: &ProbeInfo) -> bool {
+    let expected = p.duration * p.fps.as_f64();
+    p.duration > 0.0 && (p.frame_count as f64 - expected).abs() > (0.002 * expected).max(15.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -244,12 +349,13 @@ pub fn run_ffmpeg(
     mut on_frame: impl FnMut(u64),
 ) -> Result<(), RunError> {
     log::info!("ffmpeg {}", args.join(" "));
-    let mut child = command(ffmpeg)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| RunError::Failed(format!("could not start ffmpeg: {e}")))?;
+    let mut child = spawn(
+        command(ffmpeg)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|e| RunError::Failed(format!("could not start ffmpeg: {e}")))?;
 
     let frames = Arc::new(AtomicU64::new(0));
     let stdout = child.stdout.take().expect("piped");
@@ -309,9 +415,7 @@ fn tail(s: &str, max: usize) -> String {
 
 /// Encoders compiled into this ffmpeg (`ffmpeg -encoders`).
 pub fn has_encoder(ffmpeg: &Path, name: &str) -> bool {
-    command(ffmpeg)
-        .args(["-hide_banner", "-encoders"])
-        .output()
+    output(command(ffmpeg).args(["-hide_banner", "-encoders"]))
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .split_whitespace()
@@ -373,9 +477,13 @@ pub fn proxy_args(plan: &ProxyPlan, encoder: Encoder, hwaccel: bool) -> Vec<Stri
         }
         push(&["-i", &input.to_string_lossy()]);
     }
+    // `setparams` labels the input BT.709 like Reco treats it, so ffmpeg
+    // 7's `scale` does not convert HDR (BT.2020) colours that Reco's export
+    // keeps as they are: the preview then shows the export's colours.
     let tile = |input: u32, skip: u64, label: &str| {
         format!(
             "[{input}:v]trim=start_frame={skip},setpts=N/({fps})/TB,\
+             setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
              scale={w}:{h}:flags=bicubic,setsar=1,format=yuv420p[{label}]"
         )
     };
@@ -459,21 +567,22 @@ pub fn make_proxy(
 
 /// Number of video frames in a file (packet count, fast).
 pub fn count_frames(tools: &Tools, path: &Path) -> Option<u64> {
-    let out = command(tools.ffprobe().ok()?)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-count_packets",
-            "-show_entries",
-            "stream=nb_read_packets",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
+    let out = output(
+        command(tools.ffprobe().ok()?)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path),
+    )
+    .ok()?;
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
@@ -602,7 +711,7 @@ mod tests {
             width: w,
             height: h,
             fps: Fps { num: fps, den: 1 },
-            frame_count: 100,
+            frame_count: fps as u64 * 10,
             duration: 10.0,
             codec: "h264".into(),
             pixel_format: "yuv420p".into(),
@@ -625,6 +734,22 @@ mod tests {
         let mut hdr = a.clone();
         hdr.color_transfer = Some("smpte2084".into());
         assert!(check_pair(&hdr, &a).unwrap()[0].contains("HDR"));
+
+        // 90 minutes where 10 were filmed at 24 instead of 30 fps.
+        let mut long = a.clone();
+        long.duration = 5400.0;
+        long.frame_count = 162_000;
+        assert!(check_pair(&long, &long).unwrap().is_empty());
+        let mut slowed = long.clone();
+        slowed.frame_count = 162_000 - 3600;
+        assert!(check_pair(&slowed, &long).unwrap()[0].contains("Auto FPS"));
+        // A couple of dropped frames are fine.
+        slowed.frame_count = 162_000 - 3;
+        assert!(check_pair(&slowed, &long).unwrap().is_empty());
+
+        let mut silent = a.clone();
+        silent.has_audio = false;
+        assert!(check_pair(&a, &silent).unwrap()[0].contains("no sound"));
     }
 
     #[test]
@@ -652,7 +777,9 @@ mod tests {
         let a = proxy_args(&plan, Encoder::X264, true).join(" ");
         assert!(a.contains("-hwaccel auto -i L.mov -hwaccel auto -i R.mov"));
         assert!(a.contains(
-            "[0:v]trim=start_frame=0,setpts=N/(30/1)/TB,scale=1280:720:flags=bicubic,setsar=1,format=yuv420p[l]"
+            "[0:v]trim=start_frame=0,setpts=N/(30/1)/TB,\
+             setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+             scale=1280:720:flags=bicubic,setsar=1,format=yuv420p[l]"
         ));
         assert!(a.contains("[1:v]trim=start_frame=12,"));
         assert!(a.contains("[l][r]vstack=inputs=2[v]"));

@@ -30,8 +30,9 @@ internet, not even when you use the online editor.
 - **Plenty of free disk space**: about 40 GB for each full match. Phone videos
   are big.
 - **Google Chrome or Microsoft Edge.** The editor runs in your web browser.
-- **Two iPhones with an ultra wide (0.5×) lens** (iPhone 11 or newer). The
-  same model on both sides is best.
+- **Two iPhones with an ultra wide (0.5×) lens** (iPhone 11 or newer, but not
+  the iPhone 16e or iPhone Air, which have no 0.5× lens). The same model on
+  both sides is best.
 - **Something to hold both phones side by side, up high**: a tall tripod or
   pole with a mount for two phones. The higher, the better.
 - Power banks for both phones, and enough free space on each phone (about
@@ -40,6 +41,11 @@ internet, not even when you use the online editor.
 ## One-time setup
 
 1. **Download** [VeoClone-windows.zip](https://github.com/rossdelport/veoclone/releases/download/helper-latest/VeoClone-windows.zip).
+   - If Chrome or Edge says the file **isn't commonly downloaded** (or blocks
+     it), press **Ctrl + J** to open the list of downloads, find
+     VeoClone-windows.zip and choose **Keep** (Chrome may call it **Download
+     suspicious file**; Edge may ask again: **Show more › Keep anyway**).
+     Browsers say this about files that few people have downloaded yet.
    - If that link doesn't work yet, open the
      [VeoClone Windows builds](https://github.com/rossdelport/veoclone/actions/workflows/veoclone-windows.yml)
      page, click the newest run with a green tick, scroll down to
@@ -53,10 +59,13 @@ internet, not even when you use the online editor.
    (it may just show as "VeoClone").
 4. The first time, Windows may say **"Windows protected your PC"**. Click
    **More info**, then **Run anyway**. Windows says this about programs it
-   doesn't know yet; you only need to do it once.
+   doesn't know yet; you only need to do it once. (If Windows instead says
+   **"Part of this app has been blocked"** or mentions **Smart App Control**,
+   see [If something goes wrong](#if-something-goes-wrong).)
 5. A black window opens, and then your browser opens the VeoClone editor.
    **Keep the black window open while you use VeoClone.** Closing it stops
-   VeoClone (it is fine to minimise it).
+   VeoClone (it is fine to minimise it). The black window also shows the
+   folder where your matches are saved.
 6. If Chrome or Edge asks for permission to **connect to devices or apps on
    your network or this computer**, click **Allow**. VeoClone only talks to
    your own PC.
@@ -70,7 +79,9 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
 
 - Choose **4K at 30 fps**.
 - Switch **HDR Video off**. Otherwise the colours look washed out.
-- If you see **Auto FPS**, set it to **Off**.
+- Set **Auto FPS** to **Off** (on older iPhones: switch **Auto Low Light
+  FPS** off). Otherwise the phones film fewer frames when the light is dim,
+  for example under floodlights, and the two halves slowly drift apart.
 - If you see **Lock Camera**, switch it **on** (the phone then keeps the same
   lens all the time).
 
@@ -112,30 +123,38 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
 1. **Start VeoClone** (double-click VeoClone.exe). The editor opens in your
    browser. At the top right it should say **Connected**.
 2. Click **New match** and type a name, for example "U12s v Rovers".
-3. **Which iPhone filmed this?** Pick your iPhone model with the **Ultra Wide
-   (0.5×)** lens. If yours isn't listed, pick the closest older model, or
-   leave it on **Not sure (automatic)**.
-4. **Camera style**: **Broadcast** (calm, like TV; best for most matches),
+3. Drag the left phone's video onto **Left phone** and the right phone's video
+   onto **Right phone** (or click a box to choose the file). Left and right
+   are as seen from behind the phones, facing the pitch. Mixed them up?
+   Click **Swap left and right**.
+4. **Which iPhone and lens filmed this?** Under **Which iPhone?** pick your
+   iPhone model. Under **Which lens?** pick **Ultra wide (0.5×)** if you
+   tapped 0.5× when filming (as this guide says), otherwise **Normal (1×)**.
+   If you don't know the model, or it isn't in the list, leave it on **Not
+   sure**. You can change this later.
+5. **Camera style**: **Broadcast** (calm, like TV; best for most matches),
    **Action** (follows the ball more closely) or **Wide** (keeps all the
    players in the picture). You can change it later.
-5. Drag the left phone's video onto **Left phone** and the right phone's video
-   onto **Right phone** (or click a box to choose the file). Mixed them up?
-   Click **Swap left and right**.
 6. Click **Start**. Keep the page open until both videos have been sent to
    VeoClone. Then VeoClone works through four steps: checking the videos,
    lining them up and joining them, making a preview, and AI ball tracking.
    This takes a while: for a full match, allow an hour or more. You can leave
-   the page, but keep the black VeoClone window open and **don't let the PC go
-   to sleep** (Settings › System › Power).
-7. When it says **Your match is ready**, click **Open the editor**.
+   the page, but **keep the black VeoClone window open**. VeoClone keeps the
+   PC awake while it works (the screen may still turn off). On a laptop,
+   keep it plugged in and the lid open.
+7. When it says **Your match is ready**, click **Open the editor**. If
+   VeoClone noticed something you should know (for example washed-out
+   colours, or the two videos didn't line up well), it says so under **Good
+   to know**, on this page and in the editor.
 
 **In the editor:**
 
 - The big picture is the **camera view**: what your video will look like.
-- The strip under it shows the **whole pitch**. The box shows where the camera
-  is pointing. Click or drag in it to point the camera somewhere else.
-- You can also drag inside the camera view to move the camera, and use the
-  mouse wheel to zoom.
+- On the right, the **Whole pitch** picture shows the whole pitch (on a small
+  screen it is below the timeline). The blue box shows where the camera is pointing.
+  Click or drag in it to point the camera somewhere else.
+- You can also drag inside the camera view to move the camera, and scroll
+  the mouse wheel there to zoom in or out at that moment.
 - Each time you move the camera, VeoClone adds a **fix**: the camera keeps your
   view around that moment, then eases back to the AI. **How long a fix lasts**
   sets how long it stays.
@@ -145,6 +164,11 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
   removes a part, for example half-time.
 - **Zoom** makes the whole video wider or closer. **Smoothness** calms down
   quick camera moves.
+- A **Good to know** box at the top right lists anything VeoClone noticed
+  while processing. Click **×** to hide it.
+- Picture bent, or the two halves don't join? Click **Change phone or lens**
+  (under **Camera** on the right). See
+  [If something goes wrong](#if-something-goes-wrong).
 - Keyboard: **Space** play/pause, **← →** one frame, **Shift + ← →** five
   seconds, **K** add a fix with the current view, **Ctrl + Z** undo.
 - Your changes are saved by themselves.
@@ -154,18 +178,25 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
 1. Click **Export**.
 2. Choose the size (**1080p** is recommended and plays everywhere; 1440p and
    4K are sharper but bigger and slower to make) and the quality.
-3. Click **Make video** and wait until it is finished.
+3. Click **Make video** and wait until it is finished. You can keep editing
+   meanwhile. Keep the black VeoClone window open.
 4. Click **Download**, or **Show in folder** to open the folder with your
    video.
 
 ## Where your files are kept
 
-- Everything VeoClone makes is in your **Videos** folder, in
-  **Videos\VeoClone**. Each match has its own folder inside
-  **Videos\VeoClone\projects**, with VeoClone's own copy of the two phone
-  videos, the preview and your finished videos (in the **exports** folder).
-  The match folders have code names, so the easiest way to find a finished
-  video is the **Show in folder** button in the editor.
+- Everything VeoClone makes is in one folder. The black VeoClone window
+  shows it when it starts ("Your matches are saved in …"). Usually it is
+  **Videos\VeoClone**. If OneDrive backs up your Videos folder, VeoClone uses
+  a **VeoClone** folder in your user folder instead (for example
+  **C:\Users\Sam\VeoClone**), so that tens of gigabytes per match aren't
+  uploaded to OneDrive. (If you already have a Videos\VeoClone folder,
+  VeoClone keeps using it.)
+- Each match has its own folder inside the **projects** folder there, with
+  VeoClone's own copy of the two phone videos, the preview and your finished
+  videos (in the **exports** folder). The match folders have code names, so
+  the easiest way to find a finished video is the **Show in folder** button
+  in the editor.
 - **To free up space**, delete matches you don't need any more on the
   VeoClone home page. This deletes VeoClone's copy of the phone videos **and
   the finished videos of that match**, so download or copy the videos you want
@@ -187,7 +218,19 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
 - If the black window says VeoClone **is already running**, another
   VeoClone window is open somewhere. Use that one, or restart the PC.
 
-**The AI is very slow, or it says "AI ready (slower: no graphics card)"**
+**Windows says "Part of this app has been blocked", or mentions Smart App Control**
+- Smart App Control is a Windows 11 setting that blocks programs Windows
+  doesn't know yet, and it has no "Run anyway" button. VeoClone is new and
+  not signed by a big company, so it can be blocked.
+- The only way round it is to switch Smart App Control off: open **Start**,
+  type **Smart App Control** and open **Smart App Control settings**, then
+  choose **Off**. Then double-click VeoClone.exe again (and click **More
+  info › Run anyway** if Windows asks).
+- On some versions of Windows 11, Smart App Control can't be switched back
+  on afterwards. Your PC is still protected by Microsoft Defender (Windows
+  Security).
+
+**The AI is very slow, or it says "AI on the main processor (slow)"**
 - VeoClone could not use your graphics card for the AI and is using the main
   processor instead, which is much slower. Update your graphics card driver
   (AMD Software: Adrenalin Edition, or the NVIDIA app), restart the PC and
@@ -202,23 +245,38 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
   the next match (Settings › Camera › Record Video).
 
 **The picture looks bent or warped, or the two halves don't join well**
-- The wrong iPhone model may be selected. Make a new match with the same two
-  videos and pick the right model (with the 0.5× Ultra Wide lens) under
-  **Which iPhone filmed this?**
-- Check that both phones used the 0.5× lens, the same settings, and did not
-  move during the match.
+- The wrong iPhone or lens may be selected. Click **Change phone or lens**
+  (in the editor under **Camera**, or on the match page), pick the iPhone
+  model and the lens that filmed the match, and click **Process again**.
+  VeoClone processes the match again with the videos it already has. This
+  takes about as long as the first time, and the editor can't be used
+  meanwhile. Your trims and fixes are kept.
+- Check that both phones used the same lens and the same settings, and did
+  not move during the match.
+
+**"We couldn't line up the two videos", or the two halves are in the wrong place**
+- The left and right videos may be the wrong way round. Click **Swap left
+  and right and try again** (on the match page after processing, it is
+  **Swap left and right**). Nothing is sent to VeoClone again.
 
 **The videos are not lined up (things jump where the two halves meet)**
 - VeoClone lines the videos up using their sound. Next time, start both
   phones closer together (within a few seconds) and clap near both phones
   just after you start. Make sure nothing covers the microphones.
+- If the two halves are fine at the start but drift apart later, one phone
+  probably had **Auto FPS** on (VeoClone then says so under **Good to
+  know**). Set it to **Off** before the next match (Settings › Camera ›
+  Record Video).
 
 **Processing stopped half-way**
-- If the PC went to sleep or the black window was closed, open the match and
-  press **Try again**.
+- If the PC was switched off or restarted, or the black window was closed,
+  open the match and press **Try again**.
+- If the match was ready before (for example you were changing the camera
+  style), VeoClone keeps the earlier result, so you can go on editing.
 
 **Still stuck?** The black VeoClone window shows what it is doing, and each
-match folder has a **log.txt** file. Please include it when you ask for help.
+match folder (see [Where your files are kept](#where-your-files-are-kept))
+has a **log.txt** file. Please include it when you ask for help.
 
 ## Online editor or local editor?
 
@@ -277,11 +335,15 @@ cd web && npm run typecheck && npm test && npm run test:ui
 - `veoclone-ci.yml`: editor typecheck, tests and build; helper fmt, clippy
   and tests (every push and pull request).
 - `veoclone-windows.yml`: builds the Windows folder (VeoClone.exe, FFmpeg,
-  ONNX Runtime + DirectML, models, editor) and smoke-tests it. Pushes to
-  `main` update the `helper-latest` pre-release; a `veoclone-v*` tag makes a
-  normal release.
+  ONNX Runtime + DirectML, models, editor) and smoke-tests it. Pushes to the
+  repository's default branch (whatever it is called; today
+  `claude/happy-einstein-iqtkqs`) update the `helper-latest` pre-release in
+  place; a `veoclone-v*` tag makes a normal release.
 - `veoclone-pages.yml`: publishes the editor to GitHub Pages on pushes to
-  `main`.
+  the default branch. One-time click first: Settings › Pages › Source:
+  **GitHub Actions**.
+- Reco's own workflows (`rust.yml`, `release.yml`, `build-test.yml`,
+  `test-build-gui.yml`) only run by hand here.
 
 ## Credits and licence
 

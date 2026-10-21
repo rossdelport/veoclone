@@ -291,11 +291,14 @@ impl FfmpegFileSource {
                     }
                 };
                 if let Some(secs) = seek_secs {
-                    if let Err(e) = dec.seek_to_secs(secs) {
+                    // FFmpeg seeks to the nearest keyframe BEFORE the given
+                    // time, judged by the container index (decode times,
+                    // which can be later than the frames' own times). A
+                    // second early, that keyframe is surely before the target.
+                    if let Err(e) = dec.seek_to_secs((secs - 1.0).max(0.0)) {
                         log::error!("{label} seek to {secs:.1}s failed: {e}");
                         return;
                     }
-                    // FFmpeg seeks to the nearest keyframe BEFORE the target.
                     // Decode and discard frames until we reach the target PTS.
                     let target_us = (secs * 1_000_000.0) as i64;
                     let mut skipped = 0u32;
@@ -470,7 +473,11 @@ impl reco_core::source::FrameSource for FfmpegFileSource {
             }
         }
 
-        let secs = frame as f64 / self.info.fps;
+        // Half a frame early: phone videos put frames slightly off the exact
+        // `n / fps` grid (variable frame rate), so frame `n` may start a tick
+        // before `n / fps`. Frames are counted from here on, so landing one
+        // frame late would shift everything after a seek.
+        let secs = (frame as f64 - 0.5).max(0.0) / self.info.fps;
         log::debug!("Seeking to frame {frame} ({secs:.1}s)");
         // Drop old receiver - disconnects current decode threads which
         // exit on the next send() failure. Spawns fresh decoders that

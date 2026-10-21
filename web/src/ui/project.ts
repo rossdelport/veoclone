@@ -1,12 +1,13 @@
 // Processing view (#/project/:id): steps with progress, warnings, errors,
 // cancel / try again, and adding missing videos.
-import { api, watchProject, type ApiError, type JobStep, type Lens, type ProjectMeta, type Side, type Upload } from "../api";
-import { button, confirmDialog, describeError, errorBox, notice, progressBar, toast } from "./common";
+import { api, watchProject, type ApiError, type JobInfo, type JobStep, type ProjectMeta, type Side, type Style, type Upload } from "../api";
+import { button, confirmDialog, describeError, errorBox, notice, progressBar, setProgress, toast } from "./common";
 import { formatBytes, formatTimeLeft, h, icon, setChildren } from "./dom";
 import { dropZone, assignFiles, type DropZone } from "./dropzone";
 import { currentHealth } from "./health";
 import { I } from "./icons";
-import { lensSelect, sendVideos, stylePicker, STYLES } from "./newMatch";
+import { changeLens, lensOptions, lensPicker, lensUnavailable } from "./lens";
+import { sendVideos, slowAiNotice, stylePicker, STYLES } from "./newMatch";
 import type { Page, PageContext } from "./page";
 
 const STEPS: { step: JobStep; name: string; text: string }[] = [
@@ -70,11 +71,14 @@ export function projectPage(ctx: PageContext, id: string): Page {
   let sawWork = false; // watched it process, so open the editor when done
   let lastStep: JobStep | null = null; // to show which step failed
   let openTimer = 0;
-  let lenses: Lens[] | null = null;
   let upload: Upload | null = null;
   let uploading = false;
-  let forceSetup = false; // "Choose other videos" after a failure
+  let forceSetup = false; // "Change videos or phone" after a failure
   let mode = "";
+  let shown = ""; // what the page shows now (see render)
+  let live: ((p: ProjectMeta) => void) | null = null; // moves the progress bar without a rebuild
+  let restyleOpen = false;
+  let newStyle: Style | null = null;
   const stepClock = { key: "", start: 0 };
 
   // Re-built only when the kind of view changes, so inputs keep their state.
@@ -103,19 +107,39 @@ export function projectPage(ctx: PageContext, id: string): Page {
     },
   );
 
-  function render() {
+  function render(force = false) {
     const p = project!;
     const working = p.status === "processing" || p.status === "queued";
     const next = uploading ? "upload" : working ? "work" : forceSetup ? "setup" : p.status;
     if (next !== mode) {
       mode = next;
       zones = null;
+      restyleOpen = false;
+      newStyle = null;
     }
     if (uploading) return;
+    // Rebuild only when something on the page changes, so open boxes, choices
+    // and the button under the mouse survive the polls; progress moves in place.
+    const key = JSON.stringify([mode, p.status, p.job?.kind, p.job?.step, p.job?.startedAt, p.error, p.warnings, p.calibration, p.style, p.lensId, p.files, p.exports.map((e) => e.status), currentHealth()?.ai.provider]);
+    if (key === shown && !force) return live?.(p);
+    shown = key;
+    live = null;
     if (working) return renderWork(p);
     if (p.status === "ready") return renderReady(p);
     if ((p.status === "failed" || p.status === "cancelled") && !forceSetup) return renderStopped(p);
     return renderSetup(p);
+  }
+
+  /** "45% · about 3 minutes left · 1,200 of 162,000 frames" */
+  function progressText(job: JobInfo): string {
+    const key = `${job.startedAt}/${job.step}`;
+    if (stepClock.key !== key) Object.assign(stepClock, { key, start: performance.now() });
+    let eta = job.etaSeconds;
+    const elapsed = (performance.now() - stepClock.start) / 1000;
+    // Our own guess only for steps that count frames (others move in jumps).
+    if (eta === undefined && job.framesTotal && job.progress > 0.03 && elapsed > 3) eta = (elapsed / job.progress) * (1 - job.progress);
+    const frames = job.framesTotal ? `${(job.framesDone ?? 0).toLocaleString()} of ${job.framesTotal.toLocaleString()} frames` : "";
+    return [`${Math.round(job.progress * 100)}%`, formatTimeLeft(eta), frames].filter(Boolean).join(" · ");
   }
 
   function stepList(p: ProjectMeta, failed = false): HTMLElement {
@@ -127,33 +151,24 @@ export function projectPage(ctx: PageContext, id: string): Page {
       { class: "steps" },
       STEPS.map((s, i) => {
         const state = i < activeIndex ? "done" : i === activeIndex ? (failed ? "failed" : "active") : "waiting";
+        const text = h("span", { class: "muted small" }, state === "active" && job?.message ? job.message : s.text);
         let extra: HTMLElement | null = null;
         if (state === "active" && job) {
-          const key = `${job.startedAt}/${job.step}`;
-          if (stepClock.key !== key) Object.assign(stepClock, { key, start: performance.now() });
-          let eta = job.etaSeconds;
-          const elapsed = (performance.now() - stepClock.start) / 1000;
-          // Our own guess only for steps that count frames (others move in jumps).
-          if (eta === undefined && job.framesTotal && job.progress > 0.03 && elapsed > 3) eta = (elapsed / job.progress) * (1 - job.progress);
-          const frames = job.framesTotal ? `${(job.framesDone ?? 0).toLocaleString()} of ${job.framesTotal.toLocaleString()} frames` : "";
-          extra = h(
-            "div",
-            { class: "step-progress" },
-            progressBar(job.progress, s.name),
-            h("p", { class: "small muted" }, [`${Math.round(job.progress * 100)}%`, formatTimeLeft(eta), frames].filter(Boolean).join(" · ")),
-          );
+          const bar = progressBar(job.progress, s.name);
+          const line = h("p", { class: "small muted" }, progressText(job));
+          extra = h("div", { class: "step-progress" }, bar, line);
+          live = (q) => {
+            if (q.job?.kind !== "process") return;
+            setProgress(bar, q.job.progress);
+            line.textContent = progressText(q.job);
+            text.textContent = q.job.message || s.text;
+          };
         }
         return h(
           "li",
           { class: `step step-${state}`, "data-step": s.step },
           h("span", { class: "step-icon" }, state === "done" ? icon(I.check, 16) : state === "failed" ? icon(I.x, 16) : String(i + 1)),
-          h(
-            "div",
-            { class: "step-body" },
-            h("strong", null, s.name),
-            h("span", { class: "muted small" }, state === "active" && job?.message ? job.message : s.text),
-            extra,
-          ),
+          h("div", { class: "step-body" }, h("strong", null, s.name), text, extra),
         );
       }),
     );
@@ -179,12 +194,23 @@ export function projectPage(ctx: PageContext, id: string): Page {
         h(
           "div",
           { class: "card-head" },
-          h("div", null, h("h2", null, queued ? "Waiting to start…" : "Processing your match"), h("p", { class: "muted" }, queued ? "VeoClone will start as soon as it has finished its current job." : "You can leave this page; VeoClone keeps working as long as its window is open.")),
-          button("Cancel", () => void cancel(), { variant: "ghost", icon: I.x }),
+          h(
+            "div",
+            null,
+            h("h2", null, queued ? "Waiting to start…" : "Processing your match"),
+            h(
+              "p",
+              { class: "muted" },
+              queued ? "VeoClone will start as soon as it has finished its current job. " : "",
+              "Keep the black VeoClone window open. Your PC won't go to sleep while VeoClone is working (the screen may turn off). You can leave this page.",
+            ),
+          ),
+          button("Stop", () => void cancel(), { variant: "ghost", icon: I.x }),
         ),
         stepList(p),
         diskInfo(p),
       ),
+      currentHealth()?.ai.provider === "CPU" ? slowAiNotice() : null,
       warnings(p),
     );
   }
@@ -194,20 +220,21 @@ export function projectPage(ctx: PageContext, id: string): Page {
     const syncText =
       c && c.syncOffsetFrames !== 0
         ? `The ${c.syncOffsetFrames > 0 ? "right" : "left"} phone started ${Math.abs(c.syncOffsetSeconds).toFixed(1)} s before the other one.`
-        : "Both phones started at the same moment.";
+        : "No time difference found between the two phones.";
     const quality = c ? (c.confidence >= 0.8 ? "Very good" : c.confidence >= 0.5 ? "Good" : "Poor – check the result carefully") : "";
     const exporting = p.job?.kind === "export";
-    let newStyle = p.style;
+    // Straight on to the editor after watching it process, unless there is something to read first.
+    const autoOpen = sawWork && !p.warnings.length && (c?.confidence ?? 1) >= 0.5;
     const rerun = h(
       "details",
-      { class: "card rerun" },
+      { class: "card rerun", open: restyleOpen, onToggle: () => (restyleOpen = rerun.open) },
       h("summary", null, h("strong", null, "Change the camera style"), h("span", { class: "muted small" }, " – runs the AI again")),
       h("p", { class: "muted small" }, "Your trims and camera fixes are kept. This takes about as long as the first time."),
-      stylePicker(p.style, (s) => (newStyle = s), "restyle"),
+      stylePicker(newStyle ?? p.style, (s) => (newStyle = s), "restyle"),
       h(
         "div",
         { class: "row" },
-        button("Run the AI again", () => void restyle(newStyle), { variant: "secondary", icon: I.refresh }),
+        button("Run the AI again", () => void restyle(newStyle ?? p.style), { variant: "secondary", icon: I.refresh }),
       ),
     );
     setChildren(
@@ -215,7 +242,7 @@ export function projectPage(ctx: PageContext, id: string): Page {
       h(
         "section",
         { class: "card ready-card" },
-        h("div", { class: "ready-head" }, h("span", { class: "ready-icon" }, icon(I.check, 28)), h("div", null, h("h2", null, "Your match is ready"), h("p", { class: "muted" }, sawWork ? "Opening the editor…" : "Fix the camera, trim the video, then export it."))),
+        h("div", { class: "ready-head" }, h("span", { class: "ready-icon" }, icon(I.check, 28)), h("div", null, h("h2", null, "Your match is ready"), h("p", { class: "muted" }, autoOpen ? "Opening the editor…" : "Fix the camera, trim the video, then export it."))),
         h("a", { class: "btn btn-primary btn-big", href: `#/edit/${p.id}` }, icon(I.film, 22), h("span", null, "Open the editor")),
         exporting ? notice("info", "VeoClone is making a video of this match right now.") : null,
         h(
@@ -229,13 +256,29 @@ export function projectPage(ctx: PageContext, id: string): Page {
         ),
       ),
       warnings(p),
+      h(
+        "section",
+        { class: "card fix-picture" },
+        h("h2", null, "Picture looks bent, or the two halves don't join?"),
+        h("p", { class: "muted small" }, "Tell VeoClone which iPhone and lens filmed the match, or swap the two videos if the left phone's video ended up on the right. Both do all the processing again."),
+        h(
+          "div",
+          { class: "row" },
+          button("Change phone or lens", () => void lensChange(p), { icon: I.pencil }),
+          p.files.left && p.files.right ? button("Swap left and right", () => void swapSides(true), { variant: "ghost" }) : null,
+        ),
+      ),
       rerun,
     );
-    if (sawWork && !openTimer) openTimer = window.setTimeout(() => (location.hash = `#/edit/${p.id}`), 1500);
+    if (autoOpen && !openTimer) openTimer = window.setTimeout(() => (location.hash = `#/edit/${p.id}`), 1500);
   }
 
   function renderStopped(p: ProjectMeta) {
     const failed = p.status === "failed";
+    const change = button("Change videos or phone", () => {
+      forceSetup = true;
+      render();
+    }, { variant: "ghost" });
     setChildren(
       body,
       failed
@@ -243,12 +286,10 @@ export function projectPage(ctx: PageContext, id: string): Page {
             p.error?.message ?? "Processing did not finish.",
             p.error?.detail,
             button("Try again", () => void start(), { variant: "primary", icon: I.refresh }),
-            button("Choose other videos", () => {
-              forceSetup = true;
-              render();
-            }, { variant: "ghost" }),
+            p.files.left && p.files.right ? button("Swap left and right and try again", () => void swapSides(true, false)) : null,
+            change,
           )
-        : notice("info", "Processing was stopped.", h("div", { class: "notice-actions" }, button("Start again", () => void start(), { variant: "primary", icon: I.refresh }))),
+        : notice("info", "Processing was stopped.", h("div", { class: "notice-actions" }, button("Start again", () => void start(), { variant: "primary", icon: I.refresh }), change)),
       h("section", { class: "card" }, stepList(p, failed), diskInfo(p)),
       warnings(p),
     );
@@ -264,21 +305,23 @@ export function projectPage(ctx: PageContext, id: string): Page {
       left: dropZone({ side: "left", existing: p.files.left, onFiles: onFiles("left"), onChange: updateStart }),
       right: dropZone({ side: "right", existing: p.files.right, onFiles: onFiles("right"), onChange: updateStart }),
     };
-    const lensHost = h("div", { class: "lens-host" });
-    const fill = (list: Lens[]) =>
-      setChildren(lensHost, lensSelect(list, p.lensId, (lensId) => void api.updateProject(id, { lensId }).catch((e) => toast(describeError(e).message, "error"))));
-    if (lenses) fill(lenses);
-    else void api.lenses().then((l) => fill((lenses = l)), () => undefined);
+    const lensHost = h("div", { class: "lens-host" }, lensUnavailable("Loading the list…"));
+    lensOptions().then(
+      (options) => setChildren(lensHost, lensPicker(options, p.lensId, (lensId) => void api.updateProject(id, { lensId }).catch((e) => toast(describeError(e).message, "error")))),
+      () => setChildren(lensHost, lensUnavailable()),
+    );
+    const both = p.files.left && p.files.right;
     setChildren(
       body,
       h(
         "section",
         { class: "card form-section" },
-        h("h2", null, p.files.left && p.files.right ? "Ready to process" : "Add the videos"),
-        h("p", { class: "muted" }, p.files.left && p.files.right ? "Both videos are here. Press Start, or replace a video first." : "This match is missing a video. Add one video from each phone."),
+        h("h2", null, both ? "Ready to process" : "Add the videos"),
+        h("p", { class: "muted" }, both ? "Both videos are here. Press Start, or replace a video first." : "This match is missing a video. Add one video from each phone."),
         h("div", { class: "zones" }, zones.left.el, zones.right.el),
+        h("div", { class: "zones-foot" }, both ? button("Swap left and right", () => void swapSides(false), { variant: "ghost", class: "btn-small swap" }) : null),
       ),
-      h("section", { class: "card form-section" }, h("label", { class: "field-label", for: "lens" }, "Which iPhone filmed this?"), lensHost),
+      h("section", { class: "card form-section" }, h("h2", null, "Which iPhone and lens filmed this?"), lensHost),
       h("section", { class: "card form-section" }, h("h2", null, "Camera style"), stylePicker(p.style, (style) => void api.updateProject(id, { style }).catch((e) => toast(describeError(e).message, "error")))),
       h("div", { class: "start-row" }, button("Start", () => void start(), { variant: "primary", big: true, icon: I.sparkle, class: "start-btn" }), h("div", { class: "start-status" })),
     );
@@ -291,6 +334,9 @@ export function projectPage(ctx: PageContext, id: string): Page {
     const left = zones.left.file || project.files.left;
     const right = zones.right.file || project.files.right;
     btn.disabled = uploading || !left || !right;
+    // Swapping moves the videos VeoClone already has; not with a new one picked.
+    const swap = body.querySelector<HTMLButtonElement>(".swap");
+    if (swap) swap.hidden = !!(zones.left.file || zones.right.file);
   }
 
   async function start() {
@@ -323,7 +369,7 @@ export function projectPage(ctx: PageContext, id: string): Page {
     }
   }
 
-  async function restyle(style: ProjectMeta["style"]) {
+  async function restyle(style: Style) {
     try {
       if (style !== project?.style) await api.updateProject(id, { style });
       await start();
@@ -332,11 +378,43 @@ export function projectPage(ctx: PageContext, id: string): Page {
     }
   }
 
+  async function lensChange(p: ProjectMeta) {
+    if (!(await changeLens(p))) return;
+    sawWork = true;
+    watch.refresh();
+  }
+
+  /** Swap the two videos VeoClone already has (nothing is sent again), then process if asked. */
+  async function swapSides(process: boolean, ask = true) {
+    if (process && ask) {
+      const ok = await confirmDialog({
+        title: "Swap left and right?",
+        text: "Only do this if the left phone's video ended up on the right. VeoClone swaps the two videos (nothing is sent again) and does all the processing again. This takes about as long as the first time, and the editor can't be used until it has finished.",
+        confirm: "Swap and process again",
+      });
+      if (!ok) return;
+    }
+    try {
+      project = await api.swap(id);
+      forceSetup = false;
+      zones = null;
+      if (process) {
+        project = await api.process(id);
+        sawWork = true;
+      }
+      render(true);
+      watch.refresh();
+    } catch (e) {
+      toast(describeError(e).message, "error", 6000);
+    }
+  }
+
   async function cancel() {
     const ok = await confirmDialog({
       title: "Stop processing?",
-      text: "You can start it again later, but it will begin from the start.",
+      text: "You can start it again later, but it will begin from the start. If this match was ready before, its earlier result is kept.",
       confirm: "Stop processing",
+      dismiss: "Keep going",
       danger: true,
     });
     if (!ok) return;

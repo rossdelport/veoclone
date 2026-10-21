@@ -1,7 +1,7 @@
 // End-to-end UI tests against the mock helper. See playwright.config.ts.
 import { expect, test, type Page } from "@playwright/test";
 import path from "node:path";
-import { expectPicture, FIXTURES, mockState, open, resetMock, shot } from "./helpers";
+import { expectPicture, FIXTURES, MOCK, mockState, open, patchProject, resetMock, shot } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
   page.on("pageerror", (e) => console.log("page error:", e.message));
@@ -32,6 +32,8 @@ test("shows how to start VeoClone when the helper is not running", async ({ page
   await expect(banner).toContainText("VeoClone isn't running on this PC");
   await expect(banner).toContainText("Open VeoClone.exe");
   await expect(banner).toContainText("click Allow");
+  // The online editor may have been refused access to the network: offer the one VeoClone serves itself.
+  await expect(banner.getByRole("link", { name: "http://127.0.0.1:47863/" })).toHaveAttribute("href", "http://127.0.0.1:47863/");
   await expect(banner.getByRole("link", { name: "Download VeoClone" })).toHaveAttribute("href", "https://github.com/rossdelport/veoclone/releases");
   await expect(page.locator(".pill")).toContainText("not running");
   await shot(page, "02-offline");
@@ -45,16 +47,18 @@ async function createMatch(page: Page, name: string) {
   await expect(page.locator(".dropzone[data-side=left]")).toContainText("left-small.mp4");
   await expect(page.locator(".dropzone[data-side=right]")).toContainText("right-small.mp4");
   await expect(page.locator(".dropzone[data-side=left]")).toContainText("long"); // duration read from the file
-  // Lens list comes from the helper; pick the first real profile.
-  const lens = page.locator("#lens");
-  await expect(lens.locator("option")).not.toHaveCount(1);
-  const first = await lens.locator("optgroup option").first().getAttribute("value");
-  await lens.selectOption(first!);
+  // Which iPhone and which lens: two simple choices, mapped to one lens option.
+  const model = page.getByLabel("Which iPhone?");
+  await expect(model).toBeEnabled();
+  await expect(model).toHaveValue("Not sure"); // the default…
+  await expect(page.getByRole("radio", { name: /Ultra wide/ })).toBeChecked(); // …with the 0.5× lens
+  await model.selectOption("iPhone 16 Pro");
+  await expect(page.locator(".lens-note")).toHaveText("Uses the iPhone 15 Pro profile (closest match)");
   await page.getByText("Action", { exact: true }).click();
   await shot(page, "03-new-match");
   await page.getByRole("button", { name: "Start" }).click();
   await expect(page).toHaveURL(/#\/project\/\w+/);
-  return first!;
+  return "iphone-16-pro:ultra";
 }
 
 test("create a match, process it and open the editor", async ({ page }) => {
@@ -83,14 +87,18 @@ test("a failed step explains itself and Try again works", async ({ page }) => {
   await expect(page.getByText("calibrate_videos")).toBeVisible();
   await expect(page.locator(".step-failed")).toContainText("Line up and join the videos");
   await shot(page, "05-failed");
-  await page.getByRole("button", { name: "Try again" }).click();
+  await page.getByRole("button", { name: "Try again", exact: true }).click();
   await expect(page).toHaveURL(/#\/edit\/\w+/, { timeout: 60_000 });
 });
 
 test("cancel processing", async ({ page }) => {
   await resetMock();
   await createMatch(page, "Slow match to cancel");
-  await page.getByRole("button", { name: "Cancel" }).click();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  // "Keep going" closes the question without stopping.
+  await page.getByRole("button", { name: "Keep going" }).click();
+  await expect(page.getByRole("heading", { name: "Processing your match" })).toBeVisible();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
   await page.getByRole("button", { name: "Stop processing" }).click();
   await expect(page.getByText("Processing was stopped.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Start again" })).toBeVisible();
@@ -266,4 +274,197 @@ test("delete a match from the home page", async ({ page }) => {
   await page.getByRole("button", { name: "Delete Example match" }).click();
   await page.getByRole("button", { name: "Delete match" }).click();
   await expect(page.getByRole("heading", { name: "No matches yet" })).toBeVisible();
+});
+
+test("a ?helper= link to another computer is ignored, also when it was remembered", async ({ page }) => {
+  const hosts = new Set<string>();
+  page.on("request", (r) => hosts.add(new URL(r.url()).host));
+  await page.goto("/?helper=https%3A%2F%2Fveo-helper.example#/");
+  await expect(page.locator(".pill")).not.toContainText("Looking for VeoClone");
+  expect(await page.evaluate(() => localStorage.getItem("veoclone.helper"))).toBeNull();
+
+  // An address saved earlier (by an older version) is not used either.
+  await page.evaluate(() => localStorage.setItem("veoclone.helper", "http://evil.example:47863"));
+  await page.goto("/#/");
+  await expect(page.locator(".pill")).not.toContainText("Looking for VeoClone");
+  expect([...hosts].filter((h) => h.includes("example"))).toEqual([]);
+});
+
+test("the iPhone list loads once VeoClone starts", async ({ page }) => {
+  await resetMock();
+  await page.route(`${MOCK}/**`, (route) => route.abort()); // VeoClone not running yet
+  await open(page, "/new");
+  await expect(page.getByTestId("helper-offline")).toBeVisible();
+  await expect(page.getByLabel("Which iPhone?")).toBeDisabled();
+  await page.unroute(`${MOCK}/**`);
+  await expect(page.getByTestId("helper-offline")).toBeHidden({ timeout: 15_000 });
+  await expect(page.getByLabel("Which iPhone?")).toBeEnabled();
+  await expect(page.getByLabel("Which iPhone?").locator("option")).not.toHaveCount(1);
+});
+
+test("Try again after a failed upload sends only the video that is missing", async ({ page }) => {
+  await resetMock();
+  const puts: string[] = [];
+  await page.route(`${MOCK}/api/projects/*/files/*`, (route) => {
+    const side = route.request().url().split("/").pop()!;
+    puts.push(side);
+    return side === "right" && puts.filter((s) => s === "right").length === 1 ? route.abort() : route.continue();
+  });
+  await open(page, "/new");
+  await page.getByTestId("file-left").setInputFiles(path.join(FIXTURES, "left-small.mp4"));
+  await page.getByTestId("file-right").setInputFiles(path.join(FIXTURES, "right-small.mp4"));
+  await page.getByRole("button", { name: "Start" }).click();
+  await expect(page.getByText("could not be reached")).toBeVisible();
+  await page.getByRole("button", { name: "Try again" }).click();
+  await expect(page).toHaveURL(/#\/project\/\w+/);
+  expect(puts).toEqual(["left", "right", "right"]);
+  expect((await mockState()).projects).toHaveLength(1);
+});
+
+test("Stop during an upload leaves no half-made match behind", async ({ page }) => {
+  await resetMock();
+  // Send slowly, so Stop comes while VeoClone is still receiving the video
+  // (it refuses to delete the match until it notices the upload has gone).
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Network.enable");
+  await cdp.send("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: 4000 });
+  await open(page, "/new");
+  await page.getByTestId("file-left").setInputFiles(path.join(FIXTURES, "left-small.mp4"));
+  await page.getByTestId("file-right").setInputFiles(path.join(FIXTURES, "right-small.mp4"));
+  await page.getByRole("button", { name: "Start" }).click();
+  await expect(page.locator(".dropzone[data-side=left] .dz-progress")).toBeVisible();
+  await page.getByRole("button", { name: "Stop" }).click();
+  await expect(page.getByText("Stopped. Press Start to try again.")).toBeVisible();
+  await expect.poll(async () => (await mockState()).projects.length, { timeout: 10_000 }).toBe(0);
+});
+
+test("swap left and right after a failure, without sending the videos again", async ({ page }) => {
+  await resetMock();
+  await createMatch(page, "Please fail once, slowly");
+  await expect(page.getByRole("alert").filter({ hasText: "couldn't line up" })).toBeVisible({ timeout: 30_000 });
+  let puts = 0;
+  page.on("request", (r) => r.method() === "PUT" && r.url().includes("/files/") && puts++);
+  await page.getByRole("button", { name: "Swap left and right and try again" }).click();
+  await expect(page).toHaveURL(/#\/edit\/\w+/, { timeout: 60_000 });
+  const state = await mockState();
+  expect(state.swaps).toBe(1);
+  expect(state.projects[0].files.left!.name).toBe("right-small.mp4");
+  expect(state.projects[0].files.right!.name).toBe("left-small.mp4");
+  expect(puts).toBe(0);
+});
+
+test("warnings show on the home card and in the editor, and can be hidden", async ({ page }) => {
+  await resetMock(true);
+  await open(page, "/");
+  await expect(page.getByTestId("warnings-badge")).toHaveText("1 thing to check");
+  await page.getByRole("link", { name: "Open editor" }).click();
+  await expectPicture(page);
+  const notes = page.getByTestId("editor-warnings");
+  await expect(notes).toContainText("typical iPhone lens");
+  await shot(page, "10-editor-warnings");
+  await notes.getByRole("button", { name: "Hide these notes" }).click();
+  await expect(notes).toBeHidden();
+  await page.reload();
+  await expectPicture(page);
+  await expect(page.getByTestId("editor-warnings")).toBeHidden();
+});
+
+test("change phone or lens from the editor: two choices, then everything is processed again", async ({ page }) => {
+  const id = await openExample(page);
+  await page.getByRole("link", { name: "Change phone or lens" }).click();
+  const dialog = page.getByRole("dialog", { name: "Change phone or lens" });
+  await expect(dialog).toContainText("does all the processing again");
+  await dialog.getByLabel("Which iPhone?").selectOption("iPhone 13 mini");
+  await dialog.getByText("Normal (1×)").click();
+  await expect(dialog.locator(".lens-note")).toHaveText("Uses the iPhone 13 profile (closest match)");
+  await shot(page, "11-change-lens");
+  await dialog.getByRole("button", { name: "Process again" }).click();
+  await expect(page).toHaveURL(new RegExp(`#/project/${id}$`));
+  await expect(page.getByRole("heading", { name: "Processing your match" })).toBeVisible();
+  expect((await mockState()).projects[0].lensId).toBe("iphone-13-mini:main");
+  await expect(page).toHaveURL(new RegExp(`#/edit/${id}$`), { timeout: 30_000 });
+});
+
+test("a re-run that fails keeps the match ready, and the editor still opens", async ({ page }) => {
+  await resetMock(true);
+  const id = (await mockState()).projects[0].id;
+  await patchProject(id, { name: "Example match fail" }); // the mock fails its next run once
+  await open(page, `/project/${id}`);
+  await expect(page.getByRole("heading", { name: "Your match is ready" })).toBeVisible();
+  const rerun = page.locator("details.rerun");
+  await rerun.locator("summary").click();
+  await rerun.getByText("Action", { exact: true }).click();
+  // The page checks for news every 5 s; the open box and the choice must survive that.
+  await page.waitForTimeout(6000);
+  await expect(rerun).toHaveAttribute("open", "");
+  await expect(rerun.getByRole("radio", { name: /Action/ })).toBeChecked();
+  await rerun.getByRole("button", { name: "Run the AI again" }).click();
+  await expect(page.getByText("Processing it again did not work")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("heading", { name: "Your match is ready" })).toBeVisible();
+  await shot(page, "12-rerun-failed");
+  await page.getByRole("link", { name: "Open the editor" }).click();
+  await expectPicture(page);
+  await expect(page.getByTestId("editor-warnings")).toContainText("Processing it again did not work");
+});
+
+test("editor: arrow keys and Space still step and play after using a slider or a tick box", async ({ page }) => {
+  const id = await openExample(page);
+  const time = page.locator(".time-label");
+  await page.getByTestId("slider-smoothSeconds").click();
+  const smooth = await page.getByTestId("slider-smoothSeconds").inputValue();
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect(time).toHaveText("0:05 / 0:20");
+  expect(await page.getByTestId("slider-smoothSeconds").inputValue()).toBe(smooth);
+
+  const skip = page.getByRole("checkbox", { name: "Skip cut parts when playing" });
+  await skip.click();
+  await expect(skip).not.toBeChecked();
+  await page.keyboard.press("Space");
+  await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
+  await expect(skip).not.toBeChecked();
+  await page.keyboard.press("Space");
+  await expect(page.getByTestId("save-state")).toHaveText("All changes saved", { timeout: 10_000 });
+  expect((await savedEdits(id)).smoothSeconds).toBe(Number(smooth));
+});
+
+test("editor: after the preview fails mid-way, Try again brings the picture back", async ({ page }) => {
+  await openExample(page);
+  const view = page.getByTestId("camera-view");
+  // As if VeoClone had been closed for a moment while the preview was playing.
+  await page.evaluate(() => document.querySelector("video")!.dispatchEvent(new Event("error")));
+  await expect(view.getByText("The preview video could not be loaded")).toBeVisible();
+  await view.getByRole("button", { name: "Try again" }).click(); // a real mouse click
+  await expectPicture(page);
+});
+
+test("a slow AI on the main processor is shown as a warning", async ({ page }) => {
+  await resetMock();
+  await page.route(`${MOCK}/api/health`, async (route) => {
+    const res = await route.fetch();
+    const health = await res.json();
+    await route.fulfill({ response: res, json: { ...health, ai: { available: true, provider: "CPU", model: "yolo26n.onnx" } } });
+  });
+  await open(page, "/new");
+  const pill = page.locator(".pill");
+  await expect(pill).toHaveClass(/pill-warn/);
+  await expect(pill).toContainText("AI on the main processor (slow)");
+  await expect(page.getByText("The AI will run on the main processor")).toBeVisible();
+  await shot(page, "13-slow-ai");
+});
+
+test("editor: a preview that can't be fetched is not blamed on the browser", async ({ page }) => {
+  await resetMock(true);
+  const id = (await mockState()).projects[0].id;
+  // Like Chrome and Edge, which play the real helper's H.264 preview (this test browser can't).
+  await page.addInitScript(() => {
+    const canPlay = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function (type: string) {
+      return type.includes("avc1") ? "probably" : canPlay.call(this, type);
+    };
+  });
+  await page.route("**/proxy.mp4", (route) => route.abort("connectionreset"));
+  await open(page, `/edit/${id}`);
+  const view = page.getByTestId("camera-view");
+  await expect(view).toContainText("The preview video could not be loaded. Make sure VeoClone is still running");
+  await expect(view).not.toContainText("This browser");
 });

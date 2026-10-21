@@ -25,6 +25,7 @@ import { debounce, formatDuration, h, icon, setChildren } from "./dom";
 import { EditStore, upsertKeyframe, type SaveState } from "./editStore";
 import { ExportPanel } from "./exportPanel";
 import { I } from "./icons";
+import { changeLens } from "./lens";
 import type { Page, PageContext } from "./page";
 import { STYLES } from "./newMatch";
 import { editableTitle } from "./project";
@@ -108,10 +109,13 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   // ---------------------------------------------------------------------
   // Layout
   // ---------------------------------------------------------------------
-  const camCanvas = h("canvas", { class: "camera-canvas", "aria-label": "Camera view: what your video will look like. Drag to move the camera, scroll to zoom." });
+  const camCanvas = h("canvas", {
+    class: "camera-canvas",
+    "aria-label": "Camera view: what your video will look like. Drag or scroll here to move or zoom the camera at this moment (adds a fix). The Zoom slider changes the whole video.",
+  });
   const badge = h("div", { class: "view-badge" });
   const viewerMsg = h("div", { class: "viewer-msg" }, h("div", { class: "spinner", "aria-hidden": "true" }), h("p", null, "Loading the preview…"));
-  const hint = h("div", { class: "viewer-hint" }, "Drag to move the camera · Scroll to zoom");
+  const hint = h("div", { class: "viewer-hint" }, "Drag or scroll to fix the camera here · Whole video: Zoom slider");
   const viewerBox = h("div", { class: "viewer-box", "data-testid": "camera-view" }, camCanvas, badge, hint, viewerMsg);
   const video = h("video", { class: "proxy-video", preload: "auto", playsInline: true, crossOrigin: "anonymous", "aria-hidden": "true" });
 
@@ -123,7 +127,14 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const playBtn = iconButton(I.play, "Play (Space)", () => void togglePlay(), "btn-play");
   const speed = h(
     "select",
-    { class: "input input-small", "aria-label": "Playback speed", onChange: () => (video.playbackRate = Number(speed.value)) },
+    {
+      class: "input input-small",
+      "aria-label": "Playback speed",
+      onChange: () => {
+        video.playbackRate = Number(speed.value);
+        speed.blur(); // so Space and the arrow keys go back to playing and stepping
+      },
+    },
     [0.25, 0.5, 1, 2, 4].map((s) => h("option", { value: String(s), selected: s === 1 }, `${s}×`)),
   );
   const muteBtn = iconButton(I.volume, "Sound on/off", () => {
@@ -158,7 +169,14 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   );
 
   const timelineHost = h("div", { class: "timeline-host", "data-testid": "timeline" });
-  const skipBox = h("input", { type: "checkbox", checked: true, onChange: () => (skipCuts = skipBox.checked) });
+  const skipBox = h("input", {
+    type: "checkbox",
+    checked: true,
+    onChange: () => {
+      skipCuts = skipBox.checked;
+      skipBox.blur();
+    },
+  });
   const timeline = new Timeline(timelineHost, {
     seek: (f) => {
       pause();
@@ -204,9 +222,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const sliders = h("div", { class: "sliders" });
   const fixList = h("div", { class: "fix-list" });
   const trimInfo = h("div", { class: "trim-info" });
+  const notes = h("div", { class: "editor-notes" });
   const side = h(
     "aside",
     { class: "editor-side", "aria-label": "Editing tools" },
+    notes,
     h(
       "section",
       { class: "side-section" },
@@ -226,6 +246,22 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
         { class: "small muted style-line" },
         `Camera style: ${STYLES.find((s) => s.id === project.style)?.name ?? project.style} · `,
         h("a", { href: `#/project/${id}` }, "Change (runs the AI again)"),
+      ),
+      h(
+        "p",
+        { class: "small muted" },
+        "Picture looks bent, or the two halves don't join? ",
+        h(
+          "a",
+          {
+            href: `#/project/${id}`,
+            onClick: (e: MouseEvent) => {
+              e.preventDefault();
+              void fixLens();
+            },
+          },
+          "Change phone or lens",
+        ),
       ),
     ),
     h("section", { class: "side-section" }, h("h2", null, "Your fixes"), fixList),
@@ -328,6 +364,10 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
           seek(lastKept());
         } else seek(next);
       }
+    } else if (!video.seeking && !pendingSeek) {
+      // A frame shown just after pausing: the playhead follows the picture,
+      // so trims and fixes land on the frame on screen.
+      frame = wantFrame = f;
     }
     camR.updateVideoFrame(video);
     textureFresh = true;
@@ -352,7 +392,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   video.addEventListener("pause", () => updatePlayButton());
   video.addEventListener("error", () => {
     const err = video.error;
-    const unplayable = err?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED || err?.code === MediaError.MEDIA_ERR_DECODE;
+    // A failed download also reports "not supported", so blame the browser
+    // only when it really can't play the preview (H.264, High profile).
+    const unplayable =
+      err?.code === MediaError.MEDIA_ERR_DECODE ||
+      (err?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED && video.canPlayType('video/mp4; codecs="avc1.640028"') === "");
     viewerMsg.hidden = false;
     setChildren(
       viewerMsg,
@@ -363,6 +407,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
         err ? `Video error ${err.code}: ${err.message}` : undefined,
         button("Try again", () => {
           setChildren(viewerMsg, h("div", { class: "spinner" }), h("p", null, "Loading the preview…"));
+          videoReady = false; // the first frame hides the message again
           video.load();
         }, { variant: "primary" }),
       ),
@@ -573,7 +618,8 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
 
   let drag: { x: number; y: number; pose: Pose; moved: boolean; id: number } | null = null;
   viewerBox.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0 || !videoReady) return;
+    // Never capture clicks meant for the loading / error message and its buttons.
+    if (e.button !== 0 || !videoReady || !viewerMsg.hidden) return;
     pause();
     commitWheel.flush();
     drag = { x: e.clientX, y: e.clientY, pose: currentPose(), moved: false, id: e.pointerId };
@@ -708,6 +754,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
         out.textContent = d.fmt(v);
         store.change((e) => (e[d.key] = v), d.key);
       },
+      onChange: () => input.blur(), // the arrow keys step through the video again
     });
     sliders.append(
       h(
@@ -846,11 +893,50 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const watch = watchProject(
     id,
     (p) => {
+      latest = p;
       exportPanel.update(p);
       updateExportButton(p);
+      renderNotes(p);
     },
     () => undefined,
   );
+
+  // ---------------------------------------------------------------------
+  // Warnings from processing (HDR, poor line-up, a re-run that failed…)
+  // ---------------------------------------------------------------------
+  const hiddenKey = `veoclone.hiddenNotes.${id}`;
+  function renderNotes(p: ProjectMeta) {
+    const key = JSON.stringify(p.warnings);
+    let hidden = null;
+    try {
+      hidden = localStorage.getItem(hiddenKey);
+    } catch {
+      // Private mode: show them.
+    }
+    if (!p.warnings.length || hidden === key) return setChildren(notes);
+    if (notes.dataset.key === key && notes.firstChild) return;
+    notes.dataset.key = key;
+    const box = notice("warning", "Good to know", h("ul", { class: "warn-list" }, p.warnings.map((w) => h("li", null, w))));
+    box.dataset.testid = "editor-warnings";
+    box.append(
+      iconButton(I.x, "Hide these notes", () => {
+        try {
+          localStorage.setItem(hiddenKey, key);
+        } catch {
+          // Private mode: hidden until the editor opens again.
+        }
+        setChildren(notes);
+      }, "btn-ghost btn-small"),
+    );
+    setChildren(notes, box);
+  }
+  let latest = project;
+  renderNotes(project);
+
+  async function fixLens() {
+    pause();
+    if (await changeLens(latest)) location.hash = `#/project/${id}`;
+  }
 
   // ---------------------------------------------------------------------
   // Keyboard
@@ -858,7 +944,8 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   listen(window, "keydown", (e) => {
     if (document.querySelector("dialog[open]")) return;
     const t = e.target as HTMLElement;
-    const typing = t.closest("input, select, textarea, [contenteditable]") !== null;
+    // Sliders and tick boxes don't take typing: the shortcuts win over them.
+    const typing = t.closest("textarea, [contenteditable], select, input:not([type=range]):not([type=checkbox]):not([type=radio])") !== null;
     const ctrl = e.ctrlKey || e.metaKey;
     if (ctrl && (e.key === "z" || e.key === "Z") && !typing) {
       e.preventDefault();

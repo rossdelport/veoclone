@@ -16,8 +16,11 @@ STARTING VEOCLONE
 2. Double-click VeoClone.exe.
 3. The first time, Windows may say "Windows protected your PC".
    Click "More info", then "Run anyway".
+   If Windows says "Part of this app has been blocked" (Smart App Control),
+   see "If something goes wrong" below.
 4. A black window opens, then your browser opens the VeoClone editor.
    KEEP THE BLACK WINDOW OPEN while you use VeoClone (you can minimise it).
+   It also shows the folder where your matches are saved.
 5. If Chrome or Edge asks for permission to connect to devices or apps on
    your network or this computer, click "Allow".
 
@@ -29,7 +32,9 @@ https://rossdelport.github.io/veoclone/
 FILMING (on both iPhones)
 -------------------------
 - Settings > Camera > Record Video: 4K at 30 fps, HDR Video OFF,
-  Auto FPS off, Lock Camera on (if your phone has these).
+  Auto FPS OFF (older iPhones: Auto Low Light FPS off), Lock Camera on
+  (if your phone has these). With Auto FPS on, the two halves drift apart
+  in dim light or under floodlights.
 - Camera app: Video, tap 0.5x. Hold the phones sideways.
 - Side by side, as high as you can, at the halfway line. Angle them
   outwards: left phone films the left half, right phone the right half,
@@ -41,31 +46,43 @@ FILMING (on both iPhones)
 
 MAKING A VIDEO
 --------------
-1. New match: type a name, pick your iPhone model (0.5x Ultra Wide lens),
-   pick a camera style.
-2. Drop the left phone's video on "Left phone" and the right phone's video
-   on "Right phone". Click Start.
-3. Wait (a full match can take an hour or more). Don't let the PC sleep.
+1. New match: type a name. Drop the left phone's video on "Left phone" and
+   the right phone's video on "Right phone" (mixed them up? click "Swap left
+   and right").
+2. Pick your iPhone model and the lens: "Ultra wide (0.5x)" if you tapped
+   0.5x when filming. Not sure? Leave it on "Not sure". Pick a camera style
+   and click Start.
+3. Wait (a full match can take an hour or more). Keep the black window
+   open. VeoClone keeps the PC awake while it works.
 4. Open the editor: fix the camera where needed, trim, cut out half-time.
 5. Export > Make video > Download (or Show in folder).
 
 
 WHERE YOUR FILES ARE
 --------------------
-Videos\VeoClone\projects  (one folder per match; finished videos are in
-its "exports" folder). Deleting a match in VeoClone deletes that folder,
-including its finished videos, so save the videos you want to keep first.
+The folder shown in the black window, usually Videos\VeoClone (or
+VeoClone in your user folder, for example C:\Users\Sam\VeoClone, if
+OneDrive backs up your Videos folder). Each match has a folder inside its
+"projects" folder; finished videos are in the match's "exports" folder.
+Deleting a match in VeoClone deletes that folder, including its finished
+videos, so save the videos you want to keep first.
 
 
 IF SOMETHING GOES WRONG
 -----------------------
 - "VeoClone isn't running": open VeoClone.exe again and keep its window
   open. Use Chrome or Edge.
-- AI very slow ("no graphics card"): update your graphics card driver and
-  restart the PC.
+- "Part of this app has been blocked" (Smart App Control): Windows has no
+  "Run anyway" for this. Open Start, type Smart App Control, open Smart App
+  Control settings and choose Off, then open VeoClone.exe again. (On some
+  versions of Windows 11 it can't be switched back on afterwards.)
+- AI very slow ("AI on the main processor"): update your graphics card
+  driver and restart the PC.
 - Washed-out colours: switch HDR Video off on the phones next time.
-- Bent or warped picture: make the match again and pick the right iPhone
-  model.
+- Bent or warped picture: click "Change phone or lens" (in the editor or
+  on the match page) and pick the right iPhone and lens.
+- "We couldn't line up the two videos": the videos may be the wrong way
+  round. Click "Swap left and right and try again".
 - Videos not lined up: start the phones closer together and clap.
 - Each match folder has a log.txt file; include it when you ask for help.
 

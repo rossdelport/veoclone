@@ -1,9 +1,8 @@
 name: Build Test Binary
 
+# Upstream Reco workflow: in VeoClone it only runs by hand (VeoClone's own are veoclone-*.yml).
 on:
   workflow_dispatch:
-  push:
-    branches: [fix/v0.5.0-release-prep, fix/10bit-d3d11va]
 
 permissions:
   contents: read

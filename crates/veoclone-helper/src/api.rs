@@ -25,13 +25,13 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::ai::AiStatus;
-use crate::calib::iphone_lenses;
+use crate::calib::{DEFAULT_LENS, is_lens_option, lens_options};
 use crate::export::{ExportBody, validate};
 use crate::jobs::{Job, Jobs};
 use crate::media::Tools;
 use crate::store::{
     DERIVED_FILES, ExportMeta, ExportStatus, FileInfo, Files, ProjectMeta, Status, Store, Style,
-    dir_size, new_id, now_iso, original_file, valid_id, write_atomic,
+    dir_size, end_unfinished_run, new_id, now_iso, original_file, valid_id, write_atomic,
 };
 
 const EDITS_LIMIT: usize = 10 * 1024 * 1024;
@@ -170,6 +170,7 @@ pub fn router(state: AppState, port: u16, origins: &[String], web_dir: &Path) ->
         )
         .route("/projects/{id}/exports/{eid}/file", get(export_file))
         .route("/projects/{id}/open-folder", post(open_folder))
+        .route("/projects/{id}/swap", post(swap))
         .fallback(|| async {
             ApiError::new(StatusCode::NOT_FOUND, "Unknown address.").into_response()
         });
@@ -227,6 +228,8 @@ struct Allowed {
 /// Only answer requests addressed to us (DNS-rebinding protection), and only
 /// let the editor's own origins change anything (other web pages cannot
 /// read our answers because of CORS, but could still send simple POSTs).
+/// Nothing may be shown inside another web page's frame, where a hidden
+/// editor could be clicked by mistake (clickjacking).
 async fn guard(State(allowed): State<Arc<Allowed>>, req: Request, next: Next) -> Response {
     let host_ok = req
         .headers()
@@ -240,7 +243,14 @@ async fn guard(State(allowed): State<Arc<Allowed>>, req: Request, next: Next) ->
             .get("origin")
             .is_none_or(|o| allowed.origins.contains(o));
     if host_ok && origin_ok {
-        next.run(req).await
+        let mut res = next.run(req).await;
+        let h = res.headers_mut();
+        h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+        h.insert(
+            "content-security-policy",
+            HeaderValue::from_static("frame-ancestors 'none'"),
+        );
+        res
     } else {
         ApiError::new(
             StatusCode::FORBIDDEN,
@@ -287,15 +297,13 @@ async fn health(State(s): State<AppState>) -> Response {
 }
 
 async fn lenses() -> Response {
-    let list = tokio::task::spawn_blocking(|| iphone_lenses().to_vec())
+    let list = tokio::task::spawn_blocking(|| lens_options().to_vec())
         .await
         .unwrap_or_default();
     json(&list)
 }
 
-fn known_lens(id: &str) -> bool {
-    iphone_lenses().iter().any(|l| l.id == id)
-}
+const UNKNOWN_LENS: &str = "That iPhone and lens are not in the list.";
 
 // ---------------------------------------------------------------------------
 // Projects
@@ -340,12 +348,9 @@ fn clean_name(name: &str) -> ApiResult<String> {
 async fn create_project(State(s): State<AppState>, body: Body) -> ApiResult<Response> {
     let req: NewProject = read_json(body, JSON_LIMIT).await?;
     let name = clean_name(&req.name)?;
-    if let Some(l) = &req.lens_id
-        && !known_lens(l)
-    {
-        return Err(ApiError::bad_request(
-            "That iPhone model is not in the list.",
-        ));
+    let lens_id = req.lens_id.unwrap_or_else(|| DEFAULT_LENS.into());
+    if !is_lens_option(&lens_id) {
+        return Err(ApiError::bad_request(UNKNOWN_LENS));
     }
     let now = now_iso();
     let meta = ProjectMeta {
@@ -353,7 +358,7 @@ async fn create_project(State(s): State<AppState>, body: Body) -> ApiResult<Resp
         name,
         created_at: now.clone(),
         updated_at: now,
-        lens_id: req.lens_id,
+        lens_id: Some(lens_id),
         style: req.style.unwrap_or(Style::Broadcast),
         status: Status::New,
         files: Files::default(),
@@ -365,6 +370,7 @@ async fn create_project(State(s): State<AppState>, body: Body) -> ApiResult<Resp
         frame_count: None,
         disk_bytes: 0,
         exports: Vec::new(),
+        interrupted_runs: 0,
     };
     let meta = s
         .store
@@ -387,13 +393,9 @@ async fn patch_project(
     };
     let lens = match req.get("lensId") {
         None => None,
-        Some(Value::Null) => Some(None),
-        Some(Value::String(l)) if known_lens(l) => Some(Some(l.clone())),
-        Some(_) => {
-            return Err(ApiError::bad_request(
-                "That iPhone model is not in the list.",
-            ));
-        }
+        Some(Value::Null) => Some(Some(DEFAULT_LENS.to_string())),
+        Some(Value::String(l)) if is_lens_option(l) => Some(Some(l.clone())),
+        Some(_) => return Err(ApiError::bad_request(UNKNOWN_LENS)),
     };
     let style: Option<Style> = match req.get("style") {
         None | Some(Value::Null) => None,
@@ -481,6 +483,9 @@ fn extension(name: &str) -> String {
         .unwrap_or_else(|| "mp4".into())
 }
 
+const NO_SPACE: &str =
+    "There is not enough free disk space for this video. Free up some space and try again.";
+
 struct UploadGuard {
     uploads: Arc<Mutex<HashMap<String, usize>>>,
     id: String,
@@ -525,11 +530,7 @@ async fn upload(
         && let Ok(free) = fs4::available_space(&dir)
         && free < len + 200 * 1024 * 1024
     {
-        return Err(ApiError::new(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "There is not enough free disk space for this video. Free up some space and try \
-             again.",
-        ));
+        return Err(ApiError::new(StatusCode::INSUFFICIENT_STORAGE, NO_SPACE));
     }
 
     *s.uploads.lock().unwrap().entry(id.clone()).or_default() += 1;
@@ -543,6 +544,9 @@ async fn upload(
         Ok(n) => n,
         Err(e) => {
             let _ = tokio::fs::remove_file(&part).await;
+            if e.kind() == std::io::ErrorKind::StorageFull {
+                return Err(ApiError::new(StatusCode::INSUFFICIENT_STORAGE, NO_SPACE).detail(e));
+            }
             return Err(
                 ApiError::bad_request("The upload did not finish. Please try again.").detail(e),
             );
@@ -648,13 +652,14 @@ async fn process(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> Api
 
 async fn cancel(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiResult<Response> {
     project(&s, &id)?;
+    let dir = s.store.project_dir(&id);
     let removed = s.jobs.cancel(&id);
     let (meta, _) = s
         .store
         .update(&id, |m| {
             for job in &removed {
                 match job {
-                    Job::Process { .. } => m.status = Status::Cancelled,
+                    Job::Process { .. } => end_unfinished_run(m, &dir, None),
                     Job::Export { export, .. } => {
                         if let Some(e) = m.exports.iter_mut().find(|e| &e.id == export) {
                             e.status = ExportStatus::Cancelled;
@@ -665,6 +670,75 @@ async fn cancel(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiR
         })
         .ok_or_else(ApiError::no_project)?;
     Ok(json(&meta))
+}
+
+/// Swap the left and right videos without uploading them again: the most
+/// common reason the two views cannot be lined up.
+async fn swap(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiResult<Response> {
+    project(&s, &id)?;
+    if s.jobs.busy(&id) || s.uploads.lock().unwrap().get(&id).is_some_and(|n| *n > 0) {
+        return Err(ApiError::conflict(BUSY));
+    }
+    let dir = s.store.project_dir(&id);
+    let files = tokio::task::spawn_blocking(move || swap_files(&dir))
+        .await
+        .map_err(|e| ApiError::internal("The videos could not be swapped.", e))?;
+    files.map_err(|e| {
+        ApiError::internal(
+            "The videos could not be swapped. Close any program that uses them and try again.",
+            e,
+        )
+    })?;
+    let (meta, _) = s
+        .store
+        .update(&id, |m| {
+            std::mem::swap(&mut m.files.left, &mut m.files.right);
+            m.status = if m.files.left.is_some() && m.files.right.is_some() {
+                Status::Uploaded
+            } else {
+                Status::New
+            };
+            m.calibration = None;
+            m.fps = None;
+            m.frame_count = None;
+            m.error = None;
+            m.warnings.clear();
+        })
+        .ok_or_else(ApiError::no_project)?;
+    Ok(json(&meta))
+}
+
+/// Rename `left.*` to `right.*` and back (each keeps its extension), then
+/// drop everything made from the old order.
+fn swap_files(dir: &Path) -> std::io::Result<()> {
+    let ext = |p: &Path| {
+        p.extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let left = original_file(dir, "left");
+    let right = original_file(dir, "right");
+    // Park the left video under another name so the two never clash.
+    let parked = dir.join("swapping");
+    if let Some(l) = &left {
+        std::fs::rename(l, &parked)?;
+    }
+    if let Some(r) = &right
+        && let Err(e) = std::fs::rename(r, dir.join(format!("left.{}", ext(r))))
+    {
+        if let Some(l) = &left {
+            let _ = std::fs::rename(&parked, l);
+        }
+        return Err(e);
+    }
+    if let Some(l) = &left {
+        std::fs::rename(&parked, dir.join(format!("right.{}", ext(l))))?;
+    }
+    for f in DERIVED_FILES {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,13 +1091,13 @@ mod tests {
             let id = p["id"].as_str().unwrap().to_string();
             assert_eq!(p["status"], "new");
             assert_eq!(p["style"], "action");
-            assert_eq!(p["lensId"], Value::Null);
+            assert_eq!(p["lensId"], DEFAULT_LENS);
 
             let (code, _, b) = call(&app, "GET", "/api/projects", &[], "").await;
             assert_eq!(code, StatusCode::OK);
             assert_eq!(v(&b).as_array().unwrap().len(), 1);
 
-            let lens = iphone_lenses()[0].id.clone();
+            let lens = lens_options()[2].id.clone();
             let body = json!({"name":"Final","lensId":lens,"style":"frame_all"}).to_string();
             let (code, _, b) = call(&app, "PATCH", &format!("/api/projects/{id}"), &[], body).await;
             assert_eq!(code, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
@@ -1047,7 +1121,16 @@ mod tests {
                 r#"{"lensId":null}"#,
             )
             .await;
-            assert_eq!(v(&b)["lensId"], Value::Null);
+            assert_eq!(v(&b)["lensId"], DEFAULT_LENS);
+            let (code, _, _) = call(
+                &app,
+                "POST",
+                "/api/projects",
+                &[],
+                r#"{"name":"x","lensId":"Apple IPhone 15||3840x2160"}"#,
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
 
             // Processing needs both files.
             let (code, _, b) = call(
@@ -1373,9 +1456,109 @@ mod tests {
 
             let (_, _, b) = call(&app, "GET", "/api/lenses", &[], "").await;
             let l = v(&b);
-            assert!(l.as_array().unwrap().len() > 50);
-            assert!(l[0]["id"].is_string() && l[0]["label"].is_string());
-            assert!(l[0]["width"].is_u64());
+            assert_eq!(l.as_array().unwrap().len(), lens_options().len());
+            assert_eq!(l[0]["id"], DEFAULT_LENS);
+            assert_eq!(l[0]["model"], "Not sure");
+            assert_eq!(l[0]["lens"], "ultra");
+            assert!(l[0]["label"].is_string() && l[0]["note"].is_string());
+        });
+    }
+
+    /// No page can show VeoClone inside a frame (clickjacking).
+    #[test]
+    fn refuses_to_be_framed() {
+        rt().block_on(async {
+            let (_tmp, st) = state();
+            let app = app(&st);
+            for uri in ["/", "/api/projects"] {
+                let (code, h, _) = call(&app, "GET", uri, &[], "").await;
+                assert_eq!(code, StatusCode::OK);
+                assert_eq!(h["x-frame-options"], "DENY");
+                assert_eq!(h["content-security-policy"], "frame-ancestors 'none'");
+            }
+        });
+    }
+
+    #[test]
+    fn swap_left_and_right() {
+        rt().block_on(async {
+            let (_tmp, st) = state();
+            let app = app(&st);
+            let (_, _, b) = call(&app, "POST", "/api/projects", &[], r#"{"name":"x"}"#).await;
+            let id = v(&b)["id"].as_str().unwrap().to_string();
+            let dir = st.store.project_dir(&id);
+            for (side, name, data) in [("left", "A.MOV", "aaa"), ("right", "b.mp4", "bbbb")] {
+                let uri = format!("/api/projects/{id}/files/{side}");
+                call(&app, "PUT", &uri, &[("x-filename", name)], data).await;
+            }
+            for f in DERIVED_FILES {
+                std::fs::write(dir.join(f), b"old").unwrap();
+            }
+            st.store.update(&id, |m| m.status = Status::Ready);
+
+            let uri = format!("/api/projects/{id}/swap");
+            let (code, _, b) = call(&app, "POST", &uri, &[], "").await;
+            assert_eq!(code, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            let p = v(&b);
+            assert_eq!(p["status"], "uploaded");
+            assert_eq!(p["files"]["left"]["name"], "b.mp4");
+            assert_eq!(p["files"]["right"]["name"], "A.MOV");
+            assert_eq!(std::fs::read(dir.join("left.mp4")).unwrap(), b"bbbb");
+            assert_eq!(std::fs::read(dir.join("right.mov")).unwrap(), b"aaa");
+            assert!(DERIVED_FILES.iter().all(|f| !dir.join(f).exists()));
+            let names = std::fs::read_dir(&dir).unwrap().count();
+            assert_eq!(names, 3, "project.json, left.mp4, right.mov");
+
+            // And back.
+            call(&app, "POST", &uri, &[], "").await;
+            assert_eq!(std::fs::read(dir.join("left.mov")).unwrap(), b"aaa");
+            assert_eq!(std::fs::read(dir.join("right.mp4")).unwrap(), b"bbbb");
+        });
+    }
+
+    /// DESIGN.md 4.7 through the real job queue: a re-run that fails leaves
+    /// the match ready with its earlier result.
+    #[test]
+    fn failed_rerun_keeps_the_editor_open() {
+        rt().block_on(async {
+            let (_tmp, st) = state();
+            let app = app(&st);
+            let (_, _, b) = call(&app, "POST", "/api/projects", &[], r#"{"name":"x"}"#).await;
+            let id = v(&b)["id"].as_str().unwrap().to_string();
+            let dir = st.store.project_dir(&id);
+            for side in ["left", "right"] {
+                let uri = format!("/api/projects/{id}/files/{side}");
+                call(&app, "PUT", &uri, &[("x-filename", "a.mp4")], "data").await;
+            }
+            for f in DERIVED_FILES {
+                std::fs::write(dir.join(f), b"x").unwrap();
+            }
+            std::fs::write(dir.join("calib.json"), br#"{"frameCount":588}"#).unwrap();
+            st.store.update(&id, |m| {
+                m.status = Status::Ready;
+                m.frame_count = Some(588);
+            });
+
+            // The test has no ffmpeg, so the re-run fails straight away.
+            let uri = format!("/api/projects/{id}/process");
+            let (code, _, _) = call(&app, "POST", &uri, &[], "").await;
+            assert_eq!(code, StatusCode::OK);
+            let mut p = st.store.get(&id).unwrap();
+            for _ in 0..200 {
+                if !st.jobs.busy(&id) && p.status != Status::Queued {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                p = st.store.get(&id).unwrap();
+            }
+            assert_eq!(p.status, Status::Ready, "{p:?}");
+            assert_eq!(p.frame_count, Some(588));
+            assert!(p.error.is_none());
+            assert!(
+                p.warnings.iter().any(|w| w.contains("ffmpeg")),
+                "{:?}",
+                p.warnings
+            );
         });
     }
 

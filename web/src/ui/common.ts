@@ -107,10 +107,10 @@ export function toast(message: string, kind: "info" | "error" | "success" = "inf
 // Dialogs
 // ---------------------------------------------------------------------------
 
-/** A modal yes/no question. Resolves true when confirmed. */
-export function confirmDialog(opts: { title: string; text: Child; confirm: string; danger?: boolean }): Promise<boolean> {
+/** A modal yes/no question. Resolves true when confirmed. `dismiss` labels the "no" button. */
+export function confirmDialog(opts: { title: string; text: Child; confirm: string; dismiss?: string; danger?: boolean; wide?: boolean }): Promise<boolean> {
   return new Promise((resolve) => {
-    const dialog = h("dialog", { class: "dialog", "aria-label": opts.title });
+    const dialog = h("dialog", { class: opts.wide ? "dialog dialog-wide" : "dialog", "aria-label": opts.title });
     const close = (ok: boolean) => {
       dialog.close();
       dialog.remove();
@@ -122,7 +122,7 @@ export function confirmDialog(opts: { title: string; text: Child; confirm: strin
       h(
         "div",
         { class: "dialog-actions" },
-        button("Cancel", () => close(false), { variant: "ghost" }),
+        button(opts.dismiss ?? "Cancel", () => close(false), { variant: "ghost" }),
         button(opts.confirm, () => close(true), { variant: opts.danger ? "danger" : "primary" }),
       ),
     );

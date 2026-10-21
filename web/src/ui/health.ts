@@ -53,24 +53,27 @@ export function renderPill(host: HTMLElement, s: HelperState): void {
     return;
   }
   const { gpu, ai } = s.health;
-  const aiText = ai.available
-    ? ai.provider === "CPU"
-      ? "AI ready (slower: no graphics card)"
-      : "AI ready on the graphics card"
-    : ai.provider === "checking"
-      ? "AI: checking…"
-      : "AI not available";
+  const slow = ai.available && ai.provider === "CPU";
+  const aiText = slow
+    ? "AI on the main processor (slow)"
+    : ai.available
+      ? "AI ready on the graphics card"
+      : ai.provider === "checking"
+        ? "AI: checking…"
+        : "AI not available";
+  const where = helperBase !== DEFAULT_HELPER && helperBase !== location.origin ? `\nVeoClone address: ${helperBase}` : "";
   setChildren(
     host,
     h(
       "span",
       {
-        class: `pill ${ai.available || ai.provider === "checking" ? "pill-good" : "pill-warn"}`,
-        title: `Connected to VeoClone ${s.health.version}\nGraphics card: ${gpu.name || "checking…"} (${gpu.backend})\n${aiText} (${ai.provider})\nFree disk space: ${formatBytes(s.health.freeDiskBytes)}`,
+        class: `pill ${!slow && (ai.available || ai.provider === "checking") ? "pill-good" : "pill-warn"}`,
+        title: `Connected to VeoClone ${s.health.version}\nGraphics card: ${gpu.name || "checking…"}\n${aiText}\nFree disk space: ${formatBytes(s.health.freeDiskBytes)}${where}`,
       },
       h("span", { class: "dot" }),
       h("span", { class: "pill-main" }, "Connected"),
-      h("span", { class: "pill-extra" }, ` · ${gpu.name || "checking graphics card…"} · ${aiText}`),
+      // The important part first: the pill is cut short on small screens.
+      h("span", { class: "pill-extra" }, slow ? ` · ${aiText} · ${gpu.name}` : ` · ${gpu.name || "checking graphics card…"} · ${aiText}`),
     ),
   );
 }
@@ -110,7 +113,17 @@ export function renderBanner(host: HTMLElement, s: HelperState): void {
           null,
           h("li", null, h("strong", null, "Open VeoClone.exe"), " on your PC (double-click it in the VeoClone folder) and keep its window open."),
           h("li", null, "Don't have it yet? ", h("a", { href: DOWNLOAD_URL, target: "_blank", rel: "noopener" }, "Download VeoClone"), ", unzip it, then open VeoClone.exe."),
-          h("li", null, "If Chrome asks to allow access to devices on your network, click ", h("strong", null, "Allow"), "."),
+          h(
+            "li",
+            null,
+            "If the browser asks to let this page use apps and devices on your network, click ",
+            h("strong", null, "Allow"),
+            ". Clicked Block by mistake? Click the icon left of the web address, allow it again, then reload this page.",
+          ),
+          // The online editor needs that permission; the one VeoClone opens itself doesn't.
+          location.origin !== DEFAULT_HELPER
+            ? h("li", null, "Is the black VeoClone window already open? Use the editor that comes with it: ", h("a", { href: `${DEFAULT_HELPER}/` }, `${DEFAULT_HELPER}/`), ".")
+            : null,
         ),
         h("p", { class: "muted small" }, "This page will connect by itself as soon as VeoClone is running.", custom ? ` (Looking at ${helperBase})` : ""),
       ),

@@ -15,13 +15,18 @@ Options: `--port N`, `--empty` (no matches), `--speed X` (fake jobs X times
 faster), `--web DIR` (also serve a built editor, like the real helper).
 
 Test hooks: a match whose name contains "fail" fails once while lining up the
-videos (Try again then works); "slow" makes its jobs 10 times slower.
+videos (Try again then works; a re-run of a ready match goes back to ready
+with a warning instead, like the real helper, DESIGN.md 4.7); "slow" makes its
+jobs 10 times slower. Like the real helper it refuses to delete a match while
+a video is still arriving, and it supports `POST /api/projects/:id/swap`.
 `GET /__mock/state` shows what the editor sent (edits, last export with a
-summary of the camera path, "Show in folder" calls); `POST /__mock/reset`
+summary of the camera path, "Show in folder" calls, swaps); `POST /__mock/reset`
 (`?seed` for the example match) forgets everything.
 
 To use another helper address, open the editor with `?helper=http://127.0.0.1:PORT`
-(remembered in the browser; `?helper=` with no value forgets it).
+(remembered in the browser; `?helper=` with no value forgets it). Only
+`http://127.0.0.1:PORT` and `http://localhost:PORT` are accepted, so a link
+can never send someone's videos to another computer.
 
 ## Fixtures
 
@@ -33,7 +38,8 @@ football picture, 20 s, 30 fps, right phone started 12 frames early):
 - `proxy.mp4`: the helper's stacked preview (1280x1440, left camera on top,
   600 frames), re-encoded as VP9 + Opus because Playwright's Chromium cannot
   play H.264. The real helper makes H.264.
-- `lenses.json`: the real helper's `/api/lenses` list.
+- `lenses.json`: lens choices in the `/api/lenses` format (DESIGN.md 4.6:
+  "Not sure" first, then the iPhones newest first, Ultra wide and Normal each).
 - `left-small.mp4`, `right-small.mp4`: tiny clips for upload tests.
 
 ## UI tests

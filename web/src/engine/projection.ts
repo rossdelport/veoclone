@@ -2,7 +2,8 @@
 // render/renderer.rs (view matrix, quads), shaders/fisheye.wgsl (lens and
 // blending) and projection/virtual_camera.rs (yaw/pitch basis).
 // Rig tilt/roll are assumed to be 0 (true for iPhone footage).
-import type { CalibInfo, CameraUniforms, Pose, Vec3 } from "./types";
+import { globalYawRange } from "./clamp";
+import type { CalibInfo, CameraUniforms, Coverage, Pose, Vec3 } from "./types";
 
 /** Precomputed geometry of a calibration (planes, eye, basis). */
 export interface Rig {
@@ -196,6 +197,64 @@ export function sampleRay(ray: Vec3, rig: Rig): { left: RaySample | null; right:
     left: sampleCamera(ray, rig, rig.cameras.left, false),
     right: sampleCamera(ray, rig, rig.cameras.right, true),
   };
+}
+
+export interface Extent {
+  yawMin: number;
+  yawMax: number;
+  pitchMin: number;
+  pitchMax: number;
+}
+
+/**
+ * The angles the whole-pitch overview shows: the picture plus a small margin.
+ * The coverage table's widest row is no good for this: its stray edge points
+ * (and the lens maths at very wide angles) reach far past the picture, which
+ * then shrinks to a small strip in a big black box. So this looks where the
+ * cameras actually show something and keeps the biggest connected area.
+ */
+export function overviewExtent(rig: Rig, cov: Coverage): Extent {
+  let [y0, y1] = globalYawRange(cov);
+  let { pitchMin: p0, pitchMax: p1 } = cov;
+  if (!(y1 > y0)) [y0, y1] = [-Math.PI, Math.PI];
+  if (!(p1 > p0)) [p0, p1] = [-1.2, 1.2];
+  const W = 160, H = 80;
+  const yawAt = (i: number) => y1 - ((i + 0.5) / W) * (y1 - y0);
+  const pitchAt = (j: number) => p1 - ((j + 0.5) / H) * (p1 - p0);
+  const lit = new Uint8Array(W * H);
+  for (let j = 0; j < H; j++) {
+    for (let i = 0; i < W; i++) {
+      const s = sampleRay(yawPitchToDirection(yawAt(i), pitchAt(j), rig), rig);
+      lit[j * W + i] = s.left || s.right ? 1 : 0;
+    }
+  }
+  // Biggest 4-connected lit area (flood fill); its bounding box in cells.
+  let best = { size: 0, i0: 0, i1: W - 1, j0: 0, j1: H - 1 };
+  for (let start = 0; start < W * H; start++) {
+    if (lit[start] !== 1) continue;
+    const box = { size: 0, i0: W, i1: -1, j0: H, j1: -1 };
+    const stack = [start];
+    lit[start] = 2;
+    while (stack.length) {
+      const k = stack.pop()!;
+      const i = k % W, j = (k - i) / W;
+      box.size++;
+      box.i0 = Math.min(box.i0, i);
+      box.i1 = Math.max(box.i1, i);
+      box.j0 = Math.min(box.j0, j);
+      box.j1 = Math.max(box.j1, j);
+      for (const n of [i > 0 ? k - 1 : -1, i < W - 1 ? k + 1 : -1, k - W, k + W]) {
+        if (n >= 0 && n < W * H && lit[n] === 1) {
+          lit[n] = 2;
+          stack.push(n);
+        }
+      }
+    }
+    if (box.size > best.size) best = box;
+  }
+  const mi = (best.i1 - best.i0 + 1) * 0.03 + 0.5;
+  const mj = (best.j1 - best.j0 + 1) * 0.03 + 0.5;
+  return { yawMax: yawAt(best.i0 - mi), yawMin: yawAt(best.i1 + mi), pitchMax: pitchAt(best.j0 - mj), pitchMin: pitchAt(best.j1 + mj) };
 }
 
 /** Outline of the virtual camera's view as yaw/pitch points (for the overview rectangle). */

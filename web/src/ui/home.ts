@@ -1,20 +1,29 @@
 // Home: the list of matches.
 import { api, isBusy, type ProjectMeta } from "../api";
 import { button, confirmDialog, describeError, errorBox, progressBar, toast } from "./common";
-import { formatBytes, formatDate, h, icon, setChildren } from "./dom";
+import { formatBytes, formatDate, formatTimeLeft, h, icon, plural, setChildren } from "./dom";
 import { onHelperState } from "./health";
 import { I } from "./icons";
 import type { Page, PageContext } from "./page";
 
-/** Plain-words status of a match and a colour class. */
-export function statusOf(p: ProjectMeta): { text: string; tone: "good" | "busy" | "warn" | "bad" | "muted"; progress?: number } {
+/**
+ * Plain-words status of a match and a colour class; while VeoClone works on
+ * it, the current step's progress and time left (the steps take very
+ * different times, so one overall figure would mislead).
+ */
+export function statusOf(p: ProjectMeta): { text: string; tone: "good" | "busy" | "warn" | "bad" | "muted"; progress?: number; detail?: string } {
   const exporting = p.exports.find((e) => e.status === "running" || e.status === "queued");
+  const timeLeft = (job: typeof p.job) => (job ? formatTimeLeft(job.etaSeconds) : "");
   if (p.status === "processing" && p.job) {
-    const overall = (p.job.stepIndex + p.job.progress) / Math.max(1, p.job.stepCount);
-    return { text: `Processing ${Math.round(overall * 100)}%`, tone: "busy", progress: overall };
+    const step = `step ${Math.min(p.job.stepIndex + 1, p.job.stepCount)} of ${p.job.stepCount}`;
+    const detail = [`${p.job.message} ${Math.round(p.job.progress * 100)}%`, timeLeft(p.job)].filter(Boolean).join(" · ");
+    return { text: `Processing: ${step}`, tone: "busy", progress: p.job.progress, detail };
   }
   if (p.status === "queued") return { text: "Waiting to start", tone: "busy", progress: 0 };
-  if (exporting) return { text: `Making video ${Math.round(exporting.progress * 100)}%`, tone: "busy", progress: exporting.progress };
+  if (exporting) {
+    const job = p.job?.kind === "export" && p.job.exportId === exporting.id ? p.job : null;
+    return { text: `Making video ${Math.round(exporting.progress * 100)}%`, tone: "busy", progress: exporting.progress, detail: timeLeft(job) || undefined };
+  }
   switch (p.status) {
     case "ready":
       return { text: "Ready to edit", tone: "good" };
@@ -113,8 +122,14 @@ export function homePage(ctx: PageContext): Page {
         { class: "match-info" },
         h("h2", null, h("a", { href: openHref(p) }, p.name)),
         h("p", { class: "muted small" }, facts.join(" · ")),
-        h("div", { class: "match-status" }, h("span", { class: `badge badge-${s.tone}` }, s.text)),
+        h(
+          "div",
+          { class: "match-status" },
+          h("span", { class: `badge badge-${s.tone}` }, s.text),
+          p.warnings.length ? h("span", { class: "badge badge-warn", title: p.warnings.join("\n"), "data-testid": "warnings-badge" }, `${plural(p.warnings.length, "thing")} to check`) : null,
+        ),
         s.progress !== undefined ? progressBar(s.progress, `${p.name}: ${s.text}`) : null,
+        s.detail ? h("p", { class: "muted small" }, s.detail) : null,
       ),
       h(
         "div",

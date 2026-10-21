@@ -5,6 +5,7 @@ name: Test Build (Windows GUI)
 # (reco-gui.exe + FFmpeg/ONNX/DirectML DLLs) as a downloadable artifact.
 # Not a release: no tag, no publish.
 
+# Upstream Reco workflow: in VeoClone it only runs by hand (VeoClone's own are veoclone-*.yml).
 on:
   workflow_dispatch:
     inputs:

@@ -14,7 +14,7 @@ use reco_core::detect::tracker::WorldState;
 use serde::Deserialize;
 
 use crate::calib::BLEND_WIDTH;
-use crate::jobs::{Context, JobError, Progress};
+use crate::jobs::{Context, JobError, Progress, check_free_space};
 use crate::media::{RunError, Tools, concat, concat_list};
 use crate::store::{ExportStatus, Fps, Quality, Step, original_file};
 
@@ -190,6 +190,21 @@ pub fn render_parts(
                 r.frames_processed
             );
         }
+        // Reco stops at a damaged spot as if the video ended there.
+        if crate::process::stopped_early(r.frames_processed, expected, plan.fps) {
+            return Err(JobError::failed(
+                format!(
+                    "The videos could not be read past {} of the match. One of the files may \
+                     be damaged.",
+                    plan.fps.clock(seg.start_frame + r.frames_processed)
+                ),
+                format!(
+                    "part {} has {} of {expected} frames",
+                    i + 1,
+                    r.frames_processed
+                ),
+            ));
+        }
         done_before += expected;
         parts.push(name);
     }
@@ -244,7 +259,7 @@ pub fn join_parts(
     Ok(())
 }
 
-/// A safe file name: "<project name> <date>.mp4".
+/// A safe file name: `<project name> <date>.mp4`.
 pub fn file_name(project_name: &str, when: chrono::DateTime<chrono::Local>) -> String {
     let clean: String = project_name
         .chars()
@@ -262,6 +277,17 @@ pub fn file_name(project_name: &str, when: chrono::DateTime<chrono::Local>) -> S
         clean = "Match".into();
     }
     format!("{clean} {}.mp4", when.format("%Y-%m-%d %H.%M"))
+}
+
+/// Rough size of the finished video in bytes (it varies with the picture).
+fn size_estimate(req: &ExportRequest, secs: f64) -> u64 {
+    let mbps_1080p = match req.quality {
+        Quality::Fast => 6.0,
+        Quality::Balanced => 10.0,
+        Quality::High => 16.0,
+    };
+    let pixels = (req.width * req.height) as f64 / (1920.0 * 1080.0);
+    (mbps_1080p * pixels * 1e6 / 8.0 * secs) as u64
 }
 
 pub fn run(
@@ -304,6 +330,12 @@ pub fn run(
         .iter()
         .map(|s| s.end_frame - s.start_frame)
         .sum();
+    // The parts and the joined video exist together for a moment.
+    let need = size_estimate(req, fps.frame_to_secs(total)) * 2;
+    if let Err(e) = check_free_space(&out_dir, need) {
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return Err(e);
+    }
     let plan = RenderPlan {
         left: &left,
         right: &right,
@@ -448,11 +480,13 @@ mod tests {
     }
 
     /// Footage whose brightness encodes the frame number: frame n has luma
-    /// 30 + 13 * (n % 16).
+    /// 30 + 13 * (n % 16). Like phone videos, the timestamps are not exactly
+    /// on the n / 30 s grid: every odd frame starts a 1/600 s tick early.
     fn coded_clip(path: &Path, frames: u32) {
         let video = format!(
             "color=c=black:s=64x36:r=30:d={},format=yuv420p,\
-             geq=lum='30+13*mod(N,16)':cb=128:cr=128,scale=1280:720:flags=neighbor",
+             geq=lum='30+13*mod(N,16)':cb=128:cr=128,scale=1280:720:flags=neighbor,\
+             settb=1/600,setpts='N*20-mod(N,2)'",
             frames as f64 / 30.0
         );
         let audio = format!("sine=f=440:sample_rate=48000:d={}", frames as f64 / 30.0);
@@ -470,6 +504,12 @@ mod tests {
                 "lavfi",
                 "-i",
                 &audio,
+                "-fps_mode",
+                "passthrough",
+                "-enc_time_base",
+                "1/600",
+                "-video_track_timescale",
+                "600",
                 "-c:v",
                 "libx264",
                 "-g",
@@ -518,7 +558,8 @@ mod tests {
 
     /// End-to-end check that exported frame k shows synced frame
     /// `start + k` with the pose `path[start + k]`, across trims (short and
-    /// long seeks) and the sync offset; also checks the preview proxy.
+    /// long seeks, one to a frame that starts early) and the sync offset;
+    /// also checks the preview proxy.
     /// Needs ffmpeg on PATH and a working GPU (llvmpipe is fine):
     /// `cargo test -p veoclone-helper -- --ignored export_frame_alignment`
     #[test]
@@ -547,7 +588,7 @@ mod tests {
                 ((f + 12) % 16) as i32
             }
         };
-        let segments = [(40, 120), (180, 220), (340, 430)];
+        let segments = [(40, 120), (180, 220), (341, 430)];
         let request = ExportRequest {
             segments: segments
                 .iter()
@@ -608,7 +649,7 @@ mod tests {
         .trim()
         .parse()
         .unwrap();
-        assert!((dur - 210.0 / 30.0).abs() < 0.1, "duration {dur}");
+        assert!((dur - 209.0 / 30.0).abs() < 0.1, "duration {dur}");
         let streams = String::from_utf8(sh(
             "ffprobe",
             &[

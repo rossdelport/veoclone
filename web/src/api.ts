@@ -17,11 +17,16 @@ export interface Health {
   freeDiskBytes: number;
 }
 
-export interface Lens {
+/** One "which iPhone, which lens" choice (DESIGN.md 4.6). */
+export interface LensOption {
+  /** Stored as ProjectMeta.lensId, e.g. "iphone-15-pro:ultra", "generic:ultra". */
   id: string;
+  /** "iPhone 15 Pro", newest first; "Not sure" for the generic choices. */
+  model: string;
+  /** ultra = 0.5× ultra wide, main = 1× normal. */
+  lens: "ultra" | "main";
   label: string;
-  width: number;
-  height: number;
+  note?: string;
 }
 
 export interface ProbeInfo {
@@ -138,19 +143,25 @@ function writeStorage(value: string | null): void {
   }
 }
 
+/** Only a helper on this PC: the match videos must never go anywhere else. */
+const LOOPBACK = /^http:\/\/(127\.0\.0\.1|localhost):\d{1,5}$/;
+
 /**
- * Same origin when the helper serves the page; otherwise ?helper=URL (kept in
- * localStorage, "?helper=" with no value forgets it), else the default.
+ * Same origin when the helper serves the page; otherwise ?helper=URL on this
+ * PC (kept in localStorage, "?helper=" with no value forgets it), else the
+ * default. Any other address is ignored.
  */
 function resolveBase(): string {
+  if (location.port === "47863" && /^(127\.0\.0\.1|localhost)$/.test(location.hostname)) return location.origin;
   const param = new URLSearchParams(location.search).get("helper");
   if (param !== null) {
     const clean = param.trim().replace(/\/+$/, "");
-    writeStorage(clean || null);
-    if (clean) return clean;
+    const ok = LOOPBACK.test(clean);
+    writeStorage(ok ? clean : null);
+    if (ok) return clean;
   }
-  if (location.port === "47863" && /^(127\.0\.0\.1|localhost)$/.test(location.hostname)) return location.origin;
-  return readStorage() || DEFAULT_HELPER;
+  const stored = readStorage();
+  return stored && LOOPBACK.test(stored) ? stored : DEFAULT_HELPER;
 }
 
 export const helperBase = resolveBase();
@@ -205,7 +216,7 @@ const project = (id: string) => `/api/projects/${enc(id)}`;
 
 export const api = {
   health: () => json<Health>("GET", "/api/health", undefined, 4000),
-  lenses: () => json<Lens[]>("GET", "/api/lenses"),
+  lenses: () => json<LensOption[]>("GET", "/api/lenses"),
   listProjects: () => json<ProjectMeta[]>("GET", "/api/projects"),
   createProject: (body: { name: string; lensId?: string | null; style: Style }) =>
     json<ProjectMeta>("POST", "/api/projects", body),
@@ -215,6 +226,7 @@ export const api = {
   deleteProject: (id: string) => request("DELETE", project(id)).then(() => undefined),
   process: (id: string) => json<ProjectMeta>("POST", `${project(id)}/process`),
   cancel: (id: string) => json<ProjectMeta>("POST", `${project(id)}/cancel`),
+  swap: (id: string) => json<ProjectMeta>("POST", `${project(id)}/swap`),
   calibration: (id: string) => json<CalibInfo>("GET", `${project(id)}/calibration`),
   aiPath: async (id: string): Promise<Float32Array> => {
     const res = await request("GET", `${project(id)}/ai-path.bin`, undefined, 120_000);

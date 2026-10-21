@@ -10,7 +10,9 @@ use std::time::Instant;
 
 use crate::export::ExportRequest;
 use crate::media::Tools;
-use crate::store::{ErrorInfo, ExportStatus, JobInfo, JobKind, Status, Step, Store, now_iso};
+use crate::store::{
+    ErrorInfo, ExportStatus, JobInfo, JobKind, Status, Step, Store, end_unfinished_run, now_iso,
+};
 
 #[derive(Debug, Clone)]
 pub enum Job {
@@ -164,6 +166,7 @@ impl Jobs {
     fn run(&self, ctx: Context) {
         loop {
             let (job, cancel) = self.next();
+            keep_awake(true);
             let project = job.project().to_string();
             let dir = ctx.store.project_dir(&project);
             crate::logging::start_job_log(&dir.join("log.txt"));
@@ -204,8 +207,55 @@ impl Jobs {
             }
             finish(&ctx.store, &job, result);
             crate::logging::end_job_log();
+            keep_awake(false);
             self.lock().running = None;
         }
+    }
+}
+
+/// While a job runs, ask Windows not to go to sleep (the screen may still
+/// turn off). The request belongs to the calling thread: the one thread
+/// that runs every job.
+fn keep_awake(on: bool) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Power::{
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+        };
+        let flags = if on {
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        } else {
+            ES_CONTINUOUS
+        };
+        // SAFETY: plain Win32 call with valid flags.
+        unsafe { SetThreadExecutionState(flags) };
+    }
+    #[cfg(not(windows))]
+    let _ = on;
+}
+
+/// Shown when a job failed and the disk is (nearly) full, which is the
+/// likely reason.
+const DISK_FULL: &str = "Your disk is full. Free up some space (for example by deleting old \
+                             matches or videos) and press Try again.";
+
+/// Below this much free space a failure is blamed on the full disk.
+const NEARLY_FULL: u64 = 1 << 30;
+
+/// Fail before a long job when the disk clearly cannot hold what it makes
+/// (`need` bytes, a rough estimate).
+pub fn check_free_space(dir: &std::path::Path, need: u64) -> Result<(), JobError> {
+    match fs4::available_space(dir) {
+        Ok(free) if free < need => Err(JobError::failed(
+            format!(
+                "There is not enough free disk space for this: about {} GB more is needed. \
+                 Free up some space (for example by deleting old matches or videos) and \
+                 press Try again.",
+                (need - free).div_ceil(1 << 30)
+            ),
+            format!("{free} bytes free, about {need} needed"),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -218,6 +268,15 @@ fn describe(job: &Job) -> String {
 
 /// Record how a job ended in project.json.
 fn finish(store: &Store, job: &Job, result: Result<(), JobError>) {
+    let dir = store.project_dir(job.project());
+    let result = match result {
+        Err(JobError::Failed { message, detail })
+            if fs4::available_space(&dir).is_ok_and(|free| free < NEARLY_FULL) =>
+        {
+            Err(JobError::failed(DISK_FULL, format!("{message} ({detail})")))
+        }
+        r => r,
+    };
     store.update(job.project(), |m| {
         m.job = None;
         match job {
@@ -225,17 +284,15 @@ fn finish(store: &Store, job: &Job, result: Result<(), JobError>) {
                 Ok(()) => {
                     m.status = Status::Ready;
                     m.error = None;
+                    m.interrupted_runs = 0;
                 }
-                Err(JobError::Cancelled) => {
-                    m.status = Status::Cancelled;
-                    m.error = None;
-                }
+                Err(JobError::Cancelled) => end_unfinished_run(m, &dir, None),
                 Err(JobError::Failed { message, detail }) => {
-                    m.status = Status::Failed;
-                    m.error = Some(ErrorInfo {
+                    let error = ErrorInfo {
                         message,
                         detail: Some(detail),
-                    });
+                    };
+                    end_unfinished_run(m, &dir, Some(error));
                 }
             },
             Job::Export { export, .. } => {
@@ -246,9 +303,11 @@ fn finish(store: &Store, job: &Job, result: Result<(), JobError>) {
                             ex.progress = 1.0;
                         }
                         Err(JobError::Cancelled) => ex.status = ExportStatus::Cancelled,
-                        Err(JobError::Failed { message, .. }) => {
+                        Err(JobError::Failed { message, detail }) => {
                             ex.status = ExportStatus::Failed;
-                            ex.error = Some(message);
+                            // First line in plain words, then the
+                            // technical detail.
+                            ex.error = Some(format!("{message}\n{detail}"));
                         }
                     }
                 }

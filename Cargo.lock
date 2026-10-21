@@ -7524,6 +7524,7 @@ dependencies = [
  "dirs",
  "fs4",
  "futures-util",
+ "libc",
  "log",
  "open",
  "reco-autocam",
@@ -7540,6 +7541,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

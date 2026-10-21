@@ -1,7 +1,8 @@
 name: VeoClone CI
 
 # Checks the VeoClone parts (web/ editor and crates/veoclone-helper) on every
-# push and pull request. Reco's own crates are checked by rust.yml.
+# push and pull request. Reco's own crates are checked by rust.yml, which
+# only runs by hand in this repository.
 
 on:
   push:

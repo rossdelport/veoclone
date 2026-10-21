@@ -6,11 +6,14 @@ name: VeoClone Windows
 #
 # - Every run uploads the folder as the artifact "VeoClone-windows"
 #   (it downloads from the run page as VeoClone-windows.zip).
-# - On main it also updates the rolling pre-release "helper-latest".
+# - On the repository's default branch (whatever it is called: today a
+#   claude/ branch, later perhaps main) it also updates the rolling
+#   pre-release "helper-latest".
 # - A tag like veoclone-v0.2.0 makes a normal release with the zip.
 
 on:
   push:
+    # The default branch must be one of these.
     branches: [main, 'claude/**']
     tags: ['veoclone-v*']
   workflow_dispatch:
@@ -20,8 +23,9 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Let a running main build finish so the release is never half-updated.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Let a running default-branch build finish so the release is never
+  # half-updated.
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -226,13 +230,13 @@ jobs:
           if-no-files-found: error
 
   # ====================================================================
-  # Publish to GitHub Releases (main and veoclone-v* tags only). A
-  # separate job so that only this small step can write to the repo.
+  # Publish to GitHub Releases (default branch and veoclone-v* tags only).
+  # A separate job so that only this small step can write to the repo.
   # ====================================================================
   publish:
     name: Publish release
     needs: build
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/veoclone-v')
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/veoclone-v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -254,21 +258,39 @@ jobs:
           ls -l ../VeoClone-windows.zip
 
       - name: Update the "helper-latest" pre-release
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: |
           title="VeoClone for Windows (latest build)"
-          notes="The newest build of VeoClone for Windows, made automatically from commit ${GITHUB_SHA::7} on $(date -u '+%-d %B %Y').
+          notes="The newest build of VeoClone for Windows, made automatically on $(date -u '+%-d %B %Y') from commit ${GITHUB_SHA::7}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}
 
           How to use it: download VeoClone-windows.zip below, unzip it, then double-click VeoClone.exe.
           Step-by-step guide: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}#readme"
 
-          # Replace the previous build and its tag. (Moving the existing tag
-          # instead is refused for GITHUB_TOKEN whenever a workflow file
-          # changed in between.) The download link stays the same.
-          gh release delete helper-latest --cleanup-tag --yes || true
-          gh api --method DELETE "repos/$GH_REPO/git/refs/tags/helper-latest" > /dev/null 2>&1 || true
-          gh release create helper-latest VeoClone-windows.zip --target "$GITHUB_SHA" --prerelease \
-            --title "$title" --notes "$notes"
+          if gh release view helper-latest > /dev/null 2>&1; then
+            # Update the release in place so the download link keeps
+            # working: upload the new zip under another name first, then
+            # swap it for the old one.
+            cp VeoClone-windows.zip VeoClone-windows-new.zip
+            gh release upload helper-latest VeoClone-windows-new.zip --clobber
+            asset_id() {
+              gh api "repos/$GH_REPO/releases/tags/helper-latest" --jq ".assets[] | select(.name == \"$1\") | .id"
+            }
+            old=$(asset_id VeoClone-windows.zip)
+            new=$(asset_id VeoClone-windows-new.zip)
+            if [ -n "$old" ]; then gh api --method DELETE "repos/$GH_REPO/releases/assets/$old"; fi
+            gh api --method PATCH "repos/$GH_REPO/releases/assets/$new" -f name=VeoClone-windows.zip > /dev/null
+            gh release edit helper-latest --title "$title" --notes "$notes"
+          else
+            # First build: create the release (and its tag) with the zip.
+            gh release create helper-latest VeoClone-windows.zip --target "$GITHUB_SHA" --prerelease \
+              --title "$title" --notes "$notes"
+          fi
+
+          # Move the tag to this commit too. GitHub can refuse this for the
+          # workflow's token when a workflow file changed in between; the
+          # download is fine either way and the notes name the commit.
+          gh api --method PATCH "repos/$GH_REPO/git/refs/tags/helper-latest" -f sha="$GITHUB_SHA" -F force=true > /dev/null \
+            || echo "::warning::Could not move the helper-latest tag to ${GITHUB_SHA::7}; the release notes name the right commit."
 
       - name: Publish the release for this tag
         if: startsWith(github.ref, 'refs/tags/veoclone-v')

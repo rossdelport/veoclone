@@ -12,7 +12,8 @@ mod media;
 mod process;
 mod store;
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -48,14 +49,54 @@ struct Args {
     no_open: bool,
 }
 
+/// Where matches are stored: `--data-dir`, else env `VEOCLONE_HOME`, else
+/// `Videos/VeoClone`. When OneDrive backs up the Videos folder (it would
+/// upload tens of gigabytes per match), or Videos cannot be used (Windows
+/// Controlled Folder Access), `<home>/VeoClone` is used instead, unless
+/// matches are already stored in Videos.
 fn data_dir(arg: Option<PathBuf>) -> PathBuf {
-    arg.or_else(|| std::env::var_os("VEOCLONE_HOME").map(PathBuf::from))
-        .unwrap_or_else(|| {
-            dirs::video_dir()
-                .or_else(dirs::home_dir)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("VeoClone")
-        })
+    if let Some(dir) = arg.or_else(|| std::env::var_os("VEOCLONE_HOME").map(PathBuf::from)) {
+        return dir;
+    }
+    let home = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("VeoClone");
+    let onedrive: Vec<OsString> = ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .collect();
+    match dirs::video_dir().map(|v| v.join("VeoClone")) {
+        Some(videos) if videos.is_dir() => videos,
+        Some(videos)
+            if !inside_any(&videos, &onedrive) && std::fs::create_dir_all(&videos).is_ok() =>
+        {
+            videos
+        }
+        _ => home,
+    }
+}
+
+/// Is `path` inside one of the `folders` (ignoring upper/lower case, as
+/// Windows does)?
+fn inside_any(path: &Path, folders: &[OsString]) -> bool {
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    folders
+        .iter()
+        .filter(|f| !f.is_empty())
+        .any(|f| lower(path).starts_with(lower(Path::new(f))))
+}
+
+/// Hold `<data>/veoclone.lock` while VeoClone runs, so a second copy
+/// started with another `--port` cannot use the same folder.
+fn lock_folder(data: &Path) -> Result<std::fs::File, std::fs::TryLockError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data.join("veoclone.lock"))
+        .map_err(std::fs::TryLockError::Error)?;
+    file.try_lock()?;
+    Ok(file)
 }
 
 /// Reco's audio sync runs `ffmpeg` by name, so make the bundled copy next to
@@ -83,6 +124,23 @@ fn main() {
     let args = Args::parse();
     put_exe_dir_on_path();
     logging::init();
+    let url = format!("http://127.0.0.1:{}/", args.port);
+
+    // One VeoClone at a time. The port is taken before anything else: a
+    // second copy must not tidy up the folder the first one is working in.
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", args.port)) {
+        Ok(l) => l,
+        Err(e) => {
+            if !args.no_open {
+                let _ = open::that_detached(&url);
+            }
+            exit_with(&format!(
+                "VeoClone is already running (or another program uses port {}). You can \
+                 close this window. ({e})",
+                args.port
+            ));
+        }
+    };
 
     let data = data_dir(args.data_dir);
     let data = std::path::absolute(&data).unwrap_or(data);
@@ -92,6 +150,17 @@ fn main() {
             data.display()
         ));
     }
+    let _lock = match lock_folder(&data) {
+        Ok(file) => Some(file),
+        Err(std::fs::TryLockError::WouldBlock) => exit_with(&format!(
+            "VeoClone is already running and using the folder {}. You can close this window.",
+            data.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => {
+            log::warn!("Could not lock {}: {e}", data.display());
+            None
+        }
+    };
     let store = match Store::open(&data) {
         Ok(s) => Arc::new(s),
         Err(e) => exit_with(&format!(
@@ -167,7 +236,6 @@ fn main() {
     let mut origins = api::default_origins(args.port);
     origins.extend(args.allow_origin);
     let app = api::router(state, args.port, &origins, &web_dir);
-    let url = format!("http://127.0.0.1:{}/", args.port);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -175,21 +243,15 @@ fn main() {
         .build()
         .expect("tokio runtime");
     runtime.block_on(async move {
-        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
+        let listener = match listener
+            .set_nonblocking(true)
+            .and_then(|()| tokio::net::TcpListener::from_std(listener))
+        {
             Ok(l) => l,
-            Err(e) => {
-                if !args.no_open {
-                    let _ = open::that_detached(&url);
-                }
-                exit_with(&format!(
-                    "VeoClone is already running (or another program uses port {}). You can \
-                     close this window. ({e})",
-                    args.port
-                ));
-            }
+            Err(e) => exit_with(&format!("VeoClone could not start: {e}")),
         };
         println!();
-        println!("  VeoClone helper {}", env!("CARGO_PKG_VERSION"));
+        println!("  VeoClone {}", env!("CARGO_PKG_VERSION"));
         println!();
         println!("  Keep this window open while you use VeoClone.");
         println!("  If your browser did not open, go to {url}");
@@ -199,7 +261,43 @@ fn main() {
             println!("  (Could not open the browser by itself.)");
         }
         if let Err(e) = axum::serve(listener, app).await {
-            exit_with(&format!("The VeoClone helper stopped: {e}"));
+            exit_with(&format!("VeoClone stopped: {e}"));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn onedrive_folders() {
+        let roots = [OsString::from("/home/ross/OneDrive"), OsString::new()];
+        assert!(inside_any(
+            Path::new("/home/ross/OneDrive/Videos/VeoClone"),
+            &roots
+        ));
+        assert!(inside_any(
+            Path::new("/home/ross/onedrive/Videos/VeoClone"),
+            &roots
+        ));
+        assert!(!inside_any(Path::new("/home/ross/Videos/VeoClone"), &roots));
+        assert!(!inside_any(
+            Path::new("/home/ross/OneDriveX/Videos"),
+            &roots
+        ));
+        assert_eq!(data_dir(Some("/x".into())), PathBuf::from("/x"));
+    }
+
+    #[test]
+    fn folder_lock_is_exclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = lock_folder(tmp.path()).unwrap();
+        assert!(matches!(
+            lock_folder(tmp.path()),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(first);
+        assert!(lock_folder(tmp.path()).is_ok());
+    }
 }

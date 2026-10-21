@@ -1,10 +1,11 @@
 // New match: name, iPhone model, camera style, the two videos, filming tips.
-import { api, ApiError, uploadFile, type Lens, type ProjectMeta, type Side, type Style, type Upload } from "../api";
-import { button, describeError, errorBox, toast } from "./common";
+import { api, ApiError, uploadFile, type ProjectMeta, type Side, type Style, type Upload } from "../api";
+import { button, describeError, errorBox, notice, toast } from "./common";
 import { formatBytes, h, icon, setChildren } from "./dom";
 import { assignFiles, dropZone, type DropZone } from "./dropzone";
 import { currentHealth, onHelperState } from "./health";
 import { I } from "./icons";
+import { DEFAULT_LENS, initialLens, lensOptions, lensPicker, lensUnavailable } from "./lens";
 import type { Page, PageContext } from "./page";
 
 export const STYLES: { id: Style; name: string; text: string }[] = [
@@ -29,36 +30,13 @@ export function stylePicker(value: Style, onChange: (s: Style) => void, name = "
   );
 }
 
-/** "Which iPhone filmed this?" select, grouped by phone model. */
-export function lensSelect(lenses: Lens[], value: string | null, onChange: (id: string | null) => void): HTMLSelectElement {
-  const groups = new Map<string, Lens[]>();
-  for (const l of lenses) {
-    const model = l.label.split(" · ")[0];
-    if (!groups.has(model)) groups.set(model, []);
-    groups.get(model)!.push(l);
-  }
-  const select = h(
-    "select",
-    { class: "input", id: "lens", onChange: () => onChange(select.value || null) },
-    h("option", { value: "" }, "Not sure (automatic)"),
-    [...groups].map(([model, items]) =>
-      h(
-        "optgroup",
-        { label: model },
-        items.map((l) => h("option", { value: l.id }, l.label.split(" · ").slice(1).join(" · ") || l.label)),
-      ),
-    ),
-  );
-  select.value = value ?? "";
-  return select;
-}
-
 export function filmingTips(): HTMLElement {
   const tips: [string, string][] = [
     ["Side by side, up high", "Put both phones next to each other on a tripod or fence, as high as you can, near the halfway line. Point one at each half of the pitch so the views overlap a little in the middle."],
     ["Use the 0.5× lens", "Choose the 0.5× (ultra wide) lens on both phones so together they see the whole pitch."],
     ["Landscape, 4K at 30 fps", "Hold the phones sideways. In Settings › Camera › Record Video choose 4K at 30 fps."],
     ["Turn HDR Video off", "In Settings › Camera › Record Video, switch off HDR Video, or the colours look washed out."],
+    ["Turn Auto FPS off", "In Settings › Camera › Record Video, switch off Auto FPS (called Auto Low Light FPS on older iPhones). Otherwise the phones slow down in dim light or under floodlights, and the two halves drift out of step."],
     ["Start both together", "Press record on both phones within a few seconds of each other. VeoClone lines them up using the sound."],
     ["Keep them still", "Don't touch or move the phones while recording. Plug in power banks for a full match."],
     ["One video per phone", "If you stopped recording at half-time, make two matches: one for each half."],
@@ -88,7 +66,7 @@ export async function sendVideos(
   let meta: ProjectMeta | null = null;
   for (const side of ["left", "right"] as Side[]) {
     const file = zones[side].file;
-    if (!file) continue;
+    if (!file || zones[side].uploaded) continue; // already sent (Try again after the other one failed)
     const up = uploadFile(id, side, file, (p) => zones[side].setUploading(p));
     onUpload(up);
     try {
@@ -102,6 +80,15 @@ export async function sendVideos(
   return meta;
 }
 
+/** Shown before and during processing when the AI can't use the graphics card. */
+export function slowAiNotice(): HTMLElement {
+  return notice(
+    "warning",
+    "The AI will run on the main processor, so processing takes much longer.",
+    h("p", { class: "small" }, "VeoClone could not use the graphics card. Update the AMD graphics driver (AMD Software: Adrenalin Edition), restart the PC, then open VeoClone again."),
+  );
+}
+
 function defaultName(): string {
   return `Match ${new Date().toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}`;
 }
@@ -109,14 +96,17 @@ function defaultName(): string {
 export function newMatchPage(ctx: PageContext): Page {
   ctx.setTitle("New match");
   let style: Style = "broadcast";
-  let lensId: string | null = null;
+  let lensId: string | null = DEFAULT_LENS;
+  let lensesLoaded = false;
   let upload: Upload | null = null;
   let busy = false;
   let projectId: string | null = null;
+  let stopping: Promise<void> = Promise.resolve();
 
   const nameInput = h("input", { class: "input input-big", id: "match-name", value: defaultName(), maxLength: 200, autocomplete: "off" });
-  const lensHost = h("div", { class: "lens-host" }, h("select", { class: "input", disabled: true, "aria-label": "Which iPhone filmed this?" }, h("option", null, "Loading the list…")));
+  const lensHost = h("div", { class: "lens-host" }, lensUnavailable("Loading the list…"));
   const status = h("div", { class: "start-status", "aria-live": "polite" });
+  const aiNote = h("div");
   const space = h("p", { class: "muted small space-info" });
 
   const zones = {} as Record<Side, DropZone>;
@@ -163,8 +153,8 @@ export function newMatchPage(ctx: PageContext): Page {
           h(
             "section",
             { class: "card form-section" },
-            h("label", { class: "field-label", for: "lens" }, "Which iPhone filmed this?"),
-            h("p", { class: "muted small" }, "Pick your model and the lens you used (0.5× is called Ultra Wide). If yours isn't listed, pick the closest older model, or leave it on automatic."),
+            h("h2", null, "Which iPhone and lens filmed this?"),
+            h("p", { class: "muted small" }, "Both phones should be the same model and use the same lens. Not sure which iPhone? Leave it on Not sure."),
             lensHost,
           ),
           h(
@@ -174,6 +164,7 @@ export function newMatchPage(ctx: PageContext): Page {
             h("p", { class: "muted small" }, "How the AI camera should move. You can fine-tune everything in the editor afterwards."),
             stylePicker(style, (s) => (style = s)),
           ),
+          aiNote,
           h("div", { class: "start-row" }, start, stop, status),
         ),
         filmingTips(),
@@ -193,6 +184,7 @@ export function newMatchPage(ctx: PageContext): Page {
       space.textContent = `Space needed on your PC: about ${formatBytes(needed)} (you have ${formatBytes(health.freeDiskBytes)} free).`;
       space.classList.toggle("text-bad", health.freeDiskBytes > 0 && health.freeDiskBytes < needed);
     } else space.textContent = "";
+    setChildren(aiNote, health?.ai.provider === "CPU" ? slowAiNotice() : null);
     const same = both && zones.left.file!.name === zones.right.file!.name && zones.left.file!.size === zones.right.file!.size;
     if (!busy) {
       setChildren(
@@ -206,10 +198,13 @@ export function newMatchPage(ctx: PageContext): Page {
 
   async function loadLenses() {
     try {
-      const lenses = await api.lenses();
-      setChildren(lensHost, lensSelect(lenses, lensId, (id) => (lensId = id)));
+      const options = await lensOptions();
+      lensId = initialLens(options, lensId)?.id ?? null;
+      lensesLoaded = true;
+      setChildren(lensHost, lensPicker(options, lensId, (id) => (lensId = id)));
+      if (busy) setBusy(true);
     } catch {
-      setChildren(lensHost, h("select", { class: "input", id: "lens", disabled: true }, h("option", null, "Not sure (automatic)")));
+      setChildren(lensHost, lensUnavailable());
     }
   }
 
@@ -219,7 +214,7 @@ export function newMatchPage(ctx: PageContext): Page {
     zones.left.setDisabled(b);
     zones.right.setDisabled(b);
     stop.hidden = !b;
-    for (const el of ctx.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>(".choice input, #lens")) el.disabled = b;
+    for (const el of ctx.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>(".choice input, #lens-model")) el.disabled = b || (!lensesLoaded && el.id === "lens-model");
     update();
   }
 
@@ -233,7 +228,9 @@ export function newMatchPage(ctx: PageContext): Page {
     setBusy(true);
     setChildren(status, h("p", { class: "small" }, "Sending your videos to VeoClone. Keep this page open."));
     try {
-      if (!projectId) projectId = (await api.createProject({ name, lensId, style })).id;
+      await stopping; // a Stop that is still tidying up
+      if (projectId) await api.updateProject(projectId, { name, lensId, style });
+      else projectId = (await api.createProject({ name, lensId, style })).id;
       await sendVideos(projectId, zones, (u) => (upload = u));
       await api.process(projectId);
       busy = false;
@@ -249,17 +246,35 @@ export function newMatchPage(ctx: PageContext): Page {
     }
   }
 
-  async function abort() {
-    upload?.abort();
-    if (projectId) {
+  /** Stop sending and remove the half-made match (VeoClone refuses while it still sees the upload). */
+  function abort(): Promise<void> {
+    const u = upload;
+    u?.abort();
+    stopping = (async () => {
+      await u?.promise.catch(() => undefined);
       const id = projectId;
-      projectId = null;
-      await api.deleteProject(id).catch(() => undefined);
-    }
+      for (let i = 0; id && i < 10; i++) {
+        try {
+          await api.deleteProject(id);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 409) {
+            await new Promise((r) => setTimeout(r, 300));
+            continue;
+          }
+          if (!(e instanceof ApiError && e.status === 404)) return; // keep it: the next Start uses it
+        }
+        if (projectId === id) projectId = null;
+        return;
+      }
+    })();
+    return stopping;
   }
 
-  void loadLenses();
-  const unsubscribe = onHelperState(() => update());
+  // The list comes from VeoClone, so (again) as soon as it is running.
+  const unsubscribe = onHelperState((s) => {
+    update();
+    if (s.kind === "online" && !lensesLoaded) void loadLenses();
+  });
   update();
   nameInput.addEventListener("focus", () => nameInput.select(), { once: true });
 

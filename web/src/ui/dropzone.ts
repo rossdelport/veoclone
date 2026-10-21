@@ -8,8 +8,10 @@ const VIDEO_EXT = /\.(mp4|mov|m4v|mkv|avi|mts|m2ts|3gp)$/i;
 
 export interface DropZone {
   el: HTMLElement;
-  /** The file chosen in this browser (null when using the helper's copy). */
+  /** The file chosen in this browser (null when using the copy VeoClone already has). */
   file: File | null;
+  /** That file has been sent to VeoClone. */
+  readonly uploaded: boolean;
   setFile(file: File | null): void;
   setUploading(p: UploadProgress | null): void;
   setUploaded(): void;
@@ -49,6 +51,7 @@ export function dropZone(opts: {
   );
 
   let file: File | null = null;
+  let uploaded = false;
   let disabled = false;
   let meta: { duration: number; width: number; height: number } | null = null;
   let metaToken = 0;
@@ -151,8 +154,12 @@ export function dropZone(opts: {
     get file() {
       return file;
     },
+    get uploaded() {
+      return uploaded;
+    },
     setFile(f) {
       file = f;
+      uploaded = false;
       el.classList.remove("uploaded");
       if (f) readMeta(f);
       render();
@@ -174,6 +181,7 @@ export function dropZone(opts: {
       text.textContent = [`Sending to VeoClone… ${Math.round(frac * 100)}%`, formatTimeLeft(left)].filter(Boolean).join(" · ");
     },
     setUploaded() {
+      uploaded = true;
       el.classList.remove("uploading");
       el.classList.add("uploaded");
       render();

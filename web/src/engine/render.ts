@@ -2,8 +2,7 @@
 // Reco's two camera planes (the same maths as projection.ts / fisheye.wgsl)
 // and samples the stacked proxy video: left camera in the top half, right
 // camera in the bottom half.
-import { globalYawRange } from "./clamp";
-import { buildRig, cameraBasis, type Rig, type RigCamera } from "./projection";
+import { buildRig, cameraBasis, overviewExtent, type Extent, type Rig, type RigCamera } from "./projection";
 import type { CalibInfo, Pose } from "./types";
 
 const VERTEX_SHADER = `#version 300 es
@@ -298,17 +297,12 @@ export class CameraViewRenderer extends ProxyRenderer {
 /** WebGL2 whole-pitch overview (equirectangular map of the coverage). */
 export class OverviewRenderer extends ProxyRenderer {
   /** Angles shown by the map: yawMax at the left edge, pitchMax at the top. */
-  readonly extent: { yawMin: number; yawMax: number; pitchMin: number; pitchMax: number };
+  readonly extent: Extent;
   private rendered = false;
 
   constructor(canvas: HTMLCanvasElement, calib: CalibInfo) {
     super(canvas, calib);
-    const cov = calib.coverage;
-    let [yawMin, yawMax] = globalYawRange(cov);
-    let { pitchMin, pitchMax } = cov;
-    if (!(yawMax > yawMin)) [yawMin, yawMax] = [-1, 1];
-    if (!(pitchMax > pitchMin)) [pitchMin, pitchMax] = [-0.5, 0.5];
-    this.extent = { yawMin, yawMax, pitchMin, pitchMax };
+    this.extent = overviewExtent(this.rig, calib.coverage);
   }
 
   render(): void {

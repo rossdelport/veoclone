@@ -13,6 +13,10 @@ repository is public:
 All three run by themselves on GitHub's computers ("GitHub Actions") when
 changes are pushed. Nobody has to build anything by hand.
 
+The download and the online editor are published from the repository's
+**default branch** (the one GitHub shows first; Settings › General › Default
+branch), whatever it is called. Today that is `claude/happy-einstein-iqtkqs`.
+
 ## One-time settings (the repository owner clicks these once)
 
 1. **Keep the repository public.** GitHub Pages and Actions minutes are free
@@ -20,6 +24,7 @@ changes are pushed. Nobody has to build anything by hand.
    repository visibility.)
 2. **Turn on GitHub Pages.** Settings › **Pages** › Build and deployment ›
    **Source**: choose **GitHub Actions**. Nothing else to pick on that page.
+   This is the only click the online editor needs.
 3. **Allow Actions to run.** Settings › **Actions** › General:
    - **Actions permissions**: "Allow all actions and reusable workflows" is
      simplest. If you prefer to limit them, allow actions by GitHub plus
@@ -32,12 +37,29 @@ changes are pushed. Nobody has to build anything by hand.
 4. **Releases**: nothing to set. If you see **"Enable release
    immutability"** (Settings › General › Releases), leave it **off**: the
    "latest build" download is replaced with each new build.
-5. **Publish for the first time.** If the first push to `main` happened
-   before step 2, open **Actions › VeoClone Pages › Run workflow** (on
-   `main`) once. After that it runs by itself.
+5. **Publish for the first time.** Open **Actions › VeoClone Pages › Run
+   workflow** and click **Run workflow** (the branch it offers is the
+   default branch). Do the same for **VeoClone Windows** if the Releases page
+   has no "VeoClone for Windows (latest build)" yet. After that both run by
+   themselves on every push to the default branch.
+6. **Old "Bump …" pull requests.** Reco's automatic dependency updates
+   (Dependabot) are switched off in this repository. If the **Pull requests**
+   tab still lists "Bump …" pull requests from Dependabot, close them
+   (**Close pull request**, then **Delete branch**). Don't merge them.
 
-GitHub creates a `github-pages` environment the first time Pages is
-published. It only allows `main` to publish; leave it like that.
+### Changing the default branch later
+
+If you make another branch the default later (for example a new `main`),
+the download and the online editor follow by themselves: nothing in the
+workflows needs to change. Two things to know:
+
+- The Windows build only runs on `main` and `claude/...` branches, so give
+  the default branch one of those names.
+- GitHub creates a `github-pages` environment the first time Pages is
+  published, and it may only allow the branch that was the default then. If
+  **VeoClone Pages** then fails with "not allowed to deploy to github-pages",
+  open Settings › **Environments** › **github-pages** and add the new
+  default branch under **Deployment branches and tags**.
 
 ## What happens automatically
 
@@ -45,20 +67,18 @@ published. It only allows `main` to publish; leave it like that.
 |---|---|
 | Any push or pull request | **VeoClone CI** checks the editor (type check, tests, build) and the helper (formatting, clippy, tests, an export test on a software GPU). |
 | Push to `main` or a `claude/...` branch | **VeoClone Windows** builds the VeoClone folder on a Windows computer, starts it once to check it works, and keeps it as a download on the run's page (Artifacts › VeoClone-windows) for 90 days. |
-| Push to `main` | The same build also replaces the download in the **"VeoClone for Windows (latest build)"** pre-release (tag `helper-latest`). This is the link the user guide gives out. **VeoClone Pages** publishes the editor. |
+| Push to the default branch | The same build also replaces the zip in the **"VeoClone for Windows (latest build)"** pre-release (tag `helper-latest`). The release is updated in place, so the link the user guide gives out never changes, and the old zip stays downloadable until the new one is fully uploaded. **VeoClone Pages** publishes the editor. (On other branches VeoClone Pages shows as skipped.) |
 | Tag `veoclone-v...` | **VeoClone Windows** makes a normal, permanent release with the zip, for example "VeoClone v0.2.0". |
+| Never by themselves | Reco's own workflows (**Rust CI**, **Release**, **Build Test Binary**, **Test Build (Windows GUI)**). They check and package Reco's own programs, not VeoClone, so in this repository they only run if someone starts them by hand (Actions › choose one › Run workflow). |
 
 To make a permanent release: change `version` in
 `crates/veoclone-helper/Cargo.toml` (so `VeoClone.exe --version` matches),
-push it to `main`, then:
+push it to the default branch, then:
 
 ```bash
 git tag veoclone-v0.2.0
 git push origin veoclone-v0.2.0
 ```
-
-Reco's own `release.yml` reacts to tags starting with `v`; it is set to
-ignore `veoclone-v...` tags.
 
 ## How to check it worked
 
@@ -73,7 +93,11 @@ ignore `veoclone-v...` tags.
 
 - The Windows build is the slow one (it compiles everything; allow up to
   an hour). Builds of a branch that get a newer push are cancelled; builds of
-  `main` always finish.
+  the default branch always finish.
+- The release notes name the commit each "latest build" was made from. The
+  `helper-latest` tag is moved to that commit too, except when GitHub refuses
+  (it can when a workflow file changed in between); the run then shows a
+  yellow warning, and the download is fine.
 - GitHub Pages: 1 GB per site. The editor is well under 1 MB.
 - Release files can be up to 2 GB each. `VeoClone-windows.zip` is a few
   hundred MB at most.

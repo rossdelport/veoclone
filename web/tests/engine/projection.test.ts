@@ -4,12 +4,16 @@ import {
   cameraBasis,
   directionToYawPitch,
   frustumOutline,
+  overviewExtent,
   sampleRay,
   viewRay,
   yawPitchToDirection,
+  type Extent,
   type Rig,
 } from "../../src/engine/projection";
-import type { MatchCalibration, Vec3 } from "../../src/engine/types";
+import { globalYawRange } from "../../src/engine/clamp";
+import type { CalibInfo, MatchCalibration, Vec3 } from "../../src/engine/types";
+import realCalib from "../../dev/fixtures/calib.json";
 import synthJson from "./fixtures/synth-match.json";
 import {
   calibInfoOf,
@@ -266,6 +270,66 @@ describe("frustumOutline", () => {
     expect(pts[0].yaw).toBeGreaterThan(pose.yaw);
     expect(pts[0].pitch).toBeGreaterThan(pose.pitch);
     expect(frustumOutline(pose, synthRig, ASPECT)).toHaveLength(64);
+  });
+});
+
+describe("overviewExtent", () => {
+  /** Share of the picture inside the extent, and share of the extent that is picture. */
+  function fill(calib: CalibInfo, e: Extent) {
+    const rig = buildRig(calib);
+    const [y0, y1] = globalYawRange(calib.coverage);
+    const { pitchMin: p0, pitchMax: p1 } = calib.coverage;
+    const isLit = (yaw: number, pitch: number) => {
+      const s = sampleRay(yawPitchToDirection(yaw, pitch, rig), rig);
+      return !!(s.left || s.right);
+    };
+    let lit = 0, inside = 0, litInExtent = 0;
+    for (let j = 0; j < 150; j++) {
+      for (let i = 0; i < 300; i++) {
+        const yaw = y0 + ((i + 0.5) / 300) * (y1 - y0);
+        const pitch = p0 + ((j + 0.5) / 150) * (p1 - p0);
+        if (!isLit(yaw, pitch)) continue;
+        lit++;
+        if (yaw >= e.yawMin && yaw <= e.yawMax && pitch >= e.pitchMin && pitch <= e.pitchMax) inside++;
+      }
+    }
+    for (let j = 0; j < 100; j++) {
+      for (let i = 0; i < 200; i++) {
+        if (isLit(e.yawMin + ((i + 0.5) / 200) * (e.yawMax - e.yawMin), e.pitchMin + ((j + 0.5) / 100) * (e.pitchMax - e.pitchMin))) litInExtent++;
+      }
+    }
+    return { pictureInside: inside / lit, pictureShare: litInExtent / 20_000 };
+  }
+
+  it("fits the picture, not the coverage table's stray rows (real helper output)", () => {
+    // The helper's calib.json for the synthetic footage: its outer table rows
+    // are single stray points, so the widest row is far wider than the picture.
+    const calib = realCalib as unknown as CalibInfo;
+    const e = overviewExtent(buildRig(calib), calib.coverage);
+    const [y0, y1] = globalYawRange(calib.coverage);
+    expect(e.yawMax - e.yawMin).toBeLessThan(0.7 * (y1 - y0));
+    const f = fill(calib, e);
+    expect(f.pictureInside).toBeGreaterThan(0.98);
+    expect(f.pictureShare).toBeGreaterThan(0.55);
+    // The old extent (the whole table) left most of the overview black.
+    expect(fill(calib, { yawMin: y0, yawMax: y1, pitchMin: calib.coverage.pitchMin, pitchMax: calib.coverage.pitchMax }).pictureShare).toBeLessThan(0.35);
+  });
+
+  it("fits the picture of Reco's test rig and of the synthetic rig", () => {
+    for (const m of [RECO_TEST_MATCH, synthMatch]) {
+      const calib = calibInfoOf(m, coverageFromMatch(m));
+      const f = fill(calib, overviewExtent(buildRig(calib), calib.coverage));
+      expect(f.pictureInside).toBeGreaterThan(0.98);
+      expect(f.pictureShare).toBeGreaterThan(0.55);
+    }
+  });
+
+  it("still finds the picture when the coverage table is empty", () => {
+    const calib = calibInfoOf(synthMatch, { pitchMin: 0, pitchMax: 0, maxFovDeg: 40, slices: [] });
+    const e = overviewExtent(buildRig(calib), calib.coverage);
+    expect(e.yawMax).toBeGreaterThan(e.yawMin);
+    expect(e.pitchMax).toBeGreaterThan(e.pitchMin);
+    expect(Math.abs(e.yawMin) + Math.abs(e.yawMax)).toBeLessThan(4); // not the whole circle
   });
 });
 

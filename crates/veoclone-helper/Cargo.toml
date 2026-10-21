@@ -49,6 +49,18 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 reco-detect = { path = "../reco-detect", default-features = false, features = ["directml"] }
 reco-autocam = { path = "../reco-autocam", default-features = false, features = ["directml"] }
+# Keep the PC awake during jobs, and stop ffmpeg when VeoClone stops.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Power",
+    "Win32_System_Threading",
+] }
+
+# Stop ffmpeg when VeoClone stops (parent-death signal).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

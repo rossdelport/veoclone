@@ -26,7 +26,7 @@ browser to the helper on the same PC.
 
 1. Home: list of matches (projects) with status, size, delete. A banner shows
    whether the helper is running; if not, explain how to start/download it.
-2. New match: name, "Which iPhone filmed this?" (lens profile), camera style
+2. New match: name, "Which iPhone?" + "Which lens?" (4.6), camera style
    (Broadcast / Action / Wide), and two drop boxes: **Left phone** and
    **Right phone**. Filming tips shown alongside. "Start" uploads both files
    to the helper (progress bar per file) and then starts processing.
@@ -65,8 +65,8 @@ docs/veoclone/           this design, user guide pieces
 README.md                VeoClone user guide (Reco's README moved to README.reco.md)
 ```
 
-Reco's `cla.yml` workflow is removed (it is Reco's own contributor licence
-check). Other upstream workflows stay; they only trigger on `main`/tags.
+Reco's `cla.yml` workflow and Dependabot config are removed. Other upstream
+workflows stay but only run on manual dispatch (section 6).
 
 ## 3. Core concepts and units (shared by helper and editor)
 
@@ -105,8 +105,14 @@ check). Other upstream workflows stay; they only trigger on `main`/tags.
 - On start: prints a friendly banner ("Keep this window open while you use
   VeoClone"), opens the browser at `http://127.0.0.1:47863/` (disable with
   `--no-open`).
+- Only one copy runs: it takes the port, then locks `<data>/veoclone.lock`,
+  before touching the data dir; a second copy only opens the browser and
+  exits ("VeoClone is already running").
 - Data dir: `--data-dir`, else env `VEOCLONE_HOME`, else
   `<Videos folder>/VeoClone` (`dirs::video_dir()`, falling back to home).
+  When the Videos folder is synced by OneDrive (env `OneDrive*`) or cannot
+  be created, `<home>/VeoClone` is used instead, unless `Videos/VeoClone`
+  already exists. The banner prints the folder.
   Projects live in `<data>/projects/<id>/`:
 
 ```
@@ -125,8 +131,16 @@ log.txt           human-readable log of jobs for this project
 - Exactly one GPU job runs at a time (a queue). Jobs run on a worker thread
   inside the helper wrapped in `catch_unwind`; job state is persisted in
   `project.json` so that after a helper restart a project that was mid-job
-  shows as failed with "The helper was closed while this was running —
-  press Try again".
+  shows as failed with "VeoClone was closed, or the PC restarted, while
+  this was running. Press Try again." (or goes back to `ready`, 4.7).
+  While a job runs the worker thread keeps Windows awake
+  (`SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`; the
+  screen may still turn off). After two processing runs in a row were cut
+  short (`ProjectMeta.interruptedRuns >= 2`), the AI pass uses safe mode
+  (CPU video decoding) until a run succeeds.
+- ffmpeg/ffprobe children die with the helper (Windows job object with
+  kill-on-close; Linux parent-death signal), and each preview encode writes
+  a uniquely named temp file.
 - Bundled tools are found next to the executable first, then on PATH:
   `ffmpeg(.exe)`, `ffprobe(.exe)`; AI model `models/yolo26n.onnx`
   (fallback `models/yolo26n_640.onnx`, override `--model` / env
@@ -145,18 +159,26 @@ log.txt           human-readable log of jobs for this project
    recommended").
 2. **Calibrate** with `reco_calibrate::video::calibrate_videos`, GUI-like
    config: 4 frames, AKAZE detect y 0.05–0.95, skip_start = min(10 s, 10%
-   of duration). Lens: if the project has a `lensId`, load that profile from
-   `LensDatabase::embedded()`, scale intrinsics to the file resolution the
-   way reco-gui does (`fx *= w/p.width` …), and pass as
-   `left_params`/`right_params`; otherwise auto (warn "generic lens
-   profile"). Audio sync is automatic (needs ffmpeg). Save `match.json`.
-   Warn if confidence < 0.5. Record `syncOffsetFrames`.
+   of duration). Lens: always the project's lens choice (4.6; `null` =
+   `generic:ultra`), loaded from `LensDatabase::embedded()`, scaled to the
+   file resolution the way reco-gui does (`fx *= w/p.width` …), and passed
+   as `left_params`/`right_params` (never Reco's auto-detect; warn when the
+   lens is a "Not sure" guess). Audio sync is automatic (needs ffmpeg). Save
+   `match.json` and check it loads before the preview step. Warn if
+   confidence < 0.5 (mention swapped videos), if a file has no sound, or if
+   a file's frame count and duration × fps differ by more than
+   max(15, 0.2 %) (dropped frames / Auto FPS). Record `syncOffsetFrames`.
+   A failed line-up suggests the videos may be the wrong way round (4.5
+   `swap`). If the AI pass (or an export) reads more than 2 s fewer frames
+   than expected, the job fails ("one of the files may be damaged").
 3. **Preview proxy** with bundled ffmpeg: a vertically stacked, synced,
    constant-frame-rate H.264 file, left camera on top:
    - each camera scaled to **1280x720** (keep 16:9; if the source aspect is
      not 16:9, scale to width 1280 and even height), stacked → 1280x1440;
    - frame pairing by count, exactly like Reco: per input
-     `trim=start_frame=<skip>,setpts=N/(<fps>)/TB`, then `vstack`, and
+     `trim=start_frame=<skip>,setpts=N/(<fps>)/TB,setparams=<bt709 tags>`
+     (so ffmpeg 7 does not re-matrix HDR colours that Reco keeps), then
+     `vstack`, and
      `-frames:v <frameCount>`; output rate = fps; `-g` = round(fps) (one
      keyframe per second for snappy seeking); `-movflags +faststart`;
      `yuv420p`, BT.709 tags; audio = left audio from `leftSkip/fps` seconds,
@@ -209,6 +231,10 @@ Body (JSON):
   `path[startFrame + ctx.frame_index]` (hold last pose beyond the end).
   The implementation must verify the frame alignment with a test (e.g. a
   path whose yaw encodes the frame index, checked via events or pixels).
+  Reco's CPU source seeks trims over 10 s by time; it accepts a frame up to
+  half a frame early (patched in `reco-io`, phone timestamps jitter by a
+  1/600 s tick), so trims land on the counted frame. A dropped frame
+  (timestamp gap) before a trim still shifts that camera by one frame.
 - Then concat the parts with ffmpeg (`-f concat -c copy`) into
   `exports/<id>/<project name> <date>.mp4` with `-movflags +faststart`.
 - Export status is tracked in `project.json` (`exports[]`).
@@ -283,8 +309,15 @@ cap/clamp (the editor applies them).
   fps?: { num: number; den: number }; frameCount?: number;
   diskBytes: number;
   exports: ExportMeta[];  // { id, status: "queued"|"running"|"done"|"failed"|"cancelled", progress, createdAt, fileName?, sizeBytes?, width, height, quality, error? }
+  interruptedRuns: number;  // processing runs cut short in a row (4.1 safe mode)
 }
 ```
+
+`ExportMeta.error` is the plain-words message, then (after a newline) the
+technical detail. `lensId` is never null for new matches: `POST`/`PATCH`
+with no or a `null` lensId store `"generic:ultra"`; only the ids from
+`GET /api/lenses` are accepted. `swap` also works with only one video
+uploaded (it moves sides; status `new`) and refuses while busy (409).
 
 ### 4.6 Lens choices
 
@@ -303,7 +336,10 @@ The user picks two simple things instead: **which iPhone** and **which lens**.
 
 - Exactly one option per (model, lens). Every listed model offers both
   lenses; when the database has no good profile for one, map it to the
-  closest model that has one and say so in `note`. Include current models
+  closest model that has one and say so in `note`. (The iPhone 16e and Air
+  have no 0.5× lens; their `ultra` option's note says so.) Labels:
+  "<model> · Ultra wide (0.5×)" and "<model> · Normal (1×)"; "Not sure"
+  options come first. Include current models
   missing from the database (iPhone 16 / 16 Plus / 16 Pro / 16 Pro Max / 16e,
   iPhone 17 / Air / 17 Pro / 17 Pro Max) mapped to the closest profile.
 - The helper picks the underlying database profile per option: prefer clean
@@ -451,4 +487,5 @@ VeoClone/
   make two projects.
 - Audio sync needs the phones started within about 15 s of each other.
 - 60 fps works but the AI camera tuning assumes 30 fps.
-- No iPhone 16/17 lens profiles in Reco's database: pick the closest model.
+- No iPhone 16/17 lens profiles in Reco's database: those models use the
+  closest older profile (4.6).

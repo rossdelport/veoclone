@@ -1,12 +1,8 @@
 name: Release
 
+# Upstream Reco workflow: in VeoClone it only runs by hand (VeoClone's own are veoclone-*.yml).
 on:
-  push:
-    tags:
-      - 'v*'
-      # VeoClone's own tags (veoclone-v*) also start with "v"; they are
-      # built by veoclone-windows.yml, not by this workflow.
-      - '!veoclone-v*'
+  workflow_dispatch:
 
 permissions:
   contents: write

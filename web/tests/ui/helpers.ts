@@ -18,8 +18,17 @@ export async function resetMock(seed = false): Promise<void> {
 }
 
 export interface MockState {
-  projects: { id: string; name: string; status: string; lensId: string | null; style: string; exports: { id: string; status: string }[] }[];
-  edits: Record<string, { segments: { start: number; end: number }[]; keyframes: { frame: number }[]; zoom: number; export: { width: number } }>;
+  projects: {
+    id: string;
+    name: string;
+    status: string;
+    lensId: string | null;
+    style: string;
+    warnings: string[];
+    files: { left?: { name: string }; right?: { name: string } };
+    exports: { id: string; status: string }[];
+  }[];
+  edits: Record<string, { segments: { start: number; end: number }[]; keyframes: { frame: number }[]; zoom: number; smoothSeconds: number; export: { width: number } }>;
   lastExport: null | {
     segments: { startFrame: number; endFrame: number }[];
     width: number;
@@ -29,6 +38,13 @@ export interface MockState {
   };
   editsPuts: number;
   openFolder: { project: string; export: string | null }[];
+  swaps: number;
+}
+
+/** Change a match on the mock helper directly (like another browser tab would). */
+export async function patchProject(id: string, body: Record<string, unknown>): Promise<void> {
+  const res = await fetch(`${MOCK}/api/projects/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  expect(res.ok).toBe(true);
 }
 
 export async function mockState(): Promise<MockState> {

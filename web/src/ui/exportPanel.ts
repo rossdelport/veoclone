@@ -1,7 +1,7 @@
 // Export drawer: size and quality, "Make video", progress, past videos.
 import { api, type ExportMeta, type ProjectMeta } from "../api";
 import { encodePathBase64, frameToTime, keptFrameCount, type CalibInfo, type ExportQuality } from "../engine";
-import { button, confirmDialog, describeError, details, errorBox, iconButton, progressBar, toast } from "./common";
+import { button, confirmDialog, describeError, details, errorBox, iconButton, progressBar, setProgress, toast } from "./common";
 import { formatBytes, formatDate, formatDuration, formatTimeLeft, h, icon, setChildren } from "./dom";
 import type { EditStore } from "./editStore";
 import { I } from "./icons";
@@ -29,6 +29,9 @@ export class ExportPanel {
   private project: ProjectMeta | null = null;
   private starting = false;
   private clock = new Map<string, { at: number; progress: number; start: number }>();
+  /** What the list shows now, and the running rows' progress bars (moved without a rebuild). */
+  private shown = "";
+  private live = new Map<string, { bar: HTMLElement; text: HTMLElement }>();
 
   constructor(
     private readonly id: string,
@@ -101,7 +104,11 @@ export class ExportPanel {
         ),
         h("div", { class: "drawer-action" }, this.makeBtn),
         this.error,
-        h("p", { class: "muted small" }, "Videos are saved in the VeoClone folder on your PC. You can keep editing while a video is being made."),
+        h(
+          "p",
+          { class: "muted small" },
+          "Videos are saved in the VeoClone folder on your PC. You can keep editing while a video is being made. Keep the black VeoClone window open; your PC won't go to sleep while VeoClone is working (the screen may turn off).",
+        ),
         h("h3", null, "Your videos"),
         this.list,
       ),
@@ -152,11 +159,28 @@ export class ExportPanel {
     this.project = p;
     this.updateButton();
     const exports = [...p.exports].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    // Rebuild the rows only when one changes, so their buttons stay put under the mouse.
+    const key = JSON.stringify(exports.map((e) => [e.id, e.status, e.fileName, e.sizeBytes, e.error]));
+    if (key === this.shown) {
+      for (const e of exports) {
+        const row = this.live.get(e.id);
+        if (!row) continue;
+        setProgress(row.bar, e.progress);
+        row.text.textContent = this.progressText(p, e);
+      }
+      return;
+    }
+    this.shown = key;
+    this.live.clear();
     if (!exports.length) {
       setChildren(this.list, h("p", { class: "muted empty-small" }, "No videos yet. Press Make video when you're happy with your edit."));
       return;
     }
     setChildren(this.list, exports.map((e) => this.row(p, e)));
+  }
+
+  private progressText(p: ProjectMeta, e: ExportMeta): string {
+    return e.status === "queued" ? "Waiting to start…" : [`Making your video… ${Math.round(e.progress * 100)}%`, this.timeLeft(p, e)].filter(Boolean).join(" · ");
   }
 
   private timeLeft(p: ProjectMeta, e: ExportMeta): string {
@@ -178,19 +202,13 @@ export class ExportPanel {
     let body: HTMLElement;
     switch (e.status) {
       case "queued":
-      case "running":
-        body = h(
-          "div",
-          { class: "export-progress" },
-          progressBar(e.progress, "Making your video"),
-          h(
-            "div",
-            { class: "row" },
-            h("span", { class: "small" }, e.status === "queued" ? "Waiting to start…" : [`Making your video… ${Math.round(e.progress * 100)}%`, this.timeLeft(p, e)].filter(Boolean).join(" · ")),
-            button("Cancel", () => void this.cancel(), { variant: "ghost", class: "btn-small" }),
-          ),
-        );
+      case "running": {
+        const bar = progressBar(e.progress, "Making your video");
+        const text = h("span", { class: "small" }, this.progressText(p, e));
+        this.live.set(e.id, { bar, text });
+        body = h("div", { class: "export-progress" }, bar, h("div", { class: "row" }, text, button("Stop", () => void this.cancel(), { variant: "ghost", class: "btn-small" })));
         break;
+      }
       case "done":
         body = h(
           "div",
@@ -201,14 +219,17 @@ export class ExportPanel {
           iconButton(I.trash, "Delete this video", () => void this.remove(e), "btn-ghost"),
         );
         break;
-      default:
+      default: {
+        // The helper sends the plain reason, then the technical part after a newline.
+        const [why, ...more] = (e.error ?? "").split("\n");
         body = h(
           "div",
           { class: "export-failed" },
-          h("p", { class: e.status === "failed" ? "text-bad small" : "muted small" }, e.status === "failed" ? "This video could not be made." : "Stopped before it was finished."),
-          e.status === "failed" ? details(e.error) : null,
+          h("p", { class: e.status === "failed" ? "text-bad small" : "muted small" }, e.status === "failed" ? why || "This video could not be made." : "Stopped before it was finished."),
+          e.status === "failed" ? details(more.join("\n")) : null,
           h("div", { class: "row" }, button("Try again", () => void this.start(), { variant: "secondary", icon: I.refresh, class: "btn-small" }), iconButton(I.trash, "Remove from the list", () => void this.remove(e), "btn-ghost")),
         );
+      }
     }
     return h("div", { class: `export-row export-${e.status}`, "data-testid": "export-row" }, head, body);
   }
@@ -241,7 +262,7 @@ export class ExportPanel {
   }
 
   private async cancel() {
-    const ok = await confirmDialog({ title: "Stop making this video?", text: "The part made so far is thrown away.", confirm: "Stop", danger: true });
+    const ok = await confirmDialog({ title: "Stop making this video?", text: "The part made so far is thrown away.", confirm: "Stop", dismiss: "Keep going", danger: true });
     if (!ok) return;
     try {
       this.update(await api.cancel(this.id));

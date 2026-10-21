@@ -3,8 +3,9 @@
 
 Starts the helper binary, uploads two videos, processes them, checks the
 editor data, exports two segments, and exercises cancel, delete, restart
-recovery, CORS and the Host check. Python 3 standard library only; needs
-ffprobe on PATH.
+recovery, re-runs that keep the earlier result, lens choices, swapping left
+and right, the single-instance check, CORS and the Host check. Python 3
+standard library only; needs ffprobe on PATH.
 
 Usage:
   e2e.py --helper target/release/veoclone-helper --left L.mp4 --right R.mp4 \
@@ -81,12 +82,15 @@ class Helper:
         self.args = args
         self.proc = None
 
-    def start(self):
-        cmd = [self.args.helper, "--no-open", "--port", str(PORT),
+    def cmd(self, port=PORT):
+        cmd = [self.args.helper, "--no-open", "--port", str(port),
                "--data-dir", self.args.data, "--model", self.args.model]
         if self.args.web_dir:
             cmd += ["--web-dir", self.args.web_dir]
-        self.proc = subprocess.Popen(cmd, stdout=open(self.args.log, "a"),
+        return cmd
+
+    def start(self):
+        self.proc = subprocess.Popen(self.cmd(), stdout=open(self.args.log, "a"),
                                      stderr=subprocess.STDOUT)
         for _ in range(100):
             try:
@@ -180,12 +184,23 @@ def run(args, helper):
           and hdrs.get("access-control-allow-private-network") == "true",
           f"CORS preflight answered ({status}, {hdrs})")
 
+    status, hdrs, _ = request("GET", "/", raw=True)
+    hdrs = {k.lower(): v for k, v in hdrs.items()}
+    check(hdrs.get("x-frame-options") == "DENY"
+          and hdrs.get("content-security-policy") == "frame-ancestors 'none'",
+          "the editor cannot be shown inside another page")
+
     status, lenses = request("GET", "/api/lenses")
-    check(status == 200 and len(lenses) > 50, f"{len(lenses)} iPhone lenses, first {lenses[0]}")
+    check(status == 200 and lenses[0]["id"] == "generic:ultra"
+          and all(set(l) >= {"id", "model", "lens", "label"} for l in lenses)
+          and len({l["id"] for l in lenses}) == len(lenses)
+          and any(l["id"] == "iphone-16-pro:ultra" for l in lenses),
+          f"{len(lenses)} lens choices, first {lenses[0]}")
 
     # Create + upload.
     status, p = request("POST", "/api/projects", {"name": "E2E match", "style": "broadcast"})
-    check(status == 201 and p["status"] == "new", "project created")
+    check(status == 201 and p["status"] == "new" and p["lensId"] == "generic:ultra",
+          "project created with the default lens")
     pid = p["id"]
     status, p = upload(pid, "left", args.left)
     check(status == 200 and p["status"] == "new", "left uploaded")
@@ -205,6 +220,9 @@ def run(args, helper):
     p = wait_for(pid, lambda p: p["status"] in ("ready", "failed", "cancelled"), seen=seen)
     log(f"processing took {time.time() - t0:.0f} s; states seen: {sorted(seen, key=str)}")
     check(p["status"] == "ready", f"processing finished: {p.get('error')}")
+    check(p["calibration"]["lens"] == "Not sure · Ultra wide (0.5×)"
+          and any("didn't know which iPhone" in w for w in p["warnings"]),
+          "an iPhone lens was guessed, with a warning")
     steps = {s for _, s in seen}
     check({"probe", "calibrate", "proxy", "track"} <= steps, f"all steps reported {steps}")
     log(f"warnings: {p['warnings']}; calibration: {p.get('calibration')}")
@@ -294,32 +312,49 @@ def run(args, helper):
     status, p = request("DELETE", f"/api/projects/{pid}/exports/{ex2['id']}")
     check(status == 200 and len(p["exports"]) == 1, "cancelled export deleted")
 
-    # Re-run AI with another style and cancel it during tracking.
+    # A second copy of VeoClone (double-clicked again) must leave the running
+    # one alone, also on another port with the same folder.
+    folder = os.path.join(args.data, "projects", pid)
+    before = sorted(os.listdir(folder))
+    for port, words in ((PORT, "already running"), (PORT + 1, "using the folder")):
+        second = subprocess.run(["timeout", "30"] + helper.cmd(port), capture_output=True,
+                                text=True)
+        check(second.returncode != 0 and words in second.stderr
+              and sorted(os.listdir(folder)) == before,
+              f"second copy on port {port} stops at once ({second.stderr.strip()[-90:]})")
+
+    # Re-run AI with another style and cancel it during tracking: the match
+    # keeps its earlier result (DESIGN.md 4.7).
     request("PATCH", f"/api/projects/{pid}", {"style": "action"})
     request("POST", f"/api/projects/{pid}/process")
     wait_for(pid, lambda p: (p.get("job") or {}).get("step") == "track"
              and (p["job"].get("framesDone") or 0) > 10)
     request("POST", f"/api/projects/{pid}/cancel")
-    p = wait_for(pid, lambda p: p["status"] in ("cancelled", "ready", "failed"))
-    check(p["status"] == "cancelled" and p["error"] is None, "processing cancelled")
+    p = wait_for(pid, lambda p: p["job"] is None and p["status"] != "queued")
+    check(p["status"] == "ready" and p["error"] is None and p["frameCount"] == frame_count
+          and any("stopped the new run" in w for w in p["warnings"]),
+          f"cancelled re-run keeps the earlier result: {p['warnings']}")
+    status, _ = request("GET", f"/api/projects/{pid}/calibration")
+    check(status == 200, "editor data still there")
 
-    # Restart while processing: the project must come back as failed.
+    # Restart while re-processing: back to ready with the earlier result.
     request("POST", f"/api/projects/{pid}/process")
     wait_for(pid, lambda p: p["status"] == "processing")
     helper.kill()
     log("helper killed during processing; restarting")
     helper.start()
     _, p = request("GET", f"/api/projects/{pid}")
-    check(p["status"] == "failed" and "closed" in p["error"]["message"] and p["job"] is None,
-          f"interrupted job marked failed: {p['error']}")
+    check(p["status"] == "ready" and p["job"] is None
+          and any("closed" in w for w in p["warnings"]),
+          f"interrupted re-run keeps the earlier result: {p['warnings']}")
 
     # Try again (calibration + preview are reused, AI re-runs).
     request("POST", f"/api/projects/{pid}/process")
     p = wait_for(pid, lambda p: p["status"] in ("ready", "failed", "cancelled"))
     check(p["status"] == "ready" and p["style"] == "action", "Try again succeeds")
 
-    # Choosing an iPhone model re-calibrates with that lens profile.
-    lens = lenses[0]
+    # Choosing an iPhone and lens re-calibrates with it.
+    lens = [l for l in lenses if l["id"] == "iphone-13-pro:ultra"][0]
     status, p = request("PATCH", f"/api/projects/{pid}", {"lensId": lens["id"]})
     check(status == 200 and p["lensId"] == lens["id"] and "calibration" not in p,
           "lens chosen, calibration will be redone")
@@ -327,11 +362,30 @@ def run(args, helper):
     seen = set()
     p = wait_for(pid, lambda p: p["status"] in ("ready", "failed", "cancelled"), seen=seen)
     check(p["status"] == "ready" and p["calibration"]["lens"] == lens["label"]
-          and ("processing", "calibrate") in seen and ("processing", "proxy") in seen,
+          and ("processing", "calibrate") in seen and ("processing", "proxy") in seen
+          and not any("didn't know which iPhone" in w for w in p["warnings"]),
           f"re-processed with lens {p.get('calibration')}, warnings {p['warnings']}")
 
+    # Left and right the wrong way round: the error says so, and swapping
+    # them back (no new upload) fixes it.
+    status, p = request("POST", f"/api/projects/{pid}/swap")
+    check(status == 200 and p["status"] == "uploaded" and "calibration" not in p
+          and p["files"]["left"]["name"] == os.path.basename(args.right)
+          and not os.path.exists(os.path.join(folder, "proxy.mp4")),
+          "videos swapped, earlier results dropped")
+    request("POST", f"/api/projects/{pid}/process")
+    p = wait_for(pid, lambda p: p["status"] in ("ready", "failed", "cancelled"))
+    problem = p["error"]["message"] if p["status"] == "failed" else " ".join(p["warnings"])
+    check("wrong way round" in problem, f"swapped videos are pointed out: {p['status']} {problem}")
+    status, p = request("POST", f"/api/projects/{pid}/swap")
+    check(status == 200 and p["files"]["left"]["name"] == os.path.basename(args.left),
+          "videos swapped back")
+    request("POST", f"/api/projects/{pid}/process")
+    p = wait_for(pid, lambda p: p["status"] in ("ready", "failed", "cancelled"))
+    check(p["status"] == "ready" and p["calibration"]["syncOffsetFrames"] == 12,
+          "processed again after swapping back")
+
     # Delete.
-    folder = os.path.join(args.data, "projects", pid)
     status, _ = request("DELETE", f"/api/projects/{pid}")
     check(status == 200 and not os.path.exists(folder), "project deleted with its folder")
     status, _ = request("GET", f"/api/projects/{pid}")

@@ -5,20 +5,29 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use reco_calibrate::types::{CalibrationProgress, CalibrationStep, ProfileSource};
+use reco_calibrate::types::{CalibrationProgress, CalibrationStep};
 use reco_calibrate::video::{CalibrateVideosError, CalibrateVideosOptions, calibrate_videos};
 use reco_core::calibration::MatchCalibration;
 
 use crate::ai::{PoseSink, encode_path, fill_path};
-use crate::calib::{BLEND_WIDTH, calib_info, lens_params};
-use crate::jobs::{Context, JobError, Progress};
+use crate::calib::{BLEND_WIDTH, LensChoice, calib_info, choose_lens};
+use crate::jobs::{Context, JobError, Progress, check_free_space};
 use crate::media::{ProxyPlan, RunError, check_pair, make_proxy, probe, tile_size};
 use crate::store::{
-    CalibSummary, Fps, ProbeInfo, Status, Step, Style, original_file, write_atomic,
+    CalibSummary, Fps, ProbeInfo, ProjectMeta, Status, Step, new_id, original_file, write_atomic,
 };
 
 const STEPS: u32 = 4;
-const GENERIC_LENS: &str = "Generic lens (automatic)";
+
+/// When the two views cannot be lined up, the most common cause is that
+/// the left and right videos were added the wrong way round.
+const NOT_LINED_UP: &str = "We couldn't line up the two videos. Maybe the left and right videos \
+                            are the wrong way round: click “Swap left and right and try \
+                            again”. Otherwise make sure both phones film the same pitch with \
+                            some overlap in the middle, and try again.";
+
+const DAMAGED: &str = "One of the files may be damaged: copy the videos from the phones again, \
+                       add them to this match and press Start.";
 
 /// Frames to drop from each camera so both start together. Positive
 /// `sync_offset` = the right phone started first (Reco's convention).
@@ -102,19 +111,24 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     // 2. Line up & calibrate (reused when the uploads and lens are unchanged).
     progress.step(Step::Calibrate, 1, "Lining up and calibrating the cameras");
     let match_path = dir.join("match.json");
+    let lens = choose_lens(meta.lens_id.as_deref(), lp.width, lp.height);
     let summary = match (&meta.calibration, MatchCalibration::from_file(&match_path)) {
         (Some(summary), Ok(_)) => {
             tracing::info!("Using the earlier calibration");
             summary.clone()
         }
         _ => {
-            // A new calibration may line the videos up differently.
-            let _ = std::fs::remove_file(dir.join("proxy.mp4"));
+            // A new calibration may line the videos up differently, so
+            // nothing made with the old one may be opened again.
+            for f in ["proxy.mp4", "calib.json", "ai_path.bin"] {
+                let _ = std::fs::remove_file(dir.join(f));
+            }
+            tracing::info!("Lens: {}", lens.name);
             calibrate(
                 &left,
                 &right,
                 &lp,
-                &meta.lens_id,
+                &lens,
                 fps,
                 &match_path,
                 &progress,
@@ -124,19 +138,13 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     };
     if summary.confidence < 0.5 {
         warnings.push(
-            "The two views did not line up very well. Check that both phones filmed the same \
-             pitch with some overlap in the middle."
+            "The two views did not line up very well. Check that the left and right videos \
+             are not the wrong way round, and that both phones filmed the same pitch with \
+             some overlap in the middle."
                 .into(),
         );
     }
-    if summary.lens == GENERIC_LENS {
-        warnings.push(
-            "We didn't know which iPhone filmed this, so a general lens setting was used and \
-             the picture may be slightly bent near the edges. Choose your iPhone model and \
-             press Try again for a better result."
-                .into(),
-        );
-    }
+    warnings.extend(lens.warning);
     let frame_count =
         synced_frame_count(lp.frame_count, rp.frame_count, summary.sync_offset_frames);
     if frame_count < 2 {
@@ -161,7 +169,12 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     if proxy.is_file() {
         tracing::info!("Using the earlier preview video");
     } else {
-        let tmp = dir.join("proxy.tmp.mp4");
+        // Room for the preview (a few Mbit/s) and the AI pass's scratch file.
+        let secs = fps.frame_to_secs(frame_count);
+        check_free_space(&dir, (secs * 5e6 / 8.0) as u64 + (1 << 30))?;
+        // A new name every time: a leftover ffmpeg from a run that was cut
+        // short can never write into this run's file.
+        let tmp = dir.join(format!("proxy.{}.tmp.mp4", new_id()));
         let plan = ProxyPlan {
             left: left.clone(),
             right: right.clone(),
@@ -193,14 +206,22 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
 
     // 4. AI tracking.
     progress.step(Step::Track, 3, "AI ball tracking");
-    let style = meta.style;
+    if meta.safe_mode() {
+        warnings.push(
+            "VeoClone stopped while working on this match before, so it now uses a slower \
+             but safer way. This takes longer."
+                .into(),
+        );
+        set_warnings(ctx, id, &warnings);
+    }
     let path = track(
         ctx,
         &dir,
         &left,
         &right,
         &match_path,
-        style,
+        &meta,
+        fps,
         frame_count,
         &progress,
         cancel,
@@ -258,7 +279,7 @@ fn calibrate(
     left: &Path,
     right: &Path,
     probe: &ProbeInfo,
-    lens_id: &Option<String>,
+    lens: &LensChoice,
     fps: Fps,
     match_path: &Path,
     progress: &Progress,
@@ -273,22 +294,14 @@ fn calibrate(
     config.akaze.detect_y_min = 0.05;
     config.akaze.detect_y_max = 0.95;
 
-    let mut options = CalibrateVideosOptions {
+    // Always an iPhone lens: Reco's own detection cannot recognise the
+    // stock Camera app and would pick an action camera.
+    let options = CalibrateVideosOptions {
         config: Some(config),
+        left_params: Some(lens.params.clone()),
+        right_params: Some(lens.params.clone()),
         ..Default::default()
     };
-    let mut lens_name = None;
-    if let Some(id) = lens_id {
-        match lens_params(id, probe.width, probe.height) {
-            Some((params, name)) => {
-                tracing::info!("Lens profile: {name}");
-                options.left_params = Some(params.clone());
-                options.right_params = Some(params);
-                lens_name = Some(name);
-            }
-            None => tracing::warn!("Lens profile {id} not found; using automatic detection"),
-        }
-    }
 
     let result = calibrate_videos(
         left,
@@ -304,13 +317,13 @@ fn calibrate(
     let result = match result {
         Ok(r) => r,
         Err(CalibrateVideosError::Cancelled) => return Err(JobError::Cancelled),
-        Err(e) => {
+        Err(e @ CalibrateVideosError::Io(_)) => {
             return Err(JobError::failed(
-                "We couldn't line up the two videos. Make sure both phones film the same \
-                 pitch with some overlap in the middle, and try again.",
+                format!("We couldn't read part of the videos. {DAMAGED}"),
                 e,
             ));
         }
+        Err(e) => return Err(JobError::failed(NOT_LINED_UP, e)),
     };
     cancelled(cancel)?;
     let cal = &result.calibration;
@@ -322,17 +335,13 @@ fn calibrate(
     );
     write_atomic(match_path, cal.to_json_pretty().as_bytes())
         .map_err(|e| JobError::failed("We couldn't save the calibration.", e))?;
-    let lens = lens_name.unwrap_or_else(|| match &result.left_lens_profile {
-        Some(p) if !matches!(p.source, ProfileSource::Fallback) => {
-            format!("{} {}", p.camera, p.lens).trim().to_string()
-        }
-        _ => GENERIC_LENS.into(),
-    });
+    // Check it now, not after the long preview step.
+    MatchCalibration::from_file(match_path).map_err(|e| JobError::failed(NOT_LINED_UP, e))?;
     Ok(CalibSummary {
         confidence: result.confidence,
         sync_offset_frames: cal.sync_offset,
         sync_offset_seconds: cal.sync_offset as f64 / fps.as_f64(),
-        lens,
+        lens: lens.name.clone(),
     })
 }
 
@@ -345,7 +354,8 @@ fn track(
     left: &Path,
     right: &Path,
     match_path: &Path,
-    style: Style,
+    meta: &ProjectMeta,
+    fps: Fps,
     frame_count: u64,
     progress: &Progress,
     cancel: &AtomicBool,
@@ -366,7 +376,7 @@ fn track(
         poses: poses.clone(),
         max_frames: frame_count as usize * 2 + 10_000,
     };
-    let preset = style.preset();
+    let preset = meta.style.preset();
     let field_roi = cal.field_roi.clone();
     let hook_error = setup_error.clone();
     let hook_stop = stop.clone();
@@ -414,6 +424,13 @@ fn track(
         }
         session.set_event_sink(Box::new(sink));
     });
+    let job = if meta.safe_mode() {
+        // No graphics-card video decoding (zero-copy on Windows).
+        tracing::info!("Safe mode: decoding the videos without the graphics card");
+        job.force_cpu_decode()
+    } else {
+        job
+    };
 
     // Forward the user's cancel into the job's stop flag.
     let watcher_stop = stop.clone();
@@ -467,12 +484,40 @@ fn track(
              {proxy_frames:?}"
         );
     }
+    // Reco stops at the first damaged spot of either file as if the video
+    // ended there, while ffmpeg (the preview) reads past it; don't let that
+    // quietly cut the match short.
+    let expected = proxy_frames.unwrap_or(frame_count);
+    if stopped_early(frames as u64, expected, fps) {
+        return Err(JobError::failed(
+            format!(
+                "We could only read the first {} of the videos. {DAMAGED}",
+                fps.clock(frames as u64)
+            ),
+            format!("AI pass saw {frames} of {expected} frames"),
+        ));
+    }
     Ok(fill_path(&poses, frames))
+}
+
+/// Fewer frames than expected by more than two seconds' worth.
+pub fn stopped_early(frames: u64, expected: u64, fps: Fps) -> bool {
+    frames + (2.0 * fps.as_f64()).ceil() as u64 + 1 < expected
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_reads_are_noticed() {
+        let fps = Fps { num: 30, den: 1 };
+        assert!(!stopped_early(6000, 6000, fps));
+        assert!(!stopped_early(5940, 6000, fps));
+        assert!(stopped_early(2399, 6000, fps));
+        assert_eq!(fps.clock(2399), "1:19");
+        assert_eq!(fps.clock(30 * 3725), "1:02:05");
+    }
 
     #[test]
     fn sync_skips_follow_reco() {

@@ -15,8 +15,10 @@
 //   --web DIR    also serve the built editor from DIR (like the real helper)
 //
 // Test hooks: a match whose name contains "fail" fails once while lining up
-// the videos (press Try again to succeed); "slow" makes its jobs 10x slower. GET /__mock/state shows what the
-// editor sent; POST /__mock/reset forgets everything.
+// the videos (press Try again to succeed; a re-run of a ready match then goes
+// back to ready with a warning, DESIGN.md 4.7); "slow" makes its jobs 10x
+// slower. GET /__mock/state shows what the editor sent; POST /__mock/reset
+// forgets everything.
 import { createReadStream, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, extname, join, normalize, resolve } from "node:path";
@@ -48,8 +50,15 @@ const PROXY = join(FIX, "proxy.mp4");
 let projects = new Map();
 /** @type {Map<string, any>} */
 let edits = new Map();
-let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set() };
+let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0 };
 const timers = new Map(); // project id -> interval
+const uploads = new Map(); // project id -> uploads in progress
+const previous = new Map(); // project id -> the ready result a re-run started from
+const madeWith = new Map(); // project id -> camera style of the AI result on "disk"
+
+const BUSY = "VeoClone is still working on this match. Press Stop first, or wait until it has finished.";
+const GENERIC_LENS =
+  "We didn't know which iPhone filmed this, so a typical iPhone lens was used. If the picture looks bent or the two halves don't join, use “Change phone or lens”.";
 
 const now = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
 const newId = () => Math.random().toString(16).slice(2, 14).padEnd(12, "0");
@@ -79,11 +88,13 @@ function seed() {
       left: { name: "IMG_4012.MOV", sizeBytes: 742163, probe: probe("IMG_4012.MOV") },
       right: { name: "IMG_0877.MOV", sizeBytes: 769186, probe: probe("IMG_0877.MOV") },
     },
-    warnings: ["A generic lens profile was used. Choose your iPhone model for a better result."],
-    calibration: { confidence: 1, syncOffsetFrames: 12, syncOffsetSeconds: 0.4, lens: "Generic lens (automatic)" },
+    lensId: "generic:ultra",
+    warnings: [GENERIC_LENS],
+    calibration: { confidence: 1, syncOffsetFrames: 12, syncOffsetSeconds: 0.4, lens: "Not sure · Ultra wide (0.5×)" },
     fps: FPS, frameCount: FRAME_COUNT, diskBytes: 4_538_000,
   });
   projects.set(p.id, p);
+  madeWith.set(p.id, p.style);
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +151,15 @@ function runJob(p, kind, steps, { exportId, onDone, onFail }) {
   tick();
 }
 
+/** A re-run of a ready match that fails or is stopped keeps the earlier result (DESIGN.md 4.7). */
+function backToReady(p, problem) {
+  const prev = previous.get(p.id);
+  previous.delete(p.id);
+  if (!prev) return false;
+  Object.assign(p, prev, { status: "ready", job: null, error: null, warnings: [...prev.warnings, problem] });
+  return true;
+}
+
 function startProcess(p) {
   p.status = "processing";
   p.error = null;
@@ -149,23 +169,27 @@ function startProcess(p) {
     onFail: (step, progress) => {
       if (!failThisTime || step !== "calibrate" || progress < 0.5) return false;
       mock.failedOnce.add(p.id);
+      const message = "We couldn't line up the two videos. Make sure both phones filmed the same match from about the same spot. Were the left and right videos the wrong way round? Then press Swap left and right.";
+      if (backToReady(p, `Processing it again did not work, so the earlier result is kept. ${message}`)) return true;
       p.job = null;
       p.status = "failed";
       p.error = {
-        message: "We couldn't line up the two videos. Make sure both phones filmed the same match from about the same spot.",
+        message,
         detail: "calibrate_videos: not enough feature matches between the cameras (12 < 50)\n  at reco_calibrate::video::calibrate_videos",
       };
       return true;
     },
     onDone: () => {
+      previous.delete(p.id);
+      madeWith.set(p.id, p.style);
       p.status = "ready";
       p.fps = FPS;
       p.frameCount = FRAME_COUNT;
       p.calibration = {
         confidence: 0.92, syncOffsetFrames: 12, syncOffsetSeconds: 0.4,
-        lens: p.lensId ? lenses.find((l) => l.id === p.lensId)?.label ?? p.lensId : "Generic lens (automatic)",
+        lens: lenses.find((l) => l.id === (p.lensId ?? "generic:ultra"))?.label ?? p.lensId,
       };
-      if (!p.lensId) p.warnings.push("A generic lens profile was used. Choose your iPhone model for a better result.");
+      if (!p.lensId || p.lensId.startsWith("generic:")) p.warnings.push(GENERIC_LENS);
       p.diskBytes += 4_000_000;
       p.updatedAt = now();
     },
@@ -186,7 +210,9 @@ function startExport(p, e) {
 function cancelJobs(p) {
   const t = timers.get(p.id);
   if (t) clearInterval(t), timers.delete(p.id);
-  if (p.job?.kind === "process" || p.status === "queued" || p.status === "processing") p.status = "cancelled";
+  if (p.job?.kind === "process" || p.status === "queued" || p.status === "processing") {
+    if (!backToReady(p, "Processing it again was stopped, so the earlier result is kept.")) p.status = "cancelled";
+  }
   for (const e of p.exports) if (e.status === "queued" || e.status === "running") e.status = "cancelled";
   p.job = null;
 }
@@ -305,7 +331,9 @@ async function handle(req, res) {
       timers.clear();
       projects = new Map();
       edits = new Map();
-      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set() };
+      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0 };
+      uploads.clear();
+      previous.clear();
       if (url.searchParams.has("seed")) seed();
       return send(res, 200, { ok: true });
     }
@@ -340,6 +368,7 @@ async function handle(req, res) {
       const body = await readJson(req);
       if (!body?.name?.trim()) return fail(res, 400, "Please give the match a name.");
       if (body.lensId && !lenses.some((l) => l.id === body.lensId)) return fail(res, 400, "That iPhone model is not in the list.");
+      if (body.lensId === undefined) body.lensId = null;
       const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, style: body.style ?? "broadcast" });
       projects.set(p.id, p);
       return send(res, 201, p);
@@ -356,40 +385,69 @@ async function handle(req, res) {
       return send(res, 200, p);
     case "PATCH ": {
       const body = await readJson(req);
+      if (body && "lensId" in body && body.lensId !== null && !lenses.some((l) => l.id === body.lensId)) return fail(res, 400, "That iPhone model is not in the list.");
+      if ((body?.lensId !== undefined || body?.style) && busy(p)) return fail(res, 409, BUSY);
       if (typeof body?.name === "string") p.name = body.name.trim() || p.name;
-      if (body && "lensId" in body) p.lensId = body.lensId;
+      if (body && "lensId" in body && body.lensId !== p.lensId) {
+        p.lensId = body.lensId;
+        delete p.calibration; // the next "process" lines the videos up again
+      }
       if (body?.style) p.style = body.style;
       p.updatedAt = now();
       return send(res, 200, p);
     }
     case "DELETE ":
-      if (busy(p)) return fail(res, 409, "VeoClone is still working on this match. Press Cancel first, or wait until it has finished.");
+      // Like the real helper: not while it works on the match or still receives a video.
+      if (busy(p) || uploads.get(p.id)) return fail(res, 409, BUSY);
       projects.delete(p.id);
+      previous.delete(p.id);
       return send(res, 200, { ok: true });
     case "PUT files": {
       const side = rest[1];
       if (side !== "left" && side !== "right") return fail(res, 404, "Unknown camera side.");
-      if (busy(p)) return fail(res, 409, "VeoClone is still working on this match. Press Cancel first, or wait until it has finished.");
+      if (busy(p)) return fail(res, 409, BUSY);
       let size = 0;
-      for await (const c of req) size += c.length;
+      uploads.set(p.id, (uploads.get(p.id) ?? 0) + 1);
+      try {
+        for await (const c of req) size += c.length;
+      } finally {
+        // Like the real helper, notice a dropped upload only a moment later.
+        const done = () => uploads.set(p.id, uploads.get(p.id) - 1);
+        if (req.complete) done();
+        else setTimeout(done, 200);
+      }
+      if (!req.complete) return res.destroy();
       if (size === 0) return fail(res, 400, "That file is empty.");
       const name = decodeURIComponent(req.headers["x-filename"] ?? `${side}.mp4`);
       p.files[side] = { name, sizeBytes: size };
       p.status = p.files.left && p.files.right ? "uploaded" : "new";
       delete p.calibration;
+      previous.delete(p.id);
       p.error = null;
       p.warnings = [];
       p.diskBytes = (p.files.left?.sizeBytes ?? 0) + (p.files.right?.sizeBytes ?? 0);
       return send(res, 200, p);
     }
     case "POST process":
-      if (busy(p)) return fail(res, 409, "VeoClone is still working on this match. Press Cancel first, or wait until it has finished.");
+      if (busy(p) || uploads.get(p.id)) return fail(res, 409, BUSY);
       if (!p.files.left || !p.files.right) return fail(res, 400, "Both videos are needed. Add the left and the right phone's video first.");
+      if (p.status === "ready" && p.calibration) {
+        previous.set(p.id, { style: madeWith.get(p.id) ?? p.style, warnings: p.warnings, calibration: p.calibration, fps: p.fps, frameCount: p.frameCount });
+      }
       p.status = "queued";
       setTimeout(() => p.status === "queued" && startProcess(p), 300 / SPEED);
       return send(res, 200, p);
     case "POST cancel":
       cancelJobs(p);
+      return send(res, 200, p);
+    case "POST swap":
+      if (busy(p) || uploads.get(p.id)) return fail(res, 409, BUSY);
+      if (!p.files.left || !p.files.right) return fail(res, 400, "Both videos are needed. Add the left and the right phone's video first.");
+      [p.files.left, p.files.right] = [p.files.right, p.files.left];
+      delete p.calibration;
+      previous.delete(p.id);
+      Object.assign(p, { status: "uploaded", error: null, warnings: [], updatedAt: now() });
+      mock.swaps++;
       return send(res, 200, p);
     case "GET calibration":
       if (p.status !== "ready") return fail(res, 404, "This match has not been processed yet.");
@@ -412,7 +470,7 @@ async function handle(req, res) {
     }
     case "POST exports": {
       if (p.status !== "ready") return fail(res, 409, "This match is not ready to export yet. Wait until processing has finished.");
-      if (busy(p)) return fail(res, 409, "VeoClone is still working on this match. Press Cancel first, or wait until it has finished.");
+      if (busy(p)) return fail(res, 409, BUSY);
       const body = await readJson(req, 64 << 20);
       const problem = validateExport(body);
       if (problem) return fail(res, 400, "The video settings were not accepted.", problem);
@@ -430,7 +488,7 @@ async function handle(req, res) {
         if (e.status !== "done") return fail(res, 404, "This video is not finished yet.");
         return sendFile(req, res, PROXY, "video/mp4", { "Content-Disposition": `attachment; filename="${e.fileName.replace(/[^\x20-\x7e]|"/g, "_")}"` });
       }
-      if (e.status === "running") return fail(res, 409, "This video is still being made. Press Cancel first.");
+      if (e.status === "running") return fail(res, 409, "This video is still being made. Press Stop first.");
       p.exports = p.exports.filter((x) => x !== e);
       return send(res, 200, p);
     }

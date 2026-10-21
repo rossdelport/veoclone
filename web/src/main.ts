@@ -9,6 +9,13 @@ import { newMatchPage } from "./ui/newMatch";
 import { projectPage } from "./ui/project";
 import type { Page, PageContext } from "./ui/page";
 
+// Never run inside another web page's frame, where hidden clicks could delete
+// a match (clickjacking). GitHub Pages can't send a header that forbids it.
+if (window.top !== window.self) {
+  document.body.textContent = "Open VeoClone in its own browser tab.";
+  throw new Error("VeoClone was opened inside a frame");
+}
+
 const pageHost = document.getElementById("page")!;
 const slot = document.getElementById("appbar-slot")!;
 const pill = document.getElementById("helper-pill")!;

@@ -2,14 +2,22 @@
 //! in-memory store that keeps every `project.json` up to date.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// Message shown for jobs that were running when the helper was closed.
-pub const INTERRUPTED: &str = "The helper was closed while this was running — press Try again";
+/// Message shown for jobs that were running when VeoClone was closed.
+pub const INTERRUPTED: &str =
+    "VeoClone was closed, or the PC restarted, while this was running. Press Try again.";
+
+/// Shown instead of [`INTERRUPTED`] once a match's work has been cut short
+/// twice in a row: the next run uses the slower safe mode (see
+/// [`ProjectMeta::safe_mode`]).
+pub const STOPPED_TWICE: &str = "VeoClone stopped while working on this match more than once. \
+                                 Press Try again to use a slower but safer way.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +64,17 @@ impl Fps {
     /// Seconds from the start of the synced timeline to frame `f`.
     pub fn frame_to_secs(self, f: u64) -> f64 {
         f as f64 * self.den as f64 / self.num.max(1) as f64
+    }
+
+    /// Frame `f` as a clock time for people: "41:20" or "1:02:05".
+    pub fn clock(self, f: u64) -> String {
+        let s = self.frame_to_secs(f) as u64;
+        let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+        if h > 0 {
+            format!("{h}:{m:02}:{s:02}")
+        } else {
+            format!("{m}:{s:02}")
+        }
     }
 }
 
@@ -206,6 +225,18 @@ pub struct ProjectMeta {
     pub disk_bytes: u64,
     #[serde(default)]
     pub exports: Vec<ExportMeta>,
+    /// How many times in a row VeoClone stopped (closed or crashed) while
+    /// processing this match.
+    #[serde(default)]
+    pub interrupted_runs: u32,
+}
+
+impl ProjectMeta {
+    /// After two interrupted runs, avoid the fast graphics-card video
+    /// decoding (a crash in a driver would close VeoClone every time).
+    pub fn safe_mode(&self) -> bool {
+        self.interrupted_runs >= 2
+    }
 }
 
 pub fn now_iso() -> String {
@@ -222,12 +253,20 @@ pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// Write a file via a temporary file and a rename, so a crash never leaves
-/// half a file behind.
+/// Write a file via a temporary file and a rename, so a crash (or a power
+/// cut) never leaves half a file behind.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = path.with_file_name(format!("{name}.{}.tmp", new_id()));
-    std::fs::write(&tmp, bytes)?;
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(bytes)?;
+        // On disk before the rename, so the rename never points at nothing.
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     let result = std::fs::rename(&tmp, path).or_else(|_| {
         // Windows can refuse briefly while another program (antivirus,
         // a browser download) has the target open.
@@ -271,30 +310,43 @@ struct Entry {
 
 impl Store {
     /// Load every project under `<data>/projects`. Jobs that were running
-    /// when the helper stopped are marked failed (the work is lost).
+    /// when VeoClone stopped are marked failed (the work is lost). Only call
+    /// this while holding the data folder lock (main.rs): it removes the
+    /// leftovers of unfinished work.
     pub fn open(data_dir: &Path) -> std::io::Result<Store> {
         let root = data_dir.join("projects");
         std::fs::create_dir_all(&root)?;
         let mut map = HashMap::new();
         for entry in std::fs::read_dir(&root)?.flatten() {
             let dir = entry.path();
-            let Ok(text) = std::fs::read_to_string(dir.join("project.json")) else {
+            let folder = entry.file_name().to_string_lossy().into_owned();
+            if folder.ends_with(DELETING) {
+                // A delete that was cut short.
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+            if !valid_id(&folder) || !dir.is_dir() {
+                continue;
+            }
+            // First, so a full disk gets VeoClone's own leftovers back.
+            remove_part_files(&dir);
+            let Ok(bytes) = std::fs::read(dir.join("project.json")) else {
                 continue;
             };
-            let mut meta: ProjectMeta = match serde_json::from_str(&text) {
-                Ok(m) => m,
+            let (mut meta, damaged) = match serde_json::from_slice::<ProjectMeta>(&bytes) {
+                Ok(m) if m.id == folder => (m, false),
+                Ok(_) => continue,
                 Err(e) => {
-                    log::warn!("Skipping unreadable {}: {e}", dir.display());
-                    continue;
+                    log::warn!("Damaged match settings in {}: {e}", dir.display());
+                    (recovered_meta(&folder, &dir), true)
                 }
             };
-            if !valid_id(&meta.id) || entry.file_name().to_string_lossy() != meta.id {
-                continue;
+            if (recover_interrupted(&mut meta, &dir) || damaged)
+                && let Err(e) = write_atomic(&dir.join("project.json"), &to_json(&meta))
+            {
+                // Kept in memory; saved with the next change.
+                log::warn!("Could not save {}: {e}", dir.display());
             }
-            if recover_interrupted(&mut meta, &dir) {
-                write_atomic(&dir.join("project.json"), &to_json(&meta))?;
-            }
-            remove_part_files(&dir);
             map.insert(
                 meta.id.clone(),
                 Entry {
@@ -386,15 +438,68 @@ impl Store {
         Some((entry.meta.clone(), r))
     }
 
-    /// Forget a project and delete its folder.
+    /// Forget a project and delete its folder. All or nothing: the folder
+    /// is renamed first, which Windows refuses while another program (a
+    /// video player) has one of its files open.
     pub fn delete(&self, id: &str) -> std::io::Result<()> {
         let dir = self.project_dir(id);
         let mut map = self.lock();
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
+            let trash = self.root.join(format!("{id}{DELETING}"));
+            let _ = std::fs::remove_dir_all(&trash);
+            std::fs::rename(&dir, &trash)?;
+            if let Err(e) = std::fs::remove_dir_all(&trash) {
+                // Finished at the next start.
+                log::warn!("Could not delete all of {}: {e}", trash.display());
+            }
         }
         map.remove(id);
         Ok(())
+    }
+}
+
+/// Suffix of a project folder that is being deleted.
+const DELETING: &str = ".deleting";
+
+/// Settings for a match whose project.json was damaged (for example by a
+/// power cut), so it still shows up and can be deleted or fixed.
+fn recovered_meta(id: &str, dir: &Path) -> ProjectMeta {
+    let file = |side| {
+        let path = original_file(dir, side)?;
+        Some(FileInfo {
+            name: path.file_name()?.to_string_lossy().into_owned(),
+            size_bytes: path.metadata().ok()?.len(),
+            probe: None,
+        })
+    };
+    let files = Files {
+        left: file("left"),
+        right: file("right"),
+    };
+    let now = now_iso();
+    ProjectMeta {
+        id: id.into(),
+        name: "Recovered match".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        lens_id: None,
+        style: Style::Broadcast,
+        status: Status::Failed,
+        files,
+        job: None,
+        error: Some(ErrorInfo {
+            message: "This match's settings were damaged. You can delete it, or add the videos \
+                      again and press Start."
+                .into(),
+            detail: None,
+        }),
+        warnings: Vec::new(),
+        calibration: None,
+        fps: None,
+        frame_count: None,
+        disk_bytes: 0,
+        exports: Vec::new(),
+        interrupted_runs: 0,
     }
 }
 
@@ -406,12 +511,20 @@ fn to_json(meta: &ProjectMeta) -> Vec<u8> {
 /// anything changed.
 pub fn recover_interrupted(meta: &mut ProjectMeta, dir: &Path) -> bool {
     let mut changed = false;
+    if meta.status == Status::Processing {
+        meta.interrupted_runs += 1;
+    }
     if matches!(meta.status, Status::Queued | Status::Processing) {
-        meta.status = Status::Failed;
-        meta.error = Some(ErrorInfo {
-            message: INTERRUPTED.into(),
+        let message = if meta.safe_mode() {
+            STOPPED_TWICE
+        } else {
+            INTERRUPTED
+        };
+        let error = ErrorInfo {
+            message: message.into(),
             detail: None,
-        });
+        };
+        end_unfinished_run(meta, dir, Some(error));
         changed = true;
     }
     if meta.job.take().is_some() {
@@ -429,8 +542,56 @@ pub fn recover_interrupted(meta: &mut ProjectMeta, dir: &Path) -> bool {
     changed
 }
 
+/// A processing run that stopped before the end: cancelled (`problem` is
+/// `None`), failed, or cut short by closing VeoClone. If the results of an
+/// earlier run are all still there, the match stays ready with them and
+/// the problem becomes a warning (DESIGN.md 4.7), so the editor and the
+/// finished videos stay reachable.
+pub fn end_unfinished_run(meta: &mut ProjectMeta, dir: &Path, problem: Option<ErrorInfo>) {
+    meta.job = None;
+    let Some(frames) = earlier_results(dir) else {
+        meta.status = if problem.is_some() {
+            Status::Failed
+        } else {
+            Status::Cancelled
+        };
+        meta.error = problem;
+        return;
+    };
+    let warning = match &problem {
+        None => "You stopped the new run, so this match keeps its earlier result.".to_string(),
+        Some(e) if e.message == INTERRUPTED || e.message == STOPPED_TWICE => {
+            "VeoClone was closed, or the PC restarted, before the new run finished, so this \
+             match keeps its earlier result."
+                .to_string()
+        }
+        Some(e) => format!(
+            "The new run did not finish, so this match keeps its earlier result. {}",
+            e.message
+        ),
+    };
+    meta.status = Status::Ready;
+    meta.error = None;
+    meta.frame_count = Some(frames);
+    if !meta.warnings.contains(&warning) {
+        meta.warnings.push(warning);
+    }
+}
+
+/// The frame count of an earlier finished run whose results (calibration,
+/// preview, AI path and editor data) are all still on disk. New uploads, a
+/// swap and a new calibration delete them, so they always belong together.
+fn earlier_results(dir: &Path) -> Option<u64> {
+    if !DERIVED_FILES.iter().all(|f| dir.join(f).is_file()) {
+        return None;
+    }
+    let calib: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("calib.json")).ok()?).ok()?;
+    calib["frameCount"].as_u64().filter(|n| *n > 0)
+}
+
 /// Remove leftovers of uploads and jobs that never finished
-/// (`*.part`, `*.tmp`, `proxy.tmp.mp4`, `ai_pass.tmp.mkv`).
+/// (`*.part`, `*.tmp`, `proxy.*.tmp.mp4`, `ai_pass.tmp.mkv`).
 fn remove_part_files(dir: &Path) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -477,6 +638,7 @@ pub(crate) mod tests {
             frame_count: None,
             disk_bytes: 0,
             exports: vec![],
+            interrupted_runs: 0,
         }
     }
 
@@ -569,6 +731,139 @@ pub(crate) mod tests {
         store.delete(&id).unwrap();
         assert!(store.get(&id).is_none());
         assert!(!store.project_dir(&id).exists());
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("projects"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    fn write_results(dir: &Path, frames: u64) {
+        for f in DERIVED_FILES {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let calib = serde_json::json!({ "frameCount": frames });
+        std::fs::write(dir.join("calib.json"), calib.to_string()).unwrap();
+    }
+
+    /// DESIGN.md 4.7: a re-run that stops keeps the earlier result.
+    #[test]
+    fn unfinished_rerun_keeps_earlier_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let problem = || {
+            Some(ErrorInfo {
+                message: "It broke.".into(),
+                detail: Some("x".into()),
+            })
+        };
+        // First run: nothing to fall back on.
+        let mut m = sample("a1");
+        m.status = Status::Processing;
+        end_unfinished_run(&mut m, dir, None);
+        assert_eq!(m.status, Status::Cancelled);
+        end_unfinished_run(&mut m, dir, problem());
+        assert_eq!(m.status, Status::Failed);
+        assert_eq!(m.error.as_ref().unwrap().message, "It broke.");
+
+        // A re-run after a finished one: back to ready, problem as warning.
+        write_results(dir, 588);
+        let mut m = sample("a1");
+        m.status = Status::Processing;
+        m.frame_count = Some(600); // the re-run's probe count
+        end_unfinished_run(&mut m, dir, problem());
+        assert_eq!(m.status, Status::Ready);
+        assert!(m.error.is_none());
+        assert_eq!(m.frame_count, Some(588));
+        assert!(m.warnings[0].contains("earlier result") && m.warnings[0].contains("It broke."));
+        end_unfinished_run(&mut m, dir, None);
+        end_unfinished_run(&mut m, dir, None);
+        assert_eq!(m.warnings.len(), 2, "{:?}", m.warnings);
+
+        // Also when VeoClone was closed during the re-run.
+        let mut m = sample("a1");
+        m.status = Status::Processing;
+        assert!(recover_interrupted(&mut m, dir));
+        assert_eq!(m.status, Status::Ready);
+        assert!(m.warnings[0].starts_with("VeoClone was closed"));
+
+        // Without all the results there is nothing to keep.
+        std::fs::remove_file(dir.join("proxy.mp4")).unwrap();
+        let mut m = sample("a1");
+        m.status = Status::Processing;
+        recover_interrupted(&mut m, dir);
+        assert_eq!(m.status, Status::Failed);
+    }
+
+    /// Two interrupted runs in a row switch the match to safe mode.
+    #[test]
+    fn repeated_interruptions_use_safe_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = sample("a1");
+        for (run, message) in [(1, INTERRUPTED), (2, STOPPED_TWICE), (3, STOPPED_TWICE)] {
+            m.status = Status::Processing;
+            recover_interrupted(&mut m, tmp.path());
+            assert_eq!(m.interrupted_runs, run);
+            assert_eq!(m.error.as_ref().unwrap().message, message);
+        }
+        assert!(m.safe_mode());
+        // Queued work that never started does not count.
+        m.interrupted_runs = 0;
+        m.status = Status::Queued;
+        recover_interrupted(&mut m, tmp.path());
+        assert_eq!(m.interrupted_runs, 0);
+        assert_eq!(m.status, Status::Failed);
+    }
+
+    #[test]
+    fn damaged_settings_and_half_deleted_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let m = store.create(sample("abc123def456")).unwrap();
+        let dir = store.project_dir(&m.id);
+        std::fs::write(dir.join("left.mov"), b"12345").unwrap();
+        drop(store);
+        // A power cut left an empty project.json behind.
+        std::fs::write(dir.join("project.json"), b"").unwrap();
+        // A delete was cut short.
+        let gone = tmp.path().join("projects").join("0123456789ab.deleting");
+        std::fs::create_dir_all(gone.join("exports")).unwrap();
+
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(!gone.exists());
+        let m = store.get("abc123def456").unwrap();
+        assert_eq!(m.status, Status::Failed);
+        assert_eq!(m.name, "Recovered match");
+        assert_eq!(m.files.left.as_ref().unwrap().size_bytes, 5);
+        assert!(m.files.right.is_none());
+        drop(store);
+        // It was saved, so it stays the same.
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get("abc123def456").unwrap().created_at, m.created_at);
+        store.delete("abc123def456").unwrap();
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.json");
+        write_atomic(&path, b"one").unwrap();
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert!(write_atomic(&tmp.path().join("missing").join("b.json"), b"x").is_err());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn clock_times() {
+        let fps = Fps {
+            num: 30000,
+            den: 1001,
+        };
+        assert_eq!(fps.clock(0), "0:00");
+        assert_eq!(fps.clock(1799), "1:00");
     }
 
     #[test]

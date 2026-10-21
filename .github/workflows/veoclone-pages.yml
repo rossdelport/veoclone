@@ -4,23 +4,30 @@ name: VeoClone Pages
 # https://rossdelport.github.io/veoclone/
 # One-time setup: Settings > Pages > Source: "GitHub Actions"
 # (see docs/veoclone/hosting.md).
+#
+# Runs on every push, but only publishes from the repository's default
+# branch, whatever it is called (today a claude/ branch, later perhaps
+# main). Runs on other branches are skipped.
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# One deployment at a time; don't cancel one that has started.
+# One deployment at a time; don't cancel one that has started. Per branch,
+# so a push to another branch can't push out a waiting deployment.
 concurrency:
-  group: pages
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     name: Build the editor
+    # The deploy job needs this one, so it is skipped too.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

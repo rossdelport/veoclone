@@ -245,7 +245,7 @@ cap/clamp (the editor applies them).
 | Method & path | Purpose |
 |---|---|
 | `GET /api/health` | `{ app:"veoclone-helper", version, gpu:{name,backend}, ai:{available, provider, model}, ffmpeg:bool, dataDir, freeDiskBytes }` |
-| `GET /api/lenses` | `[{ id, label, width, height }]` iPhone profiles from the embedded lens DB (Apple entries), sorted newest first, deduplicated by label |
+| `GET /api/lenses` | Curated lens choices, see 4.6 |
 | `GET /api/projects` | `ProjectMeta[]` newest first |
 | `POST /api/projects` | body `{ name, lensId?, style }` → `ProjectMeta` |
 | `GET /api/projects/:id` | `ProjectMeta` |
@@ -262,6 +262,7 @@ cap/clamp (the editor applies them).
 | `GET /api/projects/:id/exports/:eid/file` | download (`Content-Disposition: attachment`, Range) |
 | `DELETE /api/projects/:id/exports/:eid` | delete an export |
 | `POST /api/projects/:id/open-folder` | open the project (or `?export=eid`) folder in Explorer/Finder |
+| `POST /api/projects/:id/swap` | swap the left and right videos (no re-upload); clears calibration, preview and AI path; status back to `uploaded` |
 
 `ProjectMeta`:
 
@@ -284,6 +285,47 @@ cap/clamp (the editor applies them).
   exports: ExportMeta[];  // { id, status: "queued"|"running"|"done"|"failed"|"cancelled", progress, createdAt, fileName?, sizeBytes?, width, height, quality, error? }
 }
 ```
+
+### 4.6 Lens choices
+
+The raw lens database has ~160 crowd-sourced Apple entries with messy names.
+The user picks two simple things instead: **which iPhone** and **which lens**.
+
+`GET /api/lenses` → `LensOption[]`:
+
+```ts
+{ id: string;            // stable id stored as ProjectMeta.lensId, e.g. "iphone-15-pro:ultra", "generic:ultra"
+  model: string;         // "iPhone 15 Pro", ... newest first; "Not sure" for the generic entries
+  lens: "ultra" | "main";// ultra = 0.5× ultra wide, main = 1× normal
+  label: string;         // "iPhone 15 Pro · Ultra wide (0.5×)"
+  note?: string }        // e.g. "Uses the iPhone 15 Pro profile (closest match)"
+```
+
+- Exactly one option per (model, lens). Every listed model offers both
+  lenses; when the database has no good profile for one, map it to the
+  closest model that has one and say so in `note`. Include current models
+  missing from the database (iPhone 16 / 16 Plus / 16 Pro / 16 Pro Max / 16e,
+  iPhone 17 / Air / 17 Pro / 17 Pro Max) mapped to the closest profile.
+- The helper picks the underlying database profile per option: prefer clean
+  4K stock-Camera-app entries; skip Log/ProRes/third-party-app/cinematic/
+  telephoto/front/vertical/odd-resolution entries; every chosen profile must
+  load and scale to 3840x2160 and 1920x1080 (unit-tested).
+- `generic:ultra` / `generic:main` ("Not sure") use a representative recent
+  iPhone profile of that lens type — never Reco's resolution-only fallback
+  (which is an action camera). Default for new matches: `generic:ultra`.
+- Old free-form lens ids keep working if they still resolve; otherwise treat
+  as `generic:ultra` with a warning.
+- Changing the lens of a processed match (`PATCH lensId` then `process`)
+  re-calibrates and rebuilds everything; the editor offers this when the
+  picture looks bent or the halves don't join.
+
+### 4.7 Re-runs never lock the user out
+
+If a re-run of a match that was `ready` (new style, Try again) is cancelled
+or fails, or the helper closes during it, and the previous calibration,
+preview and AI path are still valid, the match goes back to `ready` (old
+outputs kept) with the problem added to `warnings`. Warnings are shown in
+the editor and on the home card, not only on the processing page.
 
 ## 5. Editor engine (`web/src/engine/`) — pure TS, unit tested
 
@@ -369,8 +411,8 @@ the editor reads the exact presented frame via
 - `veoclone-ci.yml` (push/PR): web typecheck + unit tests + build; helper
   `cargo fmt --check`, `clippy -D warnings`, `cargo test -p veoclone-helper`
   on Ubuntu.
-- `veoclone-windows.yml` (push to main and the dev branch, tags `v*`,
-  manual): builds `veoclone-helper.exe --features load-dynamic` on
+- `veoclone-windows.yml` (push to the default branch and `claude/**`
+  branches, tags `veoclone-v*`, manual): builds `veoclone-helper.exe --features load-dynamic` on
   `windows-latest` the way Reco's `release.yml` does (BtbN FFmpeg n7.1
   win64-gpl-shared, LLVM, ONNX Runtime DirectML 1.24.4 + DirectML 1.15.4 from
   NuGet), builds the web app, downloads `yolo26n.onnx`/`yolo26n_640.onnx`
@@ -386,10 +428,17 @@ VeoClone/
   LICENSE  README.txt
 ```
 
-  Uploaded as a workflow artifact; on `main` also published to a rolling
-  GitHub release `helper-latest`.
-- `veoclone-pages.yml` (push to main, manual): builds `web/` and deploys to
-  GitHub Pages (one-time: Settings → Pages → Source: GitHub Actions).
+  Uploaded as a workflow artifact; builds of the repository's **default
+  branch** (whatever it is called — today `claude/happy-einstein-iqtkqs`,
+  later perhaps `main`) also update a rolling GitHub release
+  `helper-latest`; `veoclone-v*` tags make a normal release.
+- `veoclone-pages.yml` (push, manual): builds `web/` and deploys to GitHub
+  Pages only from the default branch (one-time: Settings → Pages → Source:
+  GitHub Actions).
+- Upstream Reco workflows (`rust.yml`, `release.yml`, `build-test.yml`,
+  `test-build-gui.yml`) only run on manual dispatch in this repository, and
+  Reco's Dependabot config is removed, so the owner isn't flooded with
+  irrelevant runs and pull requests.
 - The web build uses `base: './'` and hash routing (`#/`, `#/new`,
   `#/project/:id`, `#/edit/:id`) so the same build works on Pages and from
   the helper.

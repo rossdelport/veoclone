@@ -43,7 +43,7 @@ cargo run --release -p reco-cli --features profiling -- stitch left.mp4 right.mp
 ## Build & contributing
 
 - Build prerequisites (Rust version, FFmpeg development libraries, clang,
-  pkg-config) and the feature-flag matrix: see [README.md](README.md).
+  pkg-config) and the feature-flag matrix: see [README.reco.md](README.reco.md).
 - Contribution conventions (branch naming, PR template, CLA): see
   [CONTRIBUTING.md](CONTRIBUTING.md).
 

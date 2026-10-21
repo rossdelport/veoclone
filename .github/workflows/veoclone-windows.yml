@@ -1,0 +1,281 @@
+name: VeoClone Windows
+
+# Builds the VeoClone download for Windows: the helper (VeoClone.exe) with
+# FFmpeg, ONNX Runtime + DirectML, the AI models and the editor, as one
+# folder. The build steps follow Reco's release.yml (Windows parts).
+#
+# - Every run uploads the folder as the artifact "VeoClone-windows"
+#   (it downloads from the run page as VeoClone-windows.zip).
+# - On main it also updates the rolling pre-release "helper-latest".
+# - A tag like veoclone-v0.2.0 makes a normal release with the zip.
+
+on:
+  push:
+    branches: [main, 'claude/**']
+    tags: ['veoclone-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Let a running main build finish so the release is never half-updated.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build VeoClone for Windows
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # ----------------------------------------------------------------
+      # Editor (web/)
+      # ----------------------------------------------------------------
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install editor dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build the editor
+        working-directory: web
+        run: npm run build
+
+      # ----------------------------------------------------------------
+      # FFmpeg (BtbN win64-gpl-shared, n7.1 like release.yml)
+      #
+      # release.yml looks up "the newest BtbN autobuild with an n7.1 zip",
+      # but BtbN stopped building 7.1 in August 2026 (they now build
+      # master, n8.1 and n9.0), so that lookup fails. Instead this pins the
+      # last n7.1 build: BtbN keeps the last build of every month for two
+      # years. To update, pick a newer monthly autobuild and take the zip's
+      # SHA-256 from its checksums.sha256 asset.
+      # ----------------------------------------------------------------
+      - name: Install FFmpeg
+        shell: pwsh
+        env:
+          FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-shared-7.1.zip
+          FFMPEG_SHA256: 3e61e96b44bce30f0fad9fc31955be7fe4d6690d6a5a2b65c62494e262f8369e
+        run: |
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP\ffmpeg.zip").Hash
+          if ($hash -ne $env:FFMPEG_SHA256) { throw "FFmpeg zip has the wrong SHA-256: $hash" }
+          Expand-Archive -Path "$env:RUNNER_TEMP\ffmpeg.zip" -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
+          $dir = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1).FullName
+          echo "FFMPEG_DIR=$dir" >> $env:GITHUB_ENV
+          echo "FFMPEG_DLL_DIR=$dir\bin" >> $env:GITHUB_ENV
+          echo "Bundled FFmpeg: $(Split-Path $dir -Leaf)"
+
+      # bindgen (FFmpeg bindings) needs libclang. windows-latest ships LLVM,
+      # which release.yml relies on; install it only if it is missing.
+      - name: Check LLVM (clang)
+        shell: pwsh
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$llvm\libclang.dll")) { choco install llvm -y --no-progress }
+          echo "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+          & "$llvm\clang.exe" --version
+
+      # ----------------------------------------------------------------
+      # Helper (MSVC toolchain, same Rust version as rust-toolchain.toml)
+      # ----------------------------------------------------------------
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: veoclone-windows
+
+      # load-dynamic: onnxruntime.dll is loaded at run time from next to the
+      # exe (as in release.yml). DirectML support is switched on for Windows
+      # in the helper's Cargo.toml.
+      - name: Build the helper
+        run: cargo build --locked --release -p veoclone-helper --features load-dynamic
+
+      # ----------------------------------------------------------------
+      # ONNX Runtime + DirectML (same NuGet packages as release.yml)
+      # ----------------------------------------------------------------
+      - name: Download ONNX Runtime (DirectML)
+        shell: pwsh
+        run: |
+          $nupkg = "$env:RUNNER_TEMP\ort-dml.nupkg"
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg" -OutFile $nupkg
+          Expand-Archive -Path $nupkg -DestinationPath "$env:RUNNER_TEMP\ort-dml"
+          $dll = "$env:RUNNER_TEMP\ort-dml\runtimes\win-x64\native\onnxruntime.dll"
+          echo "ORT_DLL=$dll" >> $env:GITHUB_ENV
+          echo "Bundled ONNX Runtime 1.24.4 DirectML ($('{0:N1}' -f ((Get-Item $dll).Length / 1MB)) MB)"
+
+          # DirectML.dll is in a separate NuGet package (not bundled in ORT DirectML).
+          $dmlPkg = "$env:RUNNER_TEMP\directml.nupkg"
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg" -OutFile $dmlPkg
+          Expand-Archive -Path $dmlPkg -DestinationPath "$env:RUNNER_TEMP\directml"
+          $dml = "$env:RUNNER_TEMP\directml\bin\x64-win\DirectML.dll"
+          echo "DML_DLL=$dml" >> $env:GITHUB_ENV
+          echo "Bundled DirectML.dll 1.15.4 ($('{0:N1}' -f ((Get-Item $dml).Length / 1MB)) MB)"
+
+      # ----------------------------------------------------------------
+      # AI models (from Reco's v0.5.2 release, checked like release.yml)
+      # ----------------------------------------------------------------
+      - name: Download the AI models
+        shell: pwsh
+        run: |
+          $base = "https://github.com/reco-project/video-stitcher/releases/download/v0.5.2"
+          $models = @{
+            "yolo26n.onnx"     = "3f6e5b6c9adaaf7f033810526f12826557e92fafaffa6df2d0ed06512f5e3821"
+            "yolo26n_640.onnx" = "30fde6857b65f6256c9924c3340810a03f73fc42503df9e34156089bda9496ac"
+          }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\models" | Out-Null
+          foreach ($name in $models.Keys) {
+            $file = "$env:RUNNER_TEMP\models\$name"
+            Invoke-WebRequest -Uri "$base/$name" -OutFile $file
+            $hash = (Get-FileHash -Algorithm SHA256 $file).Hash
+            if ($hash -ne $models[$name]) { throw "$name has the wrong SHA-256: $hash" }
+            echo "$name OK"
+          }
+
+      # ----------------------------------------------------------------
+      # Put the VeoClone folder together (layout: DESIGN.md section 6)
+      # ----------------------------------------------------------------
+      - name: Assemble the VeoClone folder
+        shell: pwsh
+        run: |
+          $out = "out\VeoClone"
+          New-Item -ItemType Directory -Force -Path "$out\models" | Out-Null
+
+          Copy-Item "target\release\veoclone-helper.exe" "$out\VeoClone.exe"
+          # FFmpeg programs (audio sync, preview, probing) and their DLLs.
+          Copy-Item "$env:FFMPEG_DLL_DIR\ffmpeg.exe", "$env:FFMPEG_DLL_DIR\ffprobe.exe", "$env:FFMPEG_DLL_DIR\*.dll" $out
+          Copy-Item $env:ORT_DLL, $env:DML_DLL $out
+          # App-local Visual C++ runtime, so users don't need to install the
+          # redistributable (Microsoft's "local deployment"). onnxruntime.dll
+          # imports all four; the helper itself needs vcruntime140.dll.
+          foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll") {
+            Copy-Item "$env:SystemRoot\System32\$dll" $out
+          }
+          Copy-Item "$env:RUNNER_TEMP\models\*.onnx" "$out\models"
+          Copy-Item "web\dist" "$out\web" -Recurse
+          Copy-Item LICENSE, "packaging\README.txt" $out
+
+          # Licence texts of the bundled third-party programs.
+          $lic = "$out\licenses"
+          New-Item -ItemType Directory -Force -Path "$lic\FFmpeg", "$lic\ONNX Runtime", "$lic\DirectML" | Out-Null
+          Copy-Item "$env:FFMPEG_DIR\LICENSE.txt" "$lic\FFmpeg"
+          Copy-Item "$env:RUNNER_TEMP\ort-dml\LICENSE*", "$env:RUNNER_TEMP\ort-dml\ThirdPartyNotices*" "$lic\ONNX Runtime"
+          Copy-Item "$env:RUNNER_TEMP\directml\LICENSE*", "$env:RUNNER_TEMP\directml\ThirdPartyNotices*" "$lic\DirectML"
+          Copy-Item THIRD_PARTY_NOTICES.md "$lic\Reco-THIRD_PARTY_NOTICES.md"
+
+          Get-ChildItem $out -Recurse -File | Select-Object Length, FullName | Format-Table -AutoSize | Out-String -Width 300
+
+      # Start VeoClone.exe like a user would (without opening a browser) and
+      # check that it finds FFmpeg, loads the AI and serves the editor.
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "out\VeoClone\VeoClone.exe").Path
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "VeoClone.exe --version failed (exit code $LASTEXITCODE)" }
+
+          $tmp = "$env:RUNNER_TEMP\smoke"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          $p = Start-Process -FilePath $exe -ArgumentList "--no-open", "--data-dir", "$tmp\data" `
+            -NoNewWindow -PassThru -RedirectStandardOutput "$tmp\out.txt" -RedirectStandardError "$tmp\err.txt"
+          $null = $p.Handle  # keeps ExitCode readable after the process ends
+          try {
+            $health = $null
+            for ($i = 0; $i -lt 120; $i++) {
+              Start-Sleep -Seconds 1
+              if ($p.HasExited) { throw "VeoClone.exe stopped by itself (exit code $($p.ExitCode))" }
+              try { $health = Invoke-RestMethod -Uri "http://127.0.0.1:47863/api/health" -TimeoutSec 5 } catch { continue }
+              if ($health.ai.provider -ne "checking") { break }
+            }
+            if (-not $health) { throw "VeoClone did not answer at http://127.0.0.1:47863/api/health" }
+            $health | ConvertTo-Json -Depth 5
+            if ($health.app -ne "veoclone-helper") { throw "Unexpected answer from /api/health" }
+            if (-not $health.ffmpeg) { throw "VeoClone did not find ffmpeg.exe and ffprobe.exe next to it" }
+            if ($health.ai.provider -eq "checking") {
+              echo "::warning::The AI check had not finished after 2 minutes, so AI loading was not tested"
+            } elseif (-not $health.ai.available) {
+              throw "VeoClone could not load ONNX Runtime or the AI model"
+            }
+            $page = Invoke-WebRequest -Uri "http://127.0.0.1:47863/" -TimeoutSec 10
+            if ($page.Content -notmatch "<html") { throw "The editor is not served at http://127.0.0.1:47863/" }
+            echo "Smoke test passed"
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            Get-Content "$tmp\out.txt", "$tmp\err.txt" -ErrorAction SilentlyContinue
+          }
+
+      # The artifact holds out/VeoClone, so the zip GitHub makes for it
+      # contains a "VeoClone" folder, the same as the release zip.
+      - name: Upload VeoClone-windows
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VeoClone-windows
+          path: out/
+          if-no-files-found: error
+
+  # ====================================================================
+  # Publish to GitHub Releases (main and veoclone-v* tags only). A
+  # separate job so that only this small step can write to the repo.
+  # ====================================================================
+  publish:
+    name: Publish release
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/veoclone-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: VeoClone-windows
+          path: out
+
+      - name: Zip the VeoClone folder
+        working-directory: out
+        run: |
+          test -f VeoClone/VeoClone.exe
+          zip -q -r -9 ../VeoClone-windows.zip VeoClone
+          ls -l ../VeoClone-windows.zip
+
+      - name: Update the "helper-latest" pre-release
+        if: github.ref == 'refs/heads/main'
+        run: |
+          title="VeoClone for Windows (latest build)"
+          notes="The newest build of VeoClone for Windows, made automatically from commit ${GITHUB_SHA::7} on $(date -u '+%-d %B %Y').
+
+          How to use it: download VeoClone-windows.zip below, unzip it, then double-click VeoClone.exe.
+          Step-by-step guide: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}#readme"
+
+          # Replace the previous build and its tag. (Moving the existing tag
+          # instead is refused for GITHUB_TOKEN whenever a workflow file
+          # changed in between.) The download link stays the same.
+          gh release delete helper-latest --cleanup-tag --yes || true
+          gh api --method DELETE "repos/$GH_REPO/git/refs/tags/helper-latest" > /dev/null 2>&1 || true
+          gh release create helper-latest VeoClone-windows.zip --target "$GITHUB_SHA" --prerelease \
+            --title "$title" --notes "$notes"
+
+      - name: Publish the release for this tag
+        if: startsWith(github.ref, 'refs/tags/veoclone-v')
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" VeoClone-windows.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" VeoClone-windows.zip --verify-tag \
+              --title "VeoClone ${GITHUB_REF_NAME#veoclone-}" --generate-notes
+          fi

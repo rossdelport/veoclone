@@ -1,0 +1,83 @@
+name: VeoClone CI
+
+# Checks the VeoClone parts (web/ editor and crates/veoclone-helper) on every
+# push and pull request. Reco's own crates are checked by rust.yml.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: Editor (web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  helper:
+    name: Helper (Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # FFmpeg dev libraries + clang + pkg-config to build ffmpeg-sys-next.
+      # The ffmpeg program and Mesa's software Vulkan driver (llvmpipe) are
+      # for the export test below, which renders real video.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libavdevice-dev libavfilter-dev libswresample-dev \
+            pkg-config clang \
+            ffmpeg libvulkan1 mesa-vulkan-drivers
+
+      # Same version as rust-toolchain.toml (which cargo would install anyway).
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: veoclone-helper
+
+      - name: Format check
+        run: cargo fmt -p veoclone-helper -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked -p veoclone-helper --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked -p veoclone-helper
+
+      # Checks that every exported frame uses the editor's pose for that
+      # frame (DESIGN.md 4.3) by stitching short clips on the software GPU
+      # (about 20 s here).
+      - name: Export frame-alignment test (software GPU)
+        timeout-minutes: 20
+        run: cargo test --locked -p veoclone-helper -- --ignored export_frame_alignment

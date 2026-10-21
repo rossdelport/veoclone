@@ -1,0 +1,6 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": { "resolveJsonModule": true },
+  "include": ["*.ts", "../../src/engine", "../../test-pages"],
+  "exclude": ["vitest.config.ts", "*.pw.ts"]
+}

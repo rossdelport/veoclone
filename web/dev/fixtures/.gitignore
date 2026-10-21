@@ -1,0 +1,2 @@
+# Small test videos for the mock helper (the root .gitignore skips *.mp4).
+!*.mp4

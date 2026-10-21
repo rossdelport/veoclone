@@ -1,3 +1,299 @@
 # VeoClone
 
-Work in progress. See docs/veoclone/DESIGN.md. Built on Reco Video Stitcher (README.reco.md).
+Film a football match with two iPhones, and VeoClone turns the two videos into
+one video where the camera follows the ball, like a Veo camera.
+
+- **Download for Windows:** [VeoClone-windows.zip](https://github.com/rossdelport/veoclone/releases/download/helper-latest/VeoClone-windows.zip)
+  (or see all downloads on the [Releases page](https://github.com/rossdelport/veoclone/releases))
+- **Online editor:** <https://rossdelport.github.io/veoclone/> (VeoClone must be running on your PC)
+
+## What VeoClone does
+
+1. You film the match with two iPhones side by side, up high. Each phone films
+   one half of the pitch.
+2. VeoClone lines the two videos up using their sound, joins them into one
+   wide view of the whole pitch, and an AI watches the match and steers a
+   "camera" that follows the ball.
+3. In the editor you can point the camera somewhere else wherever the AI got
+   it wrong, trim the start and end, cut out half-time, zoom in or out, and
+   make the camera smoother.
+4. You export a normal MP4 video that plays everywhere and is easy to share.
+
+Everything happens on your own PC. Your videos are never uploaded to the
+internet, not even when you use the online editor.
+
+## What you need
+
+- **A Windows 10 or 11 PC with a decent graphics card**, for example an AMD
+  Radeon RX 6000 series or an NVIDIA GeForce RTX. A weaker graphics card
+  works too, just more slowly.
+- **Plenty of free disk space**: about 40 GB for each full match. Phone videos
+  are big.
+- **Google Chrome or Microsoft Edge.** The editor runs in your web browser.
+- **Two iPhones with an ultra wide (0.5×) lens** (iPhone 11 or newer). The
+  same model on both sides is best.
+- **Something to hold both phones side by side, up high**: a tall tripod or
+  pole with a mount for two phones. The higher, the better.
+- Power banks for both phones, and enough free space on each phone (about
+  20 GB each for a full match).
+
+## One-time setup
+
+1. **Download** [VeoClone-windows.zip](https://github.com/rossdelport/veoclone/releases/download/helper-latest/VeoClone-windows.zip).
+   - If that link doesn't work yet, open the
+     [VeoClone Windows builds](https://github.com/rossdelport/veoclone/actions/workflows/veoclone-windows.yml)
+     page, click the newest run with a green tick, scroll down to
+     **Artifacts** and click **VeoClone-windows**. (You need to be signed in
+     to GitHub for this.)
+2. **Unzip it**: right-click the downloaded file, choose **Extract All…**,
+   click **Browse…**, choose your **Documents** folder and click **Extract**.
+   You now have a folder called **Documents\VeoClone**. Don't run VeoClone
+   from inside the zip file.
+3. **Start it**: open the VeoClone folder and double-click **VeoClone.exe**
+   (it may just show as "VeoClone").
+4. The first time, Windows may say **"Windows protected your PC"**. Click
+   **More info**, then **Run anyway**. Windows says this about programs it
+   doesn't know yet; you only need to do it once.
+5. A black window opens, and then your browser opens the VeoClone editor.
+   **Keep the black window open while you use VeoClone.** Closing it stops
+   VeoClone (it is fine to minimise it).
+6. If Chrome or Edge asks for permission to **connect to devices or apps on
+   your network or this computer**, click **Allow**. VeoClone only talks to
+   your own PC.
+
+Tip: to start VeoClone more easily next time, right-click VeoClone.exe,
+choose **Show more options › Send to › Desktop (create shortcut)**.
+
+## How to film
+
+**Settings on both iPhones** (open **Settings › Camera › Record Video**):
+
+- Choose **4K at 30 fps**.
+- Switch **HDR Video off**. Otherwise the colours look washed out.
+- If you see **Auto FPS**, set it to **Off**.
+- If you see **Lock Camera**, switch it **on** (the phone then keeps the same
+  lens all the time).
+
+**Setting up at the pitch:**
+
+- Open the Camera app, choose **Video** and tap **0.5×** on both phones.
+- Hold the phones **sideways** (landscape), both the same way up.
+- Put them **side by side, as high as you can**, level with the halfway line.
+- **Angle them outwards**: the left phone films the left half of the pitch,
+  the right phone the right half. The two pictures should **overlap a
+  little in the middle** (about 15%, so the centre circle shows in both).
+- Tilt them down a little so the whole pitch fits, from the near touchline to
+  the far one.
+- Turn on **Airplane Mode** so calls don't interrupt the recording, and plug
+  in the power banks.
+
+**Recording:**
+
+- Press record on **both phones within a few seconds of each other**.
+  VeoClone uses the sound to line the two videos up. A loud clap near both
+  phones just after you start helps.
+- **Don't touch or move the phones** until the end.
+- Keep recording through half-time if you can. If you stop at half-time, you
+  get two videos per phone: make **one VeoClone match per half**.
+
+**Getting the videos onto your PC:**
+
+- On each iPhone, go to **Settings › Apps › Photos** (on older iPhones
+  **Settings › Photos**) and under **Transfer to Mac or PC** choose **Keep
+  Originals**.
+- Plug the iPhone into the PC with its cable, unlock it and tap **Trust**.
+- Open **File Explorer › This PC › Apple iPhone › Internal Storage › DCIM**
+  and copy the match video (the newest .MOV file) to a folder on your PC.
+- Rename the files straight away, for example **left.MOV** and
+  **right.MOV**, so you don't mix them up.
+
+## Making a video, step by step
+
+1. **Start VeoClone** (double-click VeoClone.exe). The editor opens in your
+   browser. At the top right it should say **Connected**.
+2. Click **New match** and type a name, for example "U12s v Rovers".
+3. **Which iPhone filmed this?** Pick your iPhone model with the **Ultra Wide
+   (0.5×)** lens. If yours isn't listed, pick the closest older model, or
+   leave it on **Not sure (automatic)**.
+4. **Camera style**: **Broadcast** (calm, like TV; best for most matches),
+   **Action** (follows the ball more closely) or **Wide** (keeps all the
+   players in the picture). You can change it later.
+5. Drag the left phone's video onto **Left phone** and the right phone's video
+   onto **Right phone** (or click a box to choose the file). Mixed them up?
+   Click **Swap left and right**.
+6. Click **Start**. Keep the page open until both videos have been sent to
+   VeoClone. Then VeoClone works through four steps: checking the videos,
+   lining them up and joining them, making a preview, and AI ball tracking.
+   This takes a while: for a full match, allow an hour or more. You can leave
+   the page, but keep the black VeoClone window open and **don't let the PC go
+   to sleep** (Settings › System › Power).
+7. When it says **Your match is ready**, click **Open the editor**.
+
+**In the editor:**
+
+- The big picture is the **camera view**: what your video will look like.
+- The strip under it shows the **whole pitch**. The box shows where the camera
+  is pointing. Click or drag in it to point the camera somewhere else.
+- You can also drag inside the camera view to move the camera, and use the
+  mouse wheel to zoom.
+- Each time you move the camera, VeoClone adds a **fix**: the camera keeps your
+  view around that moment, then eases back to the AI. **How long a fix lasts**
+  sets how long it stays.
+- The **timeline** shows the whole match. Click the fix markers to jump to
+  them; press **Delete** to remove the selected fix.
+- **Set start here** and **Set end here** trim the video. **Cut out a section**
+  removes a part, for example half-time.
+- **Zoom** makes the whole video wider or closer. **Smoothness** calms down
+  quick camera moves.
+- Keyboard: **Space** play/pause, **← →** one frame, **Shift + ← →** five
+  seconds, **K** add a fix with the current view, **Ctrl + Z** undo.
+- Your changes are saved by themselves.
+
+**Exporting:**
+
+1. Click **Export**.
+2. Choose the size (**1080p** is recommended and plays everywhere; 1440p and
+   4K are sharper but bigger and slower to make) and the quality.
+3. Click **Make video** and wait until it is finished.
+4. Click **Download**, or **Show in folder** to open the folder with your
+   video.
+
+## Where your files are kept
+
+- Everything VeoClone makes is in your **Videos** folder, in
+  **Videos\VeoClone**. Each match has its own folder inside
+  **Videos\VeoClone\projects**, with VeoClone's own copy of the two phone
+  videos, the preview and your finished videos (in the **exports** folder).
+  The match folders have code names, so the easiest way to find a finished
+  video is the **Show in folder** button in the editor.
+- **To free up space**, delete matches you don't need any more on the
+  VeoClone home page. This deletes VeoClone's copy of the phone videos **and
+  the finished videos of that match**, so download or copy the videos you want
+  to keep first. Files elsewhere on your PC or on the phones are not touched.
+- You can also delete single finished videos in the editor's export list.
+- Once a match is in VeoClone, it has its own copy of the phone videos, so
+  you can delete the copies you made from the phones if you need the space.
+
+## If something goes wrong
+
+**"VeoClone isn't running" or "VeoClone not running"**
+- Check that the black VeoClone window is open. If you closed it,
+  double-click VeoClone.exe again.
+- Use Chrome or Edge. If you clicked **Block** when the browser asked about
+  devices or apps on your network, click the icon to the left of the web
+  address, allow the network access again, and reload the page.
+- Open the editor that VeoClone itself provides: <http://127.0.0.1:47863/>.
+  It always works while the black window is open.
+- If the black window says VeoClone **is already running**, another
+  VeoClone window is open somewhere. Use that one, or restart the PC.
+
+**The AI is very slow, or it says "AI ready (slower: no graphics card)"**
+- VeoClone could not use your graphics card for the AI and is using the main
+  processor instead, which is much slower. Update your graphics card driver
+  (AMD Software: Adrenalin Edition, or the NVIDIA app), restart the PC and
+  start VeoClone again.
+- Make sure you start VeoClone.exe from the full VeoClone folder, with all
+  the other files next to it.
+- Point at **Connected** at the top right to see which graphics card
+  VeoClone found.
+
+**The colours look washed out or grey**
+- The phones filmed in HDR. Switch **HDR Video** off on both phones before
+  the next match (Settings › Camera › Record Video).
+
+**The picture looks bent or warped, or the two halves don't join well**
+- The wrong iPhone model may be selected. Make a new match with the same two
+  videos and pick the right model (with the 0.5× Ultra Wide lens) under
+  **Which iPhone filmed this?**
+- Check that both phones used the 0.5× lens, the same settings, and did not
+  move during the match.
+
+**The videos are not lined up (things jump where the two halves meet)**
+- VeoClone lines the videos up using their sound. Next time, start both
+  phones closer together (within a few seconds) and clap near both phones
+  just after you start. Make sure nothing covers the microphones.
+
+**Processing stopped half-way**
+- If the PC went to sleep or the black window was closed, open the match and
+  press **Try again**.
+
+**Still stuck?** The black VeoClone window shows what it is doing, and each
+match folder has a **log.txt** file. Please include it when you ask for help.
+
+## Online editor or local editor?
+
+- **Online:** <https://rossdelport.github.io/veoclone/>. Always the newest
+  editor. It still needs VeoClone running on your PC, and your videos stay on
+  your PC.
+- **Local:** <http://127.0.0.1:47863/>. The editor that comes with VeoClone.
+  It works without the internet.
+
+---
+
+## For developers
+
+VeoClone has two parts. The contract between them is
+[docs/veoclone/DESIGN.md](docs/veoclone/DESIGN.md).
+
+- **Helper** ([crates/veoclone-helper](crates/veoclone-helper)): a Rust
+  program that runs on the user's PC as a local HTTP server on
+  `127.0.0.1:47863`. It stores matches on disk and runs calibration, AI ball
+  tracking (ONNX Runtime, DirectML on Windows) and export in-process with the
+  Reco crates. Shipped as `VeoClone.exe`.
+- **Editor** ([web](web)): a static site (Vite + TypeScript, no framework)
+  hosted on GitHub Pages and also served by the helper. Its WebGL preview
+  re-implements Reco's projection, and it sends the final camera path to the
+  helper, so the preview matches the export.
+
+**Build and run** (prerequisites as in [README.reco.md](README.reco.md):
+Rust 1.92, FFmpeg development libraries, clang, pkg-config):
+
+```bash
+cargo build --release -p veoclone-helper
+target/release/veoclone-helper --no-open --web-dir web/dist --model path/to/yolo26n_640.onnx
+
+cd web
+npm ci
+npm run dev    # editor on http://localhost:5173, talks to the helper on 127.0.0.1:47863
+npm run mock   # a pretend helper for editor work (see web/dev/README.md)
+```
+
+The AI models come from Reco's
+[v0.5.2 release](https://github.com/reco-project/video-stitcher/releases/tag/v0.5.2).
+Helper options: `--port`, `--data-dir`, `--web-dir`, `--model`,
+`--allow-origin`, `--no-open`, `--version`.
+
+**Tests:**
+
+```bash
+cargo test -p veoclone-helper
+cargo test -p veoclone-helper -- --ignored export_frame_alignment   # needs ffmpeg and a GPU (llvmpipe works)
+cd web && npm run typecheck && npm test && npm run test:ui
+```
+
+**CI, downloads and hosting** (details in
+[docs/veoclone/hosting.md](docs/veoclone/hosting.md)):
+
+- `veoclone-ci.yml`: editor typecheck, tests and build; helper fmt, clippy
+  and tests (every push and pull request).
+- `veoclone-windows.yml`: builds the Windows folder (VeoClone.exe, FFmpeg,
+  ONNX Runtime + DirectML, models, editor) and smoke-tests it. Pushes to
+  `main` update the `helper-latest` pre-release; a `veoclone-v*` tag makes a
+  normal release.
+- `veoclone-pages.yml`: publishes the editor to GitHub Pages on pushes to
+  `main`.
+
+## Credits and licence
+
+- VeoClone is built on [Reco Video Stitcher](https://github.com/reco-project/video-stitcher)
+  by the Reco project (AGPL-3.0). Reco's own documentation is in
+  [README.reco.md](README.reco.md).
+- The AI model (yolo26n) comes from the Reco release and is based on
+  Ultralytics YOLO (AGPL-3.0).
+- The Windows download also includes FFmpeg (GPL, builds by BtbN), Microsoft
+  ONNX Runtime and DirectML, and the Microsoft Visual C++ runtime. The
+  licences of FFmpeg, ONNX Runtime and DirectML are in the `licenses` folder
+  of the download.
+- VeoClone is free software under the GNU Affero General Public License v3.0
+  (see [LICENSE](LICENSE)).
+- VeoClone is not made by, or connected with, Veo Technologies.

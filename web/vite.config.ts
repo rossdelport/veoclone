@@ -5,5 +5,5 @@ import { defineConfig } from "vite";
 // served by the helper at the root of http://127.0.0.1:47863/.
 export default defineConfig({
   base: "./",
-  test: { environment: "node", include: ["src/**/*.test.ts"] },
+  test: { environment: "node", include: ["src/**/*.test.ts", "tests/**/*.test.ts"] },
 });

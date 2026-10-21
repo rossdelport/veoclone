@@ -1,0 +1,54 @@
+[package]
+publish = false
+name = "veoclone-helper"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-only"
+repository.workspace = true
+description = "VeoClone helper: local HTTP server that runs calibration, AI tracking and export with the Reco libraries"
+
+[[bin]]
+name = "veoclone-helper"
+path = "src/main.rs"
+
+[features]
+default = []
+# Load onnxruntime.dll / libonnxruntime.so at runtime instead of linking it
+# (the Windows release build uses this, like Reco's own release.yml).
+load-dynamic = ["reco-autocam/load-dynamic", "reco-detect/load-dynamic"]
+
+[dependencies]
+reco-core = { path = "../reco-core" }
+reco-io = { path = "../reco-io", features = ["ffmpeg"] }
+reco-calibrate = { path = "../reco-calibrate", features = ["io"] }
+reco-detect = { path = "../reco-detect", default-features = false, features = ["ort"] }
+reco-autocam = { path = "../reco-autocam", default-features = false, features = ["ort"] }
+
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "sync", "time"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors", "fs"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+open = "5"
+fs4 = "0.13"
+log = "0.4"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# DirectML for AI tracking on Windows (any DX12 GPU, incl. AMD). Copied
+# from reco-gui: without the `directml` feature on ort the provider
+# silently falls back to CPU.
+[target.'cfg(windows)'.dependencies]
+reco-detect = { path = "../reco-detect", default-features = false, features = ["directml"] }
+reco-autocam = { path = "../reco-autocam", default-features = false, features = ["directml"] }
+
+[dev-dependencies]
+tempfile = "3"

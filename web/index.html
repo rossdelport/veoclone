@@ -3,10 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Turn two phone videos of a football match into one video where the camera follows the ball." />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>VeoClone</title>
   </head>
   <body>
-    <div id="app"></div>
+    <header class="appbar">
+      <a class="brand" href="#/" aria-label="VeoClone – your matches">
+        <img src="/favicon.svg" alt="" width="28" height="28" />
+        <span>VeoClone</span>
+      </a>
+      <div id="appbar-slot" class="appbar-slot"></div>
+      <div id="helper-pill" class="helper-pill"></div>
+    </header>
+    <div id="helper-banner"></div>
+    <main id="page"></main>
+    <div id="toasts" aria-live="polite"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

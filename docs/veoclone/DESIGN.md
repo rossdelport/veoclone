@@ -442,6 +442,57 @@ Frame ↔ time: `frame = round(t · num/den)` clamped to [0, frameCount−1];
 the editor reads the exact presented frame via
 `requestVideoFrameCallback` (`metadata.mediaTime`).
 
+### 5.4 Text overlays
+
+Text boxes the user types (team names, date, player name tags, anything),
+shown in the editor preview and burned into the export. The browser draws
+every overlay, for both preview and export, with one function, so the
+export looks exactly like the preview (same font, wrapping, box).
+
+```ts
+interface Overlay {
+  id: string;
+  kind: "title" | "player" | "text";   // only affects the defaults when added
+  text: string;                          // may contain line breaks, ≤ 200 chars
+  position: "top-left" | "top-center" | "top-right" | "center"
+          | "bottom-left" | "bottom-center" | "bottom-right";
+  size: "small" | "medium" | "large";
+  start: number; end: number;            // synced frames, end exclusive
+}
+// Edits.overlays: Overlay[] (default []), normalizeEdits keeps valid ones.
+```
+
+- `drawOverlay(ctx, overlay, width, height)` (`web/src/engine/overlay.ts`):
+  white bold text (system UI font stack) on a rounded, semi-transparent dark
+  box, sizes relative to the frame height (small/medium/large ≈ 3.5/5/7 % of
+  height per line), margin ≈ 3 % of height from the edges. Same call for the
+  preview (an overlay canvas over the camera view, scaled to its size) and
+  the export (an offscreen canvas at the export size → PNG).
+- Defaults when added at the playhead:
+  - **Match title**: "Home team vs Away team" + new line + today's date
+    (e.g. "Sat 25 Oct 2026"), top-center, medium, the whole video.
+  - **Player name**: "#10 Player name", bottom-left, medium, 5 s from the
+    playhead.
+  - **Text**: "Your text", bottom-center, medium, 5 s from the playhead.
+- Editor: a **Text** section in the side panel with the three "Add" buttons
+  and a list of overlays. Selecting one lets the user edit the text (live
+  preview), position (a 3×3-style picker or select), size, "Show from here" /
+  "Hide from here" (set start/end to the playhead) and delete. Overlays
+  appear as bars on the timeline; clicking a bar selects it and jumps there.
+  Undo/redo and autosave cover overlays like other edits.
+- Export: the editor maps each overlay's [start, end) through the kept
+  segments to output-time ranges in seconds (an overlay crossing a cut
+  becomes several ranges; one entirely inside a cut is dropped), renders
+  each overlay once as a PNG at the export size, and adds to the export
+  body: `overlays: [{ pngBase64, ranges: [[startSec, endSec], …] }]`
+  (≤ 50 overlays, each PNG ≤ 4 MB, dimensions must equal the export size).
+- Helper: if `overlays` is non-empty, after joining the parts it runs one
+  more ffmpeg pass that overlays the PNGs with
+  `overlay=0:0:enable='between(t,a,b)+between(t,c,d)'` chains, re-encodes
+  video with the same encoder choice and quality as the export (h264_amf
+  when available, else libx264), copies audio, `+faststart`. A new job step
+  "Adding text" with progress. With no overlays nothing changes.
+
 ## 6. Hosting, packaging, CI
 
 - `veoclone-ci.yml` (push/PR): web typecheck + unit tests + build; helper

@@ -1,0 +1,68 @@
+[package]
+publish = false
+name = "reco-cli"
+version = "0.5.4"
+edition.workspace = true
+rust-version.workspace = true
+description = "CLI tool for Reco panoramic video stitching"
+license = "AGPL-3.0-only"
+repository = "https://github.com/reco-project/video-stitcher"
+
+[[bin]]
+name = "reco"
+path = "src/main.rs"
+
+# Cross-export VRAM leak repro. Uses reco-autocam to drive the lookahead pool,
+# so it only builds when the `autocam` feature is on (skipped under
+# --no-default-features).
+[[example]]
+name = "vram_leak_repro"
+required-features = ["autocam"]
+
+[features]
+# Default gives autocam + ort (CPU) detection, matching
+# pre-refactor behavior. Jetson / custom builds opt out via
+# `--no-default-features --features autocam,tensorrt-native,...`
+# so the prebuilt ort-sys (glibc-sensitive) isn't pulled.
+default = ["autocam", "ort"]
+autocam = ["dep:reco-autocam"]
+ort = ["autocam", "reco-autocam/ort"]
+replay = ["reco-io/stacked-output"]
+cuda = ["autocam", "reco-autocam/cuda"]
+tensorrt = ["autocam", "reco-autocam/tensorrt"]
+coreml = ["autocam", "reco-autocam/coreml"]
+load-dynamic = ["autocam", "reco-autocam/load-dynamic"]
+tensorrt-native = ["autocam", "reco-autocam/tensorrt-native"]
+ncnn = ["autocam", "reco-autocam/ncnn"]
+gopro = ["reco-control/gopro"]
+gstreamer = ["reco-io/gstreamer"]
+v4l2 = ["reco-io/v4l2"]
+libcamera = ["reco-io/libcamera"]
+rpi = ["reco-io/rpi"]
+profiling = ["reco-core/profiling", "reco-io/profiling", "reco-calibrate/profiling", "reco-autocam?/profiling", "tracing-chrome"]
+
+[dependencies]
+reco-core = { path = "../reco-core" }
+reco-control = { path = "../reco-control" }
+reco-io = { path = "../reco-io", features = ["ffmpeg"] }
+# default-features = false so autocam's own default (ort) doesn't
+# force ort on Jetson / tensorrt-native builds. reco-cli's default
+# feature set above re-enables ort for standard consumers.
+reco-autocam = { path = "../reco-autocam", optional = true, default-features = false }
+reco-calibrate = { path = "../reco-calibrate", features = ["io"] }
+clap = { version = "4", features = ["derive"] }
+# M2 tracing migration (deep-review-2026-04-18): tracing-subscriber replaces
+# env_logger. tracing-log bridges existing `log::*` macro calls in
+# reco-core / reco-io / reco-calibrate to the tracing pipeline so user
+# bug-report logs have a single structured source of truth.
+log = "0.4"
+anyhow = "1"
+serde_json = "1"
+pollster = "0.4"
+winit = "0.30"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+tracing-chrome = { version = "0.7", optional = true }
+ctrlc = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

@@ -1,0 +1,41 @@
+# Rust
+target/
+
+# Video artifacts
+*.mp4
+reco-trace.json
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE & editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Cargo local config
+.cargo/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI models (large binaries)
+*.pt
+*.onnx
+*.engine
+
+# Build artifacts
+out/
+
+# Calibration artifacts
+calibrate_debug/
+calibration_adjusted.json
+# Repo-root scratch calibration (preview-driven debugging only).
+/match.json
+
+# Logs
+*.log

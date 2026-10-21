@@ -1,0 +1,29 @@
+[package]
+publish = false
+name = "reco-control"
+version = "0.5.4"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transport-agnostic control vocabulary for Reco (keyboard, gamepad, GoPro USB, mobile app, WebSocket)"
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+#
+# The crate ships with one trivial transport (`keyboard`) enabled by
+# default. Other transports are feature-gated so headless / embedded
+[features]
+default = ["keyboard"]
+keyboard = []
+gopro = ["dep:reqwest", "dep:tokio"]
+
+[dependencies]
+reco-core = { path = "../reco-core" }
+log = "0.4"
+thiserror = "2"
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "blocking"], default-features = false, optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"], optional = true }

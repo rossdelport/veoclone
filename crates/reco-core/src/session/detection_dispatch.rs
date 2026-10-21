@@ -1,0 +1,323 @@
+//! Detection entry points for [`StitchSession`].
+//!
+//! Each `detect_and_update_director_*` variant delegates to the shared
+//! [`detect_and_update_director_with`](StitchSession::detect_and_update_director_with)
+//! skeleton, passing a closure that calls the right detection backend.
+//! The skeleton handles interval gating, coordinate mapping, and the
+//! tracker/panner chain.
+
+use super::StitchSession;
+use crate::detect::detector::Detection;
+use crate::detect::director::MappedDetection;
+use crate::projection;
+use crate::session::detection::DetectionPipeline;
+use crate::session::types::SessionError;
+use crate::source::StereoFrame;
+
+impl StitchSession {
+    /// Shared detection skeleton: gate by interval, run the backend,
+    /// map to panorama, drive trackers/panners.
+    ///
+    /// Every `detect_and_update_director_*` variant is a one-liner
+    /// wrapper that passes a closure here. Adding a new detection
+    /// backend means writing one closure, not copying 15 lines.
+    fn detect_and_update_director_with(
+        &mut self,
+        elapsed: std::time::Duration,
+        detect_fn: impl FnOnce(&mut DetectionPipeline) -> Vec<Detection>,
+    ) -> Result<(), SessionError> {
+        let should_detect = self.detection.should_detect(self.frame_count);
+        if should_detect {
+            let detections = detect_fn(&mut self.detection);
+            self.detection.last_detections = self.map_detections(detections);
+        }
+        self.fire_sink_and_update_director(elapsed, should_detect)
+    }
+
+    /// Run detection + trackers only (no panner). For the lookahead
+    /// produce phase where we want the WorldState but don't want to
+    /// advance the panner.
+    pub(crate) fn detect_and_track_only(
+        &mut self,
+        frame: &StereoFrame,
+        elapsed: std::time::Duration,
+        produce_index: u64,
+    ) -> Result<crate::detect::tracker::WorldState, SessionError> {
+        let should_detect = self.detection.should_detect(produce_index);
+        if should_detect {
+            let detections = match frame {
+                #[cfg(target_os = "linux")]
+                StereoFrame::GpuResident {
+                    left_slot,
+                    right_slot,
+                } => {
+                    if self.detection.needs_cuda_frames() {
+                        if let Some((ref left_buf, ref right_buf)) = self.gpu_buf_info {
+                            self.detection.run_gpu_detection(
+                                left_buf,
+                                right_buf,
+                                *left_slot,
+                                *right_slot,
+                                self.left_rotation,
+                                self.right_rotation,
+                            )
+                        } else {
+                            vec![]
+                        }
+                    } else if let Some(ref views) = self.gpu_shared_views {
+                        let ls = *left_slot as usize;
+                        let rs = *right_slot as usize;
+                        let (w, h) = self.core.pipeline().source_info();
+                        self.detection.run_detection_wgpu_nv12(
+                            &views[ls * 2],
+                            &views[ls * 2 + 1],
+                            &views[4 + rs * 2],
+                            &views[4 + rs * 2 + 1],
+                            w,
+                            h,
+                            self.left_rotation,
+                            self.right_rotation,
+                        )
+                    } else {
+                        vec![]
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                StereoFrame::D3d11Resident { .. } => {
+                    if let Some(ref pool) = self.d3d11_staging_pool {
+                        let left_slot = (produce_index as usize * 2) % pool.n_slots();
+                        let right_slot = (produce_index as usize * 2 + 1) % pool.n_slots();
+                        let (w, h) = self.core.pipeline().source_info();
+                        self.detection.run_detection_wgpu_nv12(
+                            pool.y_view(left_slot),
+                            pool.uv_view(left_slot),
+                            pool.y_view(right_slot),
+                            pool.uv_view(right_slot),
+                            w,
+                            h,
+                            self.left_rotation,
+                            self.right_rotation,
+                        )
+                    } else {
+                        vec![]
+                    }
+                }
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                StereoFrame::MetalResident { left, right } => self.detection.run_detection_metal(
+                    left.as_ptr(),
+                    right.as_ptr(),
+                    left.width(),
+                    left.height(),
+                ),
+                _ => {
+                    let (w, h) = self.core.pipeline().source_info();
+                    self.detection.run_detection(frame, w, h)
+                }
+            };
+            self.detection.last_detections = self.map_detections(detections);
+        }
+
+        let calibration = self.core.pipeline().calibration();
+        let timestamp_ms = elapsed.as_secs_f64() * 1000.0;
+
+        let world = crate::detect::panner::dispatch_detect_only(
+            self.player_tracker.as_mut(),
+            self.ball_tracker.as_mut(),
+            crate::detect::panner::DispatchContext {
+                detections: &self.detection.last_detections,
+                calibration,
+                frame_index: produce_index,
+                timestamp_ms,
+                caller: "lookahead_produce",
+            },
+        );
+
+        Ok(world)
+    }
+
+    /// Run detection on a CPU-resident stereo frame (YUV420P / NV12).
+    pub fn detect_and_update_director(
+        &mut self,
+        frame: &StereoFrame,
+        elapsed: std::time::Duration,
+    ) -> Result<(), SessionError> {
+        let (w, h) = self.core.pipeline().source_info();
+        self.detect_and_update_director_with(elapsed, |det| det.run_detection(frame, w, h))
+    }
+
+    /// Whether detection should run on the current frame.
+    pub fn detection_should_run(&self) -> bool {
+        self.detection.has_detector() && self.detection.should_detect(self.frame_count)
+    }
+
+    /// Run detection on CPU-resident RGBA frames.
+    pub fn detect_and_update_director_rgba(
+        &mut self,
+        left_rgba: &[u8],
+        right_rgba: &[u8],
+        width: u32,
+        height: u32,
+        elapsed: std::time::Duration,
+    ) -> Result<(), SessionError> {
+        self.detect_and_update_director_with(elapsed, |det| {
+            det.run_detection_rgba(left_rgba, right_rgba, width, height)
+        })
+    }
+
+    /// Run detection on CUDA-resident RGBA frames (Bayer zero-copy).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn detect_and_update_director_cuda_rgba(
+        &mut self,
+        left_ptr: crate::interop::cuda::CUdeviceptr,
+        left_pitch: usize,
+        right_ptr: crate::interop::cuda::CUdeviceptr,
+        right_pitch: usize,
+        width: u32,
+        height: u32,
+        elapsed: std::time::Duration,
+    ) -> Result<(), SessionError> {
+        self.detect_and_update_director_with(elapsed, |det| {
+            det.run_detection_cuda_rgba(left_ptr, left_pitch, right_ptr, right_pitch, width, height)
+        })
+    }
+
+    /// Detect on pre-letterboxed CUDA RGBA (NvBufSurfTransform output).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn detect_and_update_director_preletterboxed(
+        &mut self,
+        left_ptr: crate::interop::cuda::CUdeviceptr,
+        right_ptr: crate::interop::cuda::CUdeviceptr,
+        src_width: u32,
+        src_height: u32,
+        elapsed: std::time::Duration,
+    ) -> Result<(), SessionError> {
+        self.detect_and_update_director_with(elapsed, |det| {
+            det.run_detection_preletterboxed(
+                left_ptr, src_width, src_height, right_ptr, src_width, src_height,
+            )
+        })
+    }
+
+    /// Update the director without detection.
+    ///
+    /// Advances the panner/tracker state without running object
+    /// detection. Used when the frame residency has no detection
+    /// backend (e.g. D3D11VA without CUDA).
+    pub fn update_director(&mut self, elapsed: std::time::Duration) -> Result<(), SessionError> {
+        self.fire_sink_and_update_director(elapsed, false)
+    }
+
+    /// Run GPU-resident detection from CUDA NV12 shared textures.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub(crate) fn detect_and_update_director_gpu(
+        &mut self,
+        left_buf: &crate::interop::zero_copy::GpuBufInfo,
+        right_buf: &crate::interop::zero_copy::GpuBufInfo,
+        left_slot: u8,
+        right_slot: u8,
+        elapsed: std::time::Duration,
+    ) -> Result<(), SessionError> {
+        let lr = self.left_rotation;
+        let rr = self.right_rotation;
+        self.detect_and_update_director_with(elapsed, |det| {
+            det.run_gpu_detection(left_buf, right_buf, left_slot, right_slot, lr, rr)
+        })
+    }
+
+    /// Run Metal-resident detection from CVPixelBuffers.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn detect_and_update_director_metal(
+        &mut self,
+        left_cvpb: crate::interop::metal::CVPixelBufferRef,
+        right_cvpb: crate::interop::metal::CVPixelBufferRef,
+        width: u32,
+        height: u32,
+        elapsed: std::time::Duration,
+    ) -> Result<(), SessionError> {
+        self.detect_and_update_director_with(elapsed, |det| {
+            det.run_detection_metal(left_cvpb, right_cvpb, width, height)
+        })
+    }
+
+    /// Drive the tracker/panner chain after detection.
+    ///
+    /// Shared tail for all detection paths (CPU, GPU, Metal, no-detection).
+    /// Emits DetectionsRaw events, drives every registered tracker to
+    /// build a [`WorldState`](crate::detect::tracker::WorldState), then
+    /// lets the panner decide the next pose. Viewport constraining is
+    /// handled separately by [`director_position`](Self::director_position).
+    pub(crate) fn fire_sink_and_update_director(
+        &mut self,
+        elapsed: std::time::Duration,
+        fresh_detection: bool,
+    ) -> Result<(), SessionError> {
+        let timestamp_ms = elapsed.as_secs_f64() * 1000.0;
+
+        // Trace: DetectionsRaw. Only clones when an event sink is attached.
+        if let Some(sink) = self.event_sink.as_deref_mut() {
+            sink.emit(
+                crate::detect::pipeline_event::PipelineEvent::DetectionsRaw {
+                    frame_index: self.frame_count,
+                    detections: self.detection.last_detections.clone(),
+                },
+            );
+        }
+
+        let _ = fresh_detection;
+        let calibration = self.core.pipeline().calibration();
+        let dispatch_result = crate::detect::panner::dispatch(
+            self.panner.as_mut(),
+            self.player_tracker.as_mut(),
+            self.ball_tracker.as_mut(),
+            &mut self.previous_panner_pose,
+            self.event_sink.as_deref_mut(),
+            &self.lookahead_world_states,
+            crate::detect::panner::DispatchContext {
+                detections: &self.detection.last_detections,
+                calibration,
+                frame_index: self.frame_count,
+                timestamp_ms,
+                caller: "StitchSession",
+            },
+        );
+
+        if let Some(ref result) = dispatch_result {
+            self.last_world_state = result.world_state.clone();
+        }
+
+        self.telemetry.record_detections(
+            self.detection.last_detections.len() as u32,
+            dispatch_result.as_ref().map_or(0, |r| r.active_tracks),
+            dispatch_result.as_ref().is_some_and(|r| r.ball_present),
+        );
+
+        Ok(())
+    }
+
+    /// Map raw detections to panorama coordinates.
+    pub(crate) fn map_detections(&self, detections: Vec<Detection>) -> Vec<MappedDetection> {
+        let calibration = self.core.pipeline().calibration();
+        let scene = &self.core.pipeline().scene;
+
+        detections
+            .iter()
+            .map(|d| {
+                let position = projection::camera_to_panorama(
+                    d.camera,
+                    d.center_x,
+                    d.center_y,
+                    calibration,
+                    scene,
+                );
+                MappedDetection {
+                    camera: d.camera,
+                    class_id: d.class_id,
+                    confidence: d.confidence,
+                    camera_center: (d.center_x, d.center_y),
+                    camera_size: (d.width, d.height),
+                    position,
+                }
+            })
+            .collect()
+    }
+}

@@ -1,0 +1,831 @@
+//! GPU-aware stereo file source with automatic backend selection.
+//!
+//! [`SmartFileSource`] is the standard way to open video files for stitching.
+//! It probes the input, detects the best decode path (GPU zero-copy or CPU),
+//! and delivers frames through the [`FrameSource`] trait.
+//!
+//! On capable hardware (NVIDIA + Vulkan, Apple VideoToolbox + Metal), frames
+//! are GPU-resident - no CPU-GPU transfer needed. On other hardware, frames
+//! are decoded to CPU transparently.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use reco_io::SmartFileSource;
+//!
+//! let gpu = reco_core::gpu::GpuContext::new_blocking()?;
+//! let mut source = SmartFileSource::open("left.mp4", "right.mp4", &gpu, 0)?;
+//! // source implements FrameSource - pass to session.run()
+//! ```
+
+use reco_core::render::renderer::GpuPixelFormat;
+use reco_core::source::{FrameSource, SourceError, SourceInfo, StereoFrame};
+
+/// GPU-aware stereo file source that auto-selects the optimal decode path.
+///
+/// Probes the input files at construction and selects the best available
+/// backend: CUDA/Vulkan zero-copy on Linux, D3D11VA/DX12 on Windows, VideoToolbox/Metal
+/// on macOS, or CPU software decode as a fallback. The selection is
+/// transparent to the consumer.
+///
+/// For GPU zero-copy paths, this source owns the shared textures and
+/// decode threads. The session creates bind groups from the source's
+/// textures at the start of `run()`.
+pub struct SmartFileSource {
+    mode: SourceMode,
+    info: SourceInfo,
+    pixel_format: GpuPixelFormat,
+    full_range: bool,
+    left_rotation: i32,
+    right_rotation: i32,
+    /// Human-readable description of the active decode path.
+    decode_mode: &'static str,
+    /// True once the active backend has signaled end-of-stream.
+    ///
+    /// For the CPU mode this tracks the inner `FfmpegFileSource`'s flag;
+    /// for zero-copy modes this is set locally when the pair receiver
+    /// returns `Err` (decode threads finished).
+    exhausted: bool,
+}
+
+enum SourceMode {
+    Cpu(crate::adapters::FfmpegFileSource),
+    #[cfg(target_os = "linux")]
+    GpuZeroCopy(Box<LinuxZeroCopyState>),
+    #[cfg(target_os = "macos")]
+    MetalZeroCopy(std::sync::mpsc::Receiver<reco_core::interop::zero_copy::VtFramePair>),
+    #[cfg(target_os = "windows")]
+    D3d11ZeroCopy(Box<WindowsZeroCopyState>),
+}
+
+#[cfg(target_os = "windows")]
+enum WindowsDecodeState {
+    Pending {
+        left: crate::stitch_job::InputPath,
+        right: crate::stitch_job::InputPath,
+        sync_offset: i64,
+    },
+    Running {
+        pair_rx: std::sync::mpsc::Receiver<(
+            crate::ffmpeg::decoder::D3d11Frame,
+            crate::ffmpeg::decoder::D3d11Frame,
+        )>,
+        join_handles: Vec<std::thread::JoinHandle<()>>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsZeroCopyState {
+    decode: WindowsDecodeState,
+    /// Holds the D3d11Frame pair from the most recent `next_frame()` call.
+    ///
+    /// The `_frame_ref` inside each D3d11Frame pins the decode pool slice
+    /// in FFmpeg's surface allocator. Without this, the slice is recycled
+    /// as soon as the raw pointers are extracted into `StereoFrame::D3d11Resident`,
+    /// and the decoder thread can overwrite the surface before `stage_frame`
+    /// copies it - causing frame reordering glitches on Intel and NVIDIA.
+    ///
+    /// Dropped when the next pair arrives (or the source is dropped),
+    /// which is always after `stage_frame` has completed for this pair.
+    live_frame_guard: Option<(
+        crate::ffmpeg::decoder::D3d11Frame,
+        crate::ffmpeg::decoder::D3d11Frame,
+    )>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsZeroCopyState {
+    fn ensure_running(&mut self) {
+        if let WindowsDecodeState::Pending {
+            left,
+            right,
+            sync_offset,
+        } = &self.decode
+        {
+            let left = left.clone();
+            let right = right.clone();
+            let sync_offset = *sync_offset;
+            let pair_rx = crate::zero_copy::spawn_d3d11_decode_pair(&left, &right, sync_offset);
+            self.decode = WindowsDecodeState::Running {
+                pair_rx,
+                join_handles: Vec::new(),
+                shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxZeroCopyState {
+    /// Paired frame signal receiver. Made `Option` so Drop can take it
+    /// early to unblock the pairing thread before joining decode threads.
+    frame_rx: Option<std::sync::mpsc::Receiver<reco_core::interop::zero_copy::GpuFrameSignal>>,
+    /// Shared textures (kept alive until Drop).
+    shared: reco_core::session::SharedTextureSet,
+    /// Decode thread join handles.
+    join_handles: Vec<std::thread::JoinHandle<()>>,
+    /// Shutdown flag checked by decode threads for graceful exit.
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SmartFileSource {
+    /// Open a stereo file source with automatic backend selection.
+    ///
+    /// Probes the left video for metadata (resolution, codec, rotation,
+    /// pixel format) and the right video for rotation. Detects whether
+    /// GPU zero-copy is available based on the decode backend and GPU
+    /// capabilities.
+    ///
+    /// `sync_offset` applies temporal alignment between cameras:
+    /// positive skips right frames, negative skips left frames.
+    pub fn open(
+        left: &crate::stitch_job::InputPath,
+        right: &crate::stitch_job::InputPath,
+        gpu: &reco_core::gpu::GpuContext,
+        sync_offset: i64,
+    ) -> Result<Self, SourceError> {
+        let left_probe_path = left.first_path();
+        let right_probe_path = right.first_path();
+
+        let probe = crate::ffmpeg::decoder::VideoDecoder::open(left_probe_path).map_err(|e| {
+            SourceError::Init {
+                path: left_probe_path.display().to_string(),
+                reason: format!("{e}"),
+            }
+        })?;
+
+        let fps_r = probe.frame_rate();
+        let info = SourceInfo {
+            width: probe.width(),
+            height: probe.height(),
+            fps: probe.fps(),
+            fps_rational: Some((fps_r.0, fps_r.1)),
+            total_frames: None,
+        };
+        let pixel_format = probe.pixel_format();
+        let full_range = probe.is_full_range();
+        let left_rotation = probe.rotation();
+        let decode_backend = probe.backend();
+        drop(probe);
+
+        let right_rotation = crate::ffmpeg::decoder::VideoDecoder::open(right_probe_path)
+            .map(|d| d.rotation())
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to probe right video for rotation ({e}), assuming 0 degrees");
+                0
+            });
+
+        // Detect zero-copy capability
+        let hwaccel_disabled = std::env::var("RECO_NO_HWACCEL").is_ok();
+        if hwaccel_disabled {
+            log::info!("RECO_NO_HWACCEL set, forcing CPU decode path");
+        }
+        let backend_capable = is_backend_zero_copy_capable(decode_backend);
+        let gpu_capable = gpu.supports_zero_copy();
+        let use_zero_copy = !hwaccel_disabled && backend_capable && gpu_capable;
+
+        if !use_zero_copy && !hwaccel_disabled {
+            log::info!(
+                "Zero-copy disabled: decode_backend={decode_backend} (capable={backend_capable}), \
+                 gpu_zero_copy={gpu_capable}. Using CPU upload path."
+            );
+        }
+
+        if use_zero_copy {
+            Self::open_zero_copy(
+                left,
+                right,
+                gpu,
+                sync_offset,
+                info,
+                pixel_format,
+                full_range,
+                left_rotation,
+                right_rotation,
+            )
+        } else {
+            Self::open_cpu(
+                left,
+                right,
+                sync_offset,
+                info,
+                pixel_format,
+                full_range,
+                left_rotation,
+                right_rotation,
+            )
+        }
+    }
+
+    pub fn open_cpu_only(
+        left: &crate::stitch_job::InputPath,
+        right: &crate::stitch_job::InputPath,
+        sync_offset: i64,
+    ) -> Result<Self, SourceError> {
+        let left_probe_path = left.first_path();
+
+        let probe = crate::ffmpeg::decoder::VideoDecoder::open(left_probe_path).map_err(|e| {
+            SourceError::Init {
+                path: left_probe_path.display().to_string(),
+                reason: format!("{e}"),
+            }
+        })?;
+        let fps_r = probe.frame_rate();
+        let info = SourceInfo {
+            width: probe.width(),
+            height: probe.height(),
+            fps: probe.fps(),
+            fps_rational: Some((fps_r.0, fps_r.1)),
+            total_frames: None,
+        };
+        let pixel_format = probe.pixel_format();
+        let full_range = probe.is_full_range();
+        let left_rotation = probe.rotation();
+        drop(probe);
+
+        let right_rotation = crate::ffmpeg::decoder::VideoDecoder::open(right.first_path())
+            .map(|d| d.rotation())
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to probe right video for rotation ({e}), assuming 0 degrees");
+                0
+            });
+
+        Self::open_cpu(
+            left,
+            right,
+            sync_offset,
+            info,
+            pixel_format,
+            full_range,
+            left_rotation,
+            right_rotation,
+        )
+    }
+
+    fn open_cpu(
+        left: &crate::stitch_job::InputPath,
+        right: &crate::stitch_job::InputPath,
+        sync_offset: i64,
+        info: SourceInfo,
+        pixel_format: GpuPixelFormat,
+        full_range: bool,
+        left_rotation: i32,
+        right_rotation: i32,
+    ) -> Result<Self, SourceError> {
+        let source = crate::adapters::FfmpegFileSource::open_from_inputs(left, right, sync_offset)?;
+        log::info!(
+            "SmartFileSource: CPU decode ({}x{}, {pixel_format:?}{})",
+            info.width,
+            info.height,
+            if full_range { ", full-range" } else { "" }
+        );
+        Ok(Self {
+            mode: SourceMode::Cpu(source),
+            info,
+            pixel_format,
+            full_range,
+            left_rotation,
+            right_rotation,
+            decode_mode: "CPU upload",
+            exhausted: false,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn open_zero_copy(
+        left: &crate::stitch_job::InputPath,
+        right: &crate::stitch_job::InputPath,
+        gpu: &reco_core::gpu::GpuContext,
+        sync_offset: i64,
+        info: SourceInfo,
+        pixel_format: GpuPixelFormat,
+        full_range: bool,
+        left_rotation: i32,
+        right_rotation: i32,
+    ) -> Result<Self, SourceError> {
+        use reco_core::interop::vulkan::{Nv12Plane, create_nv12_shared_texture};
+        use reco_core::interop::zero_copy::GpuBufInfo;
+        use reco_core::session::SharedTextureSet;
+
+        let map_err = |msg: String| SourceError::Init {
+            path: left.first_path().display().to_string(),
+            reason: msg,
+        };
+
+        let input_width = info.width;
+        let input_height = info.height;
+
+        // NVIDIA driver workaround for R16Unorm: see issue #134
+        let _warmup = if pixel_format == GpuPixelFormat::P010 {
+            let y = create_nv12_shared_texture(gpu, 16, 16, Nv12Plane::Y, pixel_format)
+                .map_err(|e| map_err(format!("warmup Y: {e}")))?;
+            let uv = create_nv12_shared_texture(gpu, 16, 16, Nv12Plane::Uv, pixel_format)
+                .map_err(|e| map_err(format!("warmup UV: {e}")))?;
+            Some((y, uv))
+        } else {
+            None
+        };
+
+        // Create double-buffered shared textures
+        let create_pair = |label: &str| -> Result<_, SourceError> {
+            let y = create_nv12_shared_texture(
+                gpu,
+                input_width,
+                input_height,
+                Nv12Plane::Y,
+                pixel_format,
+            )
+            .map_err(|e| map_err(format!("{label} Y: {e}")))?;
+            let uv = create_nv12_shared_texture(
+                gpu,
+                input_width,
+                input_height,
+                Nv12Plane::Uv,
+                pixel_format,
+            )
+            .map_err(|e| map_err(format!("{label} UV: {e}")))?;
+            Ok((y, uv))
+        };
+
+        let (left_y_0, left_uv_0) = create_pair("left[0]")?;
+        let (left_y_1, left_uv_1) = create_pair("left[1]")?;
+        let (right_y_0, right_uv_0) = create_pair("right[0]")?;
+        let (right_y_1, right_uv_1) = create_pair("right[1]")?;
+
+        log::info!(
+            "SmartFileSource: GPU zero-copy ({input_width}x{input_height}, {pixel_format:?}), Y pitch={}/{}",
+            left_y_0.pitch,
+            left_y_1.pitch
+        );
+
+        let left_buf = GpuBufInfo {
+            y_ptr: [left_y_0.cuda_ptr, left_y_1.cuda_ptr],
+            uv_ptr: [left_uv_0.cuda_ptr, left_uv_1.cuda_ptr],
+            y_pitch: [left_y_0.pitch, left_y_1.pitch],
+            uv_pitch: [left_uv_0.pitch, left_uv_1.pitch],
+            width: input_width,
+            height: input_height,
+            pixel_format,
+        };
+        let right_buf = GpuBufInfo {
+            y_ptr: [right_y_0.cuda_ptr, right_y_1.cuda_ptr],
+            uv_ptr: [right_uv_0.cuda_ptr, right_uv_1.cuda_ptr],
+            y_pitch: [right_y_0.pitch, right_y_1.pitch],
+            uv_pitch: [right_uv_0.pitch, right_uv_1.pitch],
+            width: input_width,
+            height: input_height,
+            pixel_format,
+        };
+
+        // Slot-free channels for backpressure
+        let (left_slot_free_tx, left_slot_free_rx) = std::sync::mpsc::sync_channel::<u8>(2);
+        let (right_slot_free_tx, right_slot_free_rx) = std::sync::mpsc::sync_channel::<u8>(2);
+        left_slot_free_tx.send(0).expect("seed slot");
+        left_slot_free_tx.send(1).expect("seed slot");
+        right_slot_free_tx.send(0).expect("seed slot");
+        right_slot_free_tx.send(1).expect("seed slot");
+
+        // Shutdown flag for graceful decode thread exit
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Spawn decode threads
+        let decode_handles = crate::zero_copy::spawn_decode_threads_gpu(
+            left.clone(),
+            right.clone(),
+            left_buf.clone(),
+            right_buf.clone(),
+            left_slot_free_rx,
+            right_slot_free_rx,
+            sync_offset,
+            shutdown.clone(),
+        );
+
+        // Build bind groups placeholder - session will create them from texture refs
+        // For now, we need a dummy bind group. Actually, the bind groups need the
+        // pipeline which we don't have. The session will create them via
+        // configure_gpu_source() when run() starts.
+        //
+        // Store textures in SharedTextureSet without bind groups.
+        // We'll need to split SharedTextureSet or use a different approach.
+        // For now, let's store the textures and bufs directly.
+
+        let shared = SharedTextureSet {
+            textures: [
+                left_y_0, left_uv_0, left_y_1, left_uv_1, right_y_0, right_uv_0, right_y_1,
+                right_uv_1,
+            ],
+            left_buf,
+            right_buf,
+            left_slot_free_tx,
+            right_slot_free_tx,
+            left_slot_free_rx: None,
+            right_slot_free_rx: None,
+            // Bind groups are created lazily by setup_gpu_source()
+            // when it sees None. The source doesn't have pipeline access.
+            bind_groups: None,
+        };
+
+        Ok(Self {
+            mode: SourceMode::GpuZeroCopy(Box::new(LinuxZeroCopyState {
+                frame_rx: Some(decode_handles.frame_rx),
+                shared,
+                join_handles: decode_handles.join_handles,
+                shutdown,
+            })),
+            info,
+            pixel_format,
+            full_range,
+            left_rotation,
+            right_rotation,
+            decode_mode: "GPU zero-copy (CUDA/Vulkan)",
+            exhausted: false,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn open_zero_copy(
+        left: &crate::stitch_job::InputPath,
+        right: &crate::stitch_job::InputPath,
+        _gpu: &reco_core::gpu::GpuContext,
+        sync_offset: i64,
+        info: SourceInfo,
+        pixel_format: GpuPixelFormat,
+        full_range: bool,
+        left_rotation: i32,
+        right_rotation: i32,
+    ) -> Result<Self, SourceError> {
+        let pair_rx = crate::zero_copy::spawn_vt_decode_pair(left, right, sync_offset);
+
+        log::info!(
+            "SmartFileSource: Metal zero-copy ({}x{}, VideoToolbox decode{})",
+            info.width,
+            info.height,
+            if full_range { ", full-range" } else { "" }
+        );
+
+        Ok(Self {
+            mode: SourceMode::MetalZeroCopy(pair_rx),
+            info,
+            pixel_format,
+            full_range,
+            left_rotation,
+            right_rotation,
+            decode_mode: "Metal zero-copy (VideoToolbox)",
+            exhausted: false,
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
+    fn open_zero_copy(
+        left: &crate::stitch_job::InputPath,
+        right: &crate::stitch_job::InputPath,
+        _gpu: &reco_core::gpu::GpuContext,
+        sync_offset: i64,
+        info: SourceInfo,
+        pixel_format: GpuPixelFormat,
+        full_range: bool,
+        left_rotation: i32,
+        right_rotation: i32,
+    ) -> Result<Self, SourceError> {
+        log::info!("SmartFileSource: D3D11VA zero-copy decode enabled");
+
+        Ok(Self {
+            mode: SourceMode::D3d11ZeroCopy(Box::new(WindowsZeroCopyState {
+                decode: WindowsDecodeState::Pending {
+                    left: left.clone(),
+                    right: right.clone(),
+                    sync_offset,
+                },
+                live_frame_guard: None,
+            })),
+            info,
+            pixel_format,
+            full_range,
+            left_rotation,
+            right_rotation,
+            decode_mode: "D3D11VA zero-copy",
+            exhausted: false,
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[allow(clippy::too_many_arguments)]
+    fn open_zero_copy(
+        left: &crate::stitch_job::InputPath,
+        right: &crate::stitch_job::InputPath,
+        _gpu: &reco_core::gpu::GpuContext,
+        sync_offset: i64,
+        info: SourceInfo,
+        pixel_format: GpuPixelFormat,
+        full_range: bool,
+        left_rotation: i32,
+        right_rotation: i32,
+    ) -> Result<Self, SourceError> {
+        log::info!("SmartFileSource: zero-copy not yet implemented for this platform, using CPU");
+        Self::open_cpu(
+            left,
+            right,
+            sync_offset,
+            info,
+            pixel_format,
+            full_range,
+            left_rotation,
+            right_rotation,
+        )
+    }
+
+    /// Human-readable description of the active decode path.
+    pub fn decode_mode(&self) -> &'static str {
+        self.decode_mode
+    }
+
+    /// Access the shared texture set (GPU zero-copy only).
+    ///
+    /// The session uses this to create bind groups at the start of `run()`.
+    /// Returns `None` for CPU-mode sources.
+    #[cfg(target_os = "linux")]
+    pub fn shared_texture_set(&self) -> Option<&reco_core::session::SharedTextureSet> {
+        match &self.mode {
+            SourceMode::GpuZeroCopy(state) => Some(&state.shared),
+            _ => None,
+        }
+    }
+
+    /// Take the slot-free senders for backpressure (GPU zero-copy only).
+    ///
+    /// The session needs these to release slots back to the decode threads
+    /// after rendering each frame. Returns `None` for CPU-mode sources.
+    ///
+    /// **Important:** The returned senders are clones. The caller MUST drop
+    /// them before this source is dropped, otherwise the `Drop` impl cannot
+    /// fully signal decode threads to shut down (the cloned senders keep the
+    /// channel alive). In practice, the session drops senders when `run()`
+    /// returns, which happens before the source is dropped.
+    #[cfg(target_os = "linux")]
+    pub fn take_slot_senders(
+        &mut self,
+    ) -> Option<(
+        std::sync::mpsc::SyncSender<u8>,
+        std::sync::mpsc::SyncSender<u8>,
+    )> {
+        match &mut self.mode {
+            SourceMode::GpuZeroCopy(state) => {
+                // Clone senders (they're clonable) for the session
+                Some((
+                    state.shared.left_slot_free_tx.clone(),
+                    state.shared.right_slot_free_tx.clone(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Access the CUDA buffer info for GPU detection (GPU zero-copy only).
+    #[cfg(target_os = "linux")]
+    pub fn gpu_buf_info(
+        &self,
+    ) -> Option<(
+        &reco_core::interop::zero_copy::GpuBufInfo,
+        &reco_core::interop::zero_copy::GpuBufInfo,
+    )> {
+        match &self.mode {
+            SourceMode::GpuZeroCopy(state) => {
+                Some((&state.shared.left_buf, &state.shared.right_buf))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl FrameSource for SmartFileSource {
+    fn info(&self) -> SourceInfo {
+        self.info.clone()
+    }
+
+    fn next_frame(&mut self) -> Result<Option<StereoFrame>, SourceError> {
+        match &mut self.mode {
+            SourceMode::Cpu(source) => {
+                let frame = source.next_frame()?;
+                if frame.is_none() {
+                    self.exhausted = true;
+                }
+                Ok(frame)
+            }
+            #[cfg(target_os = "linux")]
+            SourceMode::GpuZeroCopy(state) => {
+                let rx = state
+                    .frame_rx
+                    .as_ref()
+                    .expect("frame_rx taken during shutdown");
+                match rx.recv() {
+                    Ok(signal) => Ok(Some(StereoFrame::GpuResident {
+                        left_slot: signal.left_slot,
+                        right_slot: signal.right_slot,
+                    })),
+                    Err(_) => {
+                        self.exhausted = true;
+                        Ok(None)
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            SourceMode::MetalZeroCopy(rx) => match rx.recv() {
+                Ok(pair) => Ok(Some(StereoFrame::MetalResident {
+                    left: pair.left,
+                    right: pair.right,
+                })),
+                Err(_) => {
+                    self.exhausted = true;
+                    Ok(None)
+                }
+            },
+            #[cfg(target_os = "windows")]
+            SourceMode::D3d11ZeroCopy(state) => {
+                state.ensure_running();
+                let pair_rx = match &state.decode {
+                    WindowsDecodeState::Running { pair_rx, .. } => pair_rx,
+                    _ => unreachable!(),
+                };
+                match pair_rx.recv() {
+                    Ok((left, right)) => {
+                        let stereo = StereoFrame::D3d11Resident {
+                            left_texture: left.texture,
+                            left_slice: left.array_slice,
+                            right_texture: right.texture,
+                            right_slice: right.array_slice,
+                        };
+                        // Keep the D3d11Frame pair alive so FFmpeg doesn't
+                        // recycle the decode pool slices before stage_frame
+                        // copies them. The previous guard is dropped here,
+                        // which is safe because its staging copy already
+                        // completed in the previous loop iteration.
+                        state.live_frame_guard = Some((left, right));
+                        Ok(Some(stereo))
+                    }
+                    Err(_) => {
+                        self.exhausted = true;
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_gpu_resident(&self) -> bool {
+        !matches!(self.mode, SourceMode::Cpu(_))
+    }
+
+    fn skip_frames(&mut self, count: u64) -> Result<u64, SourceError> {
+        match &mut self.mode {
+            #[cfg(target_os = "linux")]
+            SourceMode::GpuZeroCopy(state) => {
+                let rx = state
+                    .frame_rx
+                    .as_ref()
+                    .expect("frame_rx taken during shutdown");
+                let left_tx = &state.shared.left_slot_free_tx;
+                let right_tx = &state.shared.right_slot_free_tx;
+                for i in 0..count {
+                    match rx.recv() {
+                        Ok(signal) => {
+                            let _ = left_tx.send(signal.left_slot);
+                            let _ = right_tx.send(signal.right_slot);
+                        }
+                        Err(_) => {
+                            self.exhausted = true;
+                            return Ok(i);
+                        }
+                    }
+                }
+                log::debug!("GPU zero-copy: skipped {count} frames for start_time");
+                Ok(count)
+            }
+            SourceMode::Cpu(source) => {
+                source.seek(count)?;
+                log::debug!("CPU seek: jumped to frame {count}");
+                Ok(count)
+            }
+            #[cfg(target_os = "macos")]
+            SourceMode::MetalZeroCopy(_) => {
+                for i in 0..count {
+                    if self.next_frame()?.is_none() {
+                        return Ok(i);
+                    }
+                }
+                Ok(count)
+            }
+            #[cfg(target_os = "windows")]
+            SourceMode::D3d11ZeroCopy(_) => {
+                for i in 0..count {
+                    if self.next_frame()?.is_none() {
+                        return Ok(i);
+                    }
+                }
+                Ok(count)
+            }
+        }
+    }
+
+    fn gpu_pixel_format(&self) -> GpuPixelFormat {
+        self.pixel_format
+    }
+
+    fn is_full_range(&self) -> bool {
+        self.full_range
+    }
+
+    fn left_rotation(&self) -> i32 {
+        self.left_rotation
+    }
+
+    fn right_rotation(&self) -> i32 {
+        self.right_rotation
+    }
+
+    fn is_exhausted(&self) -> bool {
+        // CPU mode defers to the inner FfmpegFileSource's own flag, which
+        // is also set by `try_next_frame` (the zero-copy modes don't
+        // implement `try_next_frame`, so their local flag is sufficient).
+        match &self.mode {
+            SourceMode::Cpu(source) => self.exhausted || source.is_exhausted(),
+            #[cfg(target_os = "linux")]
+            SourceMode::GpuZeroCopy(_) => self.exhausted,
+            #[cfg(target_os = "macos")]
+            SourceMode::MetalZeroCopy(_) => self.exhausted,
+            #[cfg(target_os = "windows")]
+            SourceMode::D3d11ZeroCopy(_) => self.exhausted,
+        }
+    }
+
+    fn start_decoding(&mut self) {
+        #[cfg(target_os = "windows")]
+        if let SourceMode::D3d11ZeroCopy(state) = &mut self.mode {
+            state.ensure_running();
+        }
+    }
+}
+
+impl Drop for SmartFileSource {
+    fn drop(&mut self) {
+        // D3D11VA / Metal: dropping the pair receiver breaks the
+        // channel, causing decode threads to exit when send() fails.
+        // Without this, orphaned decode threads keep the process alive.
+        #[cfg(target_os = "windows")]
+        if let SourceMode::D3d11ZeroCopy(state) = &mut self.mode {
+            if let WindowsDecodeState::Running { pair_rx, .. } = &mut state.decode {
+                drop(std::mem::replace(
+                    pair_rx,
+                    std::sync::mpsc::sync_channel(0).1,
+                ));
+                log::debug!("D3D11VA source dropped, decode threads signalled to exit");
+            }
+        }
+        // MetalZeroCopy: the Receiver is owned directly by the enum
+        // variant and drops naturally when the mode is replaced.
+
+        #[cfg(target_os = "linux")]
+        if let SourceMode::GpuZeroCopy(state) = &mut self.mode {
+            // Graceful shutdown ordering to prevent CUDA error 700:
+            //
+            // 1. Set shutdown flag -> decode threads exit via recv_timeout check
+            // 2. Drop frame_rx -> pairing thread's send() returns Err, exits
+            // 3. Join all threads -> VideoDecoder::Drop completes CUDA cleanup
+            //    while shared CUDA VMM memory is still mapped
+            // 4. SharedTextureSet drops naturally -> CUDA memory unmapped
+
+            // Step 1: Signal shutdown to decode threads (they check this
+            // flag via recv_timeout, so they exit even if slot senders
+            // are still alive from take_slot_senders).
+            state
+                .shutdown
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            // Step 2: Drop frame_rx to unblock pairing thread
+            state.frame_rx = None;
+
+            // Step 3: Join decode + pairing threads
+            for handle in state.join_handles.drain(..) {
+                let _ = handle.join();
+            }
+            // SharedTextureSet drops naturally after this
+        }
+    }
+}
+
+/// Check if a decode backend supports GPU zero-copy.
+fn is_backend_zero_copy_capable(backend: crate::ffmpeg::decoder::DecodeBackend) -> bool {
+    use crate::ffmpeg::decoder::DecodeBackend;
+    match backend {
+        #[cfg(target_os = "linux")]
+        DecodeBackend::Cuda => true,
+        #[cfg(target_os = "macos")]
+        DecodeBackend::VideoToolbox => true,
+        #[cfg(target_os = "windows")]
+        DecodeBackend::D3d11va => true,
+        _ => false,
+    }
+}

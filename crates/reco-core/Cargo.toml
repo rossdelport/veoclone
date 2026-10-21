@@ -1,0 +1,70 @@
+[package]
+publish = false
+name = "reco-core"
+version = "0.5.4"
+edition.workspace = true
+rust-version.workspace = true
+description = "GPU-accelerated panoramic video stitching engine"
+license = "AGPL-3.0-only"
+repository = "https://github.com/reco-project/video-stitcher"
+readme = "README.md"
+
+[features]
+profiling = ["tracing"]
+
+[dependencies]
+wgpu = { version = "28", features = ["vulkan-portability"] }
+bytemuck = { version = "1", features = ["derive"] }
+nalgebra = "0.35"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+pollster = "0.4"
+tracing = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = "0.38"
+libc = "0.2"
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+libloading = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+    "Win32_Security",
+] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+# The `metal` crate (0.33) is wgpu-hal 28's Metal backend dependency.
+# We use it directly for interop with VideoToolbox and compute shaders.
+# When wgpu moves back to objc2-metal (likely 29+), this dep goes
+# away and metal_interop.rs / metal_compute.rs revert to the
+# objc2-metal API. The old code is preserved in git history at
+# commit 62d62c8 (pre-wgpu-28 spike HEAD).
+metal = "0.33"
+foreign-types = "0.5"
+# Kept for reco-detect's CoreML path (still on objc2-core-ml 0.3).
+# When metal_compute / metal_interop drop objc2-metal, these two
+# may also become unnecessary if no other module uses them.
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = { version = "0.3", features = ["NSObject"] }
+objc2-core-ml = { version = "0.3", features = [
+    "MLModel", "MLMultiArray", "MLFeatureValue", "MLFeatureProvider",
+    "MLDictionaryFeatureProvider", "MLModelConfiguration",
+    "block2",
+] }
+block2 = "0.6"
+
+[dev-dependencies]
+approx = "0.5"
+env_logger = "0.11"
+libc = "0.2"
+tempfile = "3"

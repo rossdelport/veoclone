@@ -1,5 +1,6 @@
 //! Everything that shells out to the bundled `ffmpeg` / `ffprobe`: probing
-//! uploads, making the stacked preview proxy and joining export parts.
+//! uploads, making the stacked preview proxy, joining export parts and
+//! adding the editor's text boxes.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::store::{Fps, ProbeInfo};
+use crate::store::{Fps, ProbeInfo, Quality};
 
 /// Paths of the external tools, resolved once at startup.
 #[derive(Debug, Clone, Default)]
@@ -648,6 +649,155 @@ pub fn concat(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Text boxes (DESIGN.md 5.4)
+// ---------------------------------------------------------------------------
+
+/// Everything needed to burn the editor's text boxes into a video.
+#[derive(Debug, Clone)]
+pub struct OverlayPlan {
+    /// The joined export.
+    pub input: PathBuf,
+    /// One picture the size of the video per text box, drawn by the editor.
+    pub pngs: Vec<PathBuf>,
+    /// When each picture shows: [start, end) seconds of the video, sorted.
+    pub ranges: Vec<Vec<(f64, f64)>>,
+    pub fps: Fps,
+    pub quality: Quality,
+    pub output: PathBuf,
+}
+
+/// The `-filter_complex` that lays picture `i + 1` over the video (input 0)
+/// during `ranges[i]`; the result is labelled `v<number of pictures>`. A
+/// frame at time t should show a picture when start <= t < end, but
+/// ffmpeg's `between` includes both ends, so both move half a frame
+/// earlier. That also absorbs frame times a little off the exact grid.
+pub fn overlay_filter(ranges: &[Vec<(f64, f64)>], fps: Fps) -> String {
+    let half = 0.5 / fps.as_f64();
+    let mut last = "0:v".to_string();
+    let mut chain = Vec::new();
+    for (i, r) in ranges.iter().enumerate() {
+        let enable: Vec<String> = r
+            .iter()
+            .map(|&(a, b)| format!("between(t,{:.6},{:.6})", a - half, b - half))
+            .collect();
+        let out = format!("v{}", i + 1);
+        chain.push(format!(
+            "[{last}][{}:v]overlay=0:0:enable='{}'[{out}]",
+            i + 1,
+            enable.join("+")
+        ));
+        last = out;
+    }
+    chain.join(";")
+}
+
+/// Video encoder settings for re-encoding an export to add text. The parts
+/// were already encoded once at the user's quality (Reco's
+/// `build_encoder_opts` steps), so this second pass is one step sharper to
+/// avoid visibly softening the picture.
+fn export_encoder_args(encoder: Encoder, quality: Quality) -> Vec<&'static str> {
+    match encoder {
+        Encoder::Amf => {
+            let qp = match quality {
+                Quality::Fast => "18",
+                Quality::Balanced => "15",
+                Quality::High => "12",
+            };
+            vec![
+                "-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", qp, "-qp_p", qp,
+            ]
+        }
+        Encoder::X264 => {
+            let (preset, crf) = match quality {
+                Quality::Fast => ("veryfast", "24"),
+                Quality::Balanced => ("veryfast", "20"),
+                Quality::High => ("fast", "18"),
+            };
+            vec![
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-crf",
+                crf,
+                "-profile:v",
+                "high",
+            ]
+        }
+    }
+}
+
+/// ffmpeg arguments for burning the text boxes in. Every frame and its time
+/// is kept (`passthrough`) and the sound is copied.
+pub fn overlay_args(plan: &OverlayPlan, encoder: Encoder) -> Vec<String> {
+    let filter = overlay_filter(&plan.ranges, plan.fps);
+    let out = format!("[v{}]", plan.pngs.len());
+    let mut a: Vec<String> = Vec::new();
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
+    push(&["-hide_banner", "-nostdin", "-y", "-loglevel", "error"]);
+    push(&["-progress", "pipe:1", "-nostats"]);
+    push(&["-i", &plan.input.to_string_lossy()]);
+    for png in &plan.pngs {
+        // One still picture each (never a numbered sequence), held to the end.
+        push(&[
+            "-f",
+            "image2",
+            "-pattern_type",
+            "none",
+            "-i",
+            &png.to_string_lossy(),
+        ]);
+    }
+    push(&["-filter_complex", &filter, "-map", &out, "-map", "0:a:0?"]);
+    push(&export_encoder_args(encoder, plan.quality));
+    push(&[
+        "-pix_fmt",
+        "yuv420p",
+        "-fps_mode",
+        "passthrough",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        &plan.output.to_string_lossy(),
+    ]);
+    a
+}
+
+/// Burn the text boxes in: AMD hardware encoding when this ffmpeg has it,
+/// otherwise (or when that fails) libx264, like the rest of the export.
+pub fn add_overlays(
+    tools: &Tools,
+    plan: &OverlayPlan,
+    cancel: &AtomicBool,
+    mut on_frame: impl FnMut(u64),
+) -> Result<(), RunError> {
+    let ffmpeg = tools.ffmpeg().map_err(RunError::Failed)?;
+    if has_encoder(ffmpeg, "h264_amf") {
+        match run_ffmpeg(
+            ffmpeg,
+            &overlay_args(plan, Encoder::Amf),
+            cancel,
+            &mut on_frame,
+        ) {
+            Err(RunError::Failed(e)) => {
+                log::warn!("Adding text with AMD encoding failed ({e}); using software encoding");
+                on_frame(0);
+            }
+            other => return other,
+        }
+    }
+    run_ffmpeg(
+        ffmpeg,
+        &overlay_args(plan, Encoder::X264),
+        cancel,
+        &mut on_frame,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +975,229 @@ mod tests {
         assert!(a.contains("-c:v copy -c:a copy -movflags +faststart -f mp4 out.mp4"));
         let a = concat_args(Path::new("list.txt"), Path::new("out.mp4"), true).join(" ");
         assert!(a.contains("-c:a aac"));
+    }
+
+    #[test]
+    fn overlay_filter_chains_the_pictures() {
+        let fps = Fps { num: 30, den: 1 };
+        // Text 1 shows for output frames 30..90, text 2 for 0..15 and 300..330.
+        let f = overlay_filter(&[vec![(1.0, 3.0)], vec![(0.0, 0.5), (10.0, 11.0)]], fps);
+        assert_eq!(
+            f,
+            "[0:v][1:v]overlay=0:0:enable='between(t,0.983333,2.983333)'[v1];\
+             [v1][2:v]overlay=0:0:enable='between(t,-0.016667,0.483333)+between(t,9.983333,10.983333)'[v2]"
+        );
+        let one = overlay_filter(
+            &[vec![(0.0, 1.001)]],
+            Fps {
+                num: 30000,
+                den: 1001,
+            },
+        );
+        assert_eq!(
+            one,
+            "[0:v][1:v]overlay=0:0:enable='between(t,-0.016683,0.984317)'[v1]"
+        );
+    }
+
+    #[test]
+    fn overlay_filter_picks_whole_frames() {
+        // Frame k (at k/fps, give or take a millisecond) shows a text for
+        // [a, b) exactly when a <= k/fps < b.
+        let fps = Fps { num: 30, den: 1 };
+        let (a, b) = (2.0, 2.5);
+        let half = 0.5 / 30.0;
+        for k in 0..120 {
+            for jitter in [-0.001, 0.0, 0.001] {
+                let t = k as f64 / 30.0 + jitter;
+                let shown = (a - half..=b - half).contains(&t);
+                assert_eq!(shown, (60..75).contains(&k), "frame {k} at {t}");
+            }
+        }
+        assert!(overlay_filter(&[], fps).is_empty());
+    }
+
+    fn overlay_plan(quality: Quality) -> OverlayPlan {
+        OverlayPlan {
+            input: "joined.mp4".into(),
+            pngs: vec!["text-000.png".into(), "text-001.png".into()],
+            ranges: vec![vec![(0.0, 2.0)], vec![(4.0, 6.0)]],
+            fps: Fps { num: 30, den: 1 },
+            quality,
+            output: "out.mp4".into(),
+        }
+    }
+
+    #[test]
+    fn overlay_arguments() {
+        let a = overlay_args(&overlay_plan(Quality::Balanced), Encoder::X264).join(" ");
+        assert!(a.contains("-progress pipe:1"));
+        assert!(a.contains(
+            "-i joined.mp4 -f image2 -pattern_type none -i text-000.png \
+             -f image2 -pattern_type none -i text-001.png -filter_complex [0:v][1:v]overlay"
+        ));
+        assert!(a.contains("-map [v2] -map 0:a:0?"));
+        // One step sharper than Reco's quality steps for the export.
+        assert!(a.contains("-c:v libx264 -preset veryfast -crf 20 -profile:v high"));
+        assert!(a.contains("-fps_mode passthrough -c:a copy -movflags +faststart -f mp4"));
+        assert!(a.ends_with("out.mp4"));
+        let a = overlay_args(&overlay_plan(Quality::Fast), Encoder::X264).join(" ");
+        assert!(a.contains("-preset veryfast -crf 24"));
+        let a = overlay_args(&overlay_plan(Quality::High), Encoder::X264).join(" ");
+        assert!(a.contains("-preset fast -crf 18"));
+        let a = overlay_args(&overlay_plan(Quality::High), Encoder::Amf).join(" ");
+        assert!(a.contains("-c:v h264_amf -quality balanced -rc cqp -qp_i 12 -qp_p 12"));
+        let a = overlay_args(&overlay_plan(Quality::Fast), Encoder::Amf).join(" ");
+        assert!(a.contains("-qp_i 18 -qp_p 18"));
+    }
+
+    /// Run a tool and return its stdout, panicking with stderr on failure.
+    fn run_tool(program: &Path, args: &[&str]) -> Vec<u8> {
+        let out = Command::new(program).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    /// Burns two text pictures into a real video with the bundled-style
+    /// ffmpeg call and checks every frame: each box shows exactly during its
+    /// times. Skipped when ffmpeg is not installed.
+    #[test]
+    fn overlays_show_on_exactly_the_right_frames() {
+        let tools = Tools::find();
+        let Some(ffmpeg) = tools.ffmpeg.clone() else {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let clip = dir.join("joined.mp4");
+        let p = |path: &Path| path.to_str().unwrap().to_string();
+        run_tool(
+            &ffmpeg,
+            &[
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=gray:s=320x180:r=30:d=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=f=440:sample_rate=48000:d=2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                &p(&clip),
+            ],
+        );
+        // See-through pictures with an opaque box: magenta top left, cyan bottom right.
+        let box_png = |name: &str, (r, g, b): (u8, u8, u8), x: u32, y: u32| {
+            let path = dir.join(name);
+            let src = format!(
+                "color=s=320x180,format=rgba,geq=r={r}:g={g}:b={b}:\
+                 a='if(between(X,{x},{})*between(Y,{y},{}),255,0)'",
+                x + 59,
+                y + 39
+            );
+            run_tool(
+                &ffmpeg,
+                &[
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &src,
+                    "-frames:v",
+                    "1",
+                    &p(&path),
+                ],
+            );
+            path
+        };
+        let pngs = vec![
+            box_png("text-000.png", (255, 0, 255), 20, 20),
+            box_png("text-001.png", (0, 255, 255), 240, 130),
+        ];
+        let output = dir.join("out.mp4");
+        let plan = OverlayPlan {
+            input: clip,
+            pngs,
+            ranges: vec![vec![(0.5, 1.0)], vec![(0.0, 0.2), (1.5, 2.0)]],
+            fps: Fps { num: 30, den: 1 },
+            quality: Quality::Fast,
+            output: output.clone(),
+        };
+        let mut last = 0;
+        add_overlays(&tools, &plan, &AtomicBool::new(false), |n| last = n).unwrap();
+        assert_eq!(last, 60, "progress reports the frames");
+
+        // Colour of a small patch at (x, y) in every frame.
+        let patch = |x: u32, y: u32| -> Vec<[u8; 3]> {
+            let crop = format!("crop=8:8:{x}:{y},scale=1:1:flags=area");
+            let raw = run_tool(
+                &ffmpeg,
+                &[
+                    "-v",
+                    "error",
+                    "-i",
+                    &p(&output),
+                    "-vf",
+                    &crop,
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-",
+                ],
+            );
+            raw.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
+        };
+        let magenta = |c: [u8; 3]| c[0] > 200 && c[1] < 80 && c[2] > 200;
+        let cyan = |c: [u8; 3]| c[0] < 80 && c[1] > 200 && c[2] > 200;
+        let gray = |c: [u8; 3]| c.iter().all(|&v| (100..160).contains(&v));
+        let top = patch(46, 36);
+        let bottom = patch(266, 146);
+        assert_eq!(top.len(), 60);
+        for k in 0..60 {
+            let (t, b) = (top[k], bottom[k]);
+            if (15..30).contains(&k) {
+                assert!(magenta(t), "frame {k}: {t:?} should be magenta");
+            } else {
+                assert!(gray(t), "frame {k}: {t:?} should be plain");
+            }
+            if (0..6).contains(&k) || (45..60).contains(&k) {
+                assert!(cyan(b), "frame {k}: {b:?} should be cyan");
+            } else {
+                assert!(gray(b), "frame {k}: {b:?} should be plain");
+            }
+        }
+        // Around the boxes the picture is untouched, and the sound is kept.
+        assert!(patch(150, 90).iter().all(|&c| gray(c)));
+        let streams = run_tool(
+            tools.ffprobe.as_deref().unwrap(),
+            &[
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                &p(&output),
+            ],
+        );
+        assert_eq!(String::from_utf8_lossy(&streams).trim(), "video\naudio");
     }
 
     #[test]

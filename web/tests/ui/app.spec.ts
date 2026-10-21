@@ -204,15 +204,15 @@ test("editor: playback, frame steps and sliders", async ({ page }) => {
   await page.keyboard.press("Shift+ArrowRight");
   await expect(time).toHaveText("0:05 / 0:20");
   await page.keyboard.press("Space");
-  await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
   await expect(time).not.toHaveText("0:05 / 0:20", { timeout: 10_000 });
   await page.keyboard.press("Space");
-  await expect(page.getByRole("button", { name: "Play" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Play", exact: true })).toBeVisible();
 
   // Space plays even when a button has focus, without pressing that button again.
   await page.getByRole("button", { name: "Cut out a section" }).click();
   await page.keyboard.press("Space");
-  await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Cut to here" })).toBeVisible();
   await page.keyboard.press("Space");
   await page.keyboard.press("Escape");
@@ -420,7 +420,7 @@ test("editor: arrow keys and Space still step and play after using a slider or a
   await skip.click();
   await expect(skip).not.toBeChecked();
   await page.keyboard.press("Space");
-  await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
   await expect(skip).not.toBeChecked();
   await page.keyboard.press("Space");
   await expect(page.getByTestId("save-state")).toHaveText("All changes saved", { timeout: 10_000 });
@@ -467,4 +467,116 @@ test("editor: a preview that can't be fetched is not blamed on the browser", asy
   const view = page.getByTestId("camera-view");
   await expect(view).toContainText("The preview video could not be loaded. Make sure VeoClone is still running");
   await expect(view).not.toContainText("This browser");
+});
+
+test("text: add a match title and a player name, change them, and export with them", async ({ page }) => {
+  const id = await openExample(page);
+  const section = page.getByTestId("text-section");
+  const words = page.getByTestId("text-words");
+  const items = section.locator(".texts li");
+  const time = page.locator(".time-label");
+  // How many pixels of the text layer over the camera view are painted.
+  const painted = () =>
+    page.getByTestId("text-canvas").evaluate((c: HTMLCanvasElement) => {
+      if (!c.width || !c.height) return 0;
+      const d = c.getContext("2d")!.getImageData(0, 0, c.width, c.height).data;
+      let count = 0;
+      for (let i = 3; i < d.length; i += 4) if (d[i] > 0) count++;
+      return count;
+    });
+  expect(await painted()).toBe(0);
+  await expect(section).toContainText("Add the team names");
+
+  // A fix, selected, so a Delete that reached the editor would remove it.
+  await page.keyboard.press("k");
+  await expect(page.locator(".fixes li")).toHaveCount(1);
+
+  // Match title: team names and today's date at the top, the first line ready to type over.
+  await section.getByRole("button", { name: "Match title" }).click();
+  await expect(items).toHaveCount(1);
+  await expect(words).toBeFocused();
+  await expect(words).toHaveValue(/^Home team vs Away team\n\w{3} \d{1,2} \w{3} \d{4}$/);
+  const date = (await words.inputValue()).split("\n")[1];
+  await expect(page.getByTestId("text-when")).toHaveText("Shows for the whole video.");
+  // Typing never triggers the editor's shortcuts: Space, K, the arrow keys, Delete.
+  await page.keyboard.type("Kickers vs Roverss");
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("Delete");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Shift+ArrowLeft");
+  await expect(words).toHaveValue(`Kickers vs Rovers\n${date}`);
+  await expect(items.first()).toContainText("Kickers vs Rovers");
+  await expect(time).toHaveText("0:00 / 0:20");
+  await expect(page.getByRole("button", { name: "Play", exact: true })).toBeVisible();
+  await expect(page.locator(".fixes li")).toHaveCount(1);
+  // Shown live over the camera view.
+  await expect.poll(painted).toBeGreaterThan(1000);
+  await page.keyboard.press("Escape");
+  await expect(words).not.toBeFocused();
+
+  // Player name: 5 seconds from the playhead, bottom left.
+  await clickTimeline(page, 0.5);
+  await expect(time).toHaveText("0:10 / 0:20");
+  const titleOnly = await painted();
+  await section.getByRole("button", { name: "Player name" }).click();
+  await expect(items).toHaveCount(2);
+  await expect(words).toBeFocused();
+  await page.keyboard.type("#7 Sam Jones");
+  await expect(words).toHaveValue("#7 Sam Jones");
+  await expect(page.getByTestId("text-when")).toHaveText("Shows from 0:10 to 0:15.");
+  await expect(section.getByRole("button", { name: "Bottom left" })).toHaveAttribute("aria-pressed", "true");
+  await section.getByRole("button", { name: "Top right" }).click();
+  await expect(section.getByRole("button", { name: "Top right" })).toHaveAttribute("aria-pressed", "true");
+  await section.getByRole("radio", { name: "Large" }).check();
+  await expect.poll(painted).toBeGreaterThan(titleOnly);
+  await shot(page, "14-editor-text");
+
+  // Hide it from a later moment.
+  await clickTimeline(page, 0.6);
+  await section.getByRole("button", { name: "Hide from here" }).click();
+  await expect(page.getByTestId("text-when")).toHaveText("Shows from 0:10 to 0:12.");
+  await expect(section).toContainText("Not on screen at the playhead");
+
+  // Clicking a bar on the timeline picks that text.
+  const tl = (await page.getByTestId("timeline").boundingBox())!;
+  await page.mouse.click(tl.x + tl.width * 0.1, tl.y + tl.height - 22 - 18 + 5);
+  await expect(words).toHaveValue(`Kickers vs Rovers\n${date}`);
+  await expect(time).toHaveText("0:02 / 0:20");
+
+  // The Delete key removes the text picked last, not the fix picked before it.
+  await page.keyboard.press("Delete");
+  await expect(items).toHaveCount(1);
+  await expect(page.locator(".fixes li")).toHaveCount(1);
+  await page.keyboard.press("Control+z");
+  await expect(items).toHaveCount(2);
+
+  // Delete, and undo brings it back.
+  await section.getByRole("button", { name: "Delete the text “#7 Sam Jones”" }).click();
+  await expect(items).toHaveCount(1);
+  await page.keyboard.press("Control+z");
+  await expect(items).toHaveCount(2);
+
+  // Autosaved with the edits.
+  await expect(page.getByTestId("save-state")).toHaveText("All changes saved", { timeout: 10_000 });
+  await expect.poll(async () => (await mockState()).edits[id]?.overlays?.length).toBe(2);
+  const [title, player] = (await mockState()).edits[id].overlays;
+  expect(title).toMatchObject({ kind: "title", text: `Kickers vs Rovers\n${date}`, position: "top-center", start: 0, end: 600 });
+  expect(player).toMatchObject({ kind: "player", text: "#7 Sam Jones", position: "top-right", size: "large" });
+  expect(player.end).toBeGreaterThan(player.start);
+
+  // Export: each text as a PNG the size of the video, with when it shows.
+  await page.getByRole("button", { name: "Export" }).click();
+  const drawer = page.getByRole("dialog", { name: "Export your video" });
+  await drawer.getByRole("button", { name: "Make video" }).click();
+  await expect(drawer.getByTestId("download")).toBeVisible({ timeout: 30_000 });
+  await shot(page, "15-export-text");
+  const sent = (await mockState()).lastExport!;
+  expect(sent.overlays).toHaveLength(2);
+  for (const o of sent.overlays) {
+    expect(o).toMatchObject({ width: 1920, height: 1080 });
+    expect(o.bytes).toBeGreaterThan(1000);
+    expect(o.bytes).toBeLessThan(4 << 20);
+  }
+  expect(sent.overlays[0].ranges).toEqual([[0, 20]]);
+  expect(sent.overlays[1].ranges).toEqual([[player.start / 30, player.end / 30]]);
 });

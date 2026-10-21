@@ -1,7 +1,7 @@
 // Timeline canvas: the whole match with kept parts, cut parts, fixes
-// (keyframes), the camera's left/right movement and the playhead.
+// (keyframes), the camera's left/right movement, text boxes and the playhead.
 // Zoomable (buttons, Ctrl+wheel) and scrollable (wheel when zoomed in).
-import { formatFrameTime, type Edits, type Fps } from "../engine";
+import { formatFrameTime, type Edits, type Fps, type Overlay } from "../engine";
 import { cutParts } from "./segments";
 
 export interface TimelineModel {
@@ -12,6 +12,8 @@ export interface TimelineModel {
   finalPath: Float32Array;
   yawRange: [number, number];
   selected: number | null;
+  /** Id of the selected text box, or null. */
+  selectedText: string | null;
   /** First frame of a cut being marked, or null. */
   cutStart: number | null;
 }
@@ -19,9 +21,13 @@ export interface TimelineModel {
 export interface TimelineEvents {
   seek(frame: number, done: boolean): void;
   selectKeyframe(frame: number): void;
+  /** A text box's bar was clicked at `frame` (inside the text's time). */
+  selectOverlay(id: string, frame: number): void;
 }
 
 const RULER = 22;
+/** Lane for the text boxes, between the track and the fix markers. */
+const TEXT = 18;
 const MARKERS = 22;
 const MIN_FRAMES_VISIBLE = 60;
 
@@ -38,6 +44,9 @@ const C = {
   curve: "rgba(125, 211, 252, 0.75)",
   fix: "#fbbf24",
   fixBand: "rgba(251, 191, 36, 0.12)",
+  text: "#a78bfa",
+  textSelected: "#ddd6fe",
+  textLane: "#0a0e14",
   playhead: "#ffffff",
   pending: "#fb923c",
 };
@@ -139,11 +148,50 @@ export class Timeline {
     return best;
   }
 
+  /** The text bars: rows (overlapping texts on separate rows) and the bar height. */
+  private textBars(overlays: Overlay[], h: number) {
+    const ends: number[] = [];
+    const rows = new Map<string, number>();
+    for (const o of [...overlays].sort((a, b) => a.start - b.start)) {
+      let row = ends.findIndex((end) => end <= o.start);
+      if (row < 0) row = ends.length;
+      ends[row] = o.end;
+      rows.set(o.id, row);
+    }
+    const gap = 2;
+    const barH = Math.max(2, Math.min(8, (TEXT - 4 - gap * (ends.length - 1)) / Math.max(1, ends.length)));
+    const laneTop = h - MARKERS - TEXT;
+    return { rows, barH, top: (row: number) => laneTop + 2 + row * (barH + gap) };
+  }
+
+  private overlayNear(clientX: number, clientY: number): Overlay | null {
+    const m = this.model;
+    if (!m) return null;
+    const r = this.canvas.getBoundingClientRect();
+    const y = clientY - r.top;
+    if (y < r.height - MARKERS - TEXT || y >= r.height - MARKERS) return null;
+    const bars = this.textBars(m.edits.overlays, r.height);
+    const x = clientX - r.left;
+    // Later texts are drawn on top, so they win.
+    for (const o of [...m.edits.overlays].reverse()) {
+      const top = bars.top(bars.rows.get(o.id) ?? 0);
+      const x0 = this.x(o.start, r.width);
+      const x1 = Math.max(x0 + 3, this.x(o.end, r.width));
+      if (x >= x0 - 3 && x <= x1 + 3 && y >= top - 2 && y <= top + bars.barH + 2) return o;
+    }
+    return null;
+  }
+
   private onDown = (e: PointerEvent) => {
     if (e.button !== 0) return;
     const k = this.keyframeNear(e.clientX, e.clientY);
     if (k !== null) {
       this.events.selectKeyframe(k);
+      return;
+    }
+    const o = this.overlayNear(e.clientX, e.clientY);
+    if (o) {
+      this.events.selectOverlay(o.id, Math.min(Math.max(this.frameAt(e.clientX), o.start), o.end - 1));
       return;
     }
     this.dragging = true;
@@ -156,7 +204,8 @@ export class Timeline {
       this.events.seek(this.frameAt(e.clientX), false);
       return;
     }
-    this.canvas.style.cursor = this.keyframeNear(e.clientX, e.clientY) !== null ? "pointer" : "";
+    const near = this.keyframeNear(e.clientX, e.clientY) !== null || this.overlayNear(e.clientX, e.clientY) !== null;
+    this.canvas.style.cursor = near ? "pointer" : "";
   };
 
   private onUp = (e: PointerEvent) => {
@@ -197,7 +246,7 @@ export class Timeline {
     g.fillStyle = C.bg;
     g.fillRect(0, 0, w, h);
     const trackTop = RULER;
-    const trackH = h - RULER - MARKERS;
+    const trackH = h - RULER - TEXT - MARKERS;
     const fps = m.fps.num / m.fps.den;
 
     // Ruler.
@@ -277,6 +326,27 @@ export class Timeline {
         else g.lineTo(px, y);
       }
       g.stroke();
+    }
+
+    // Text boxes: a bar for each, on the lane below the track.
+    g.fillStyle = C.textLane;
+    g.fillRect(0, trackTop + trackH, w, TEXT);
+    const bars = this.textBars(m.edits.overlays, h);
+    for (const o of m.edits.overlays) {
+      const x0 = this.x(o.start, w);
+      const x1 = Math.max(x0 + 3, this.x(o.end, w));
+      if (x1 < 0 || x0 > w) continue;
+      const top = bars.top(bars.rows.get(o.id) ?? 0);
+      const sel = o.id === m.selectedText;
+      g.fillStyle = sel ? C.textSelected : C.text;
+      g.globalAlpha = o.text.trim() ? 1 : 0.4;
+      g.fillRect(x0, top, x1 - x0, bars.barH);
+      g.globalAlpha = 1;
+      if (sel) {
+        g.strokeStyle = "#fff";
+        g.lineWidth = 1.5;
+        g.strokeRect(x0 - 0.75, top - 0.75, x1 - x0 + 1.5, bars.barH + 1.5);
+      }
     }
 
     // Fix markers.

@@ -1,5 +1,6 @@
 //! Export (`POST /exports`): render each keep-range with Reco following the
-//! editor's final camera path, then join the parts into one MP4.
+//! editor's final camera path, join the parts into one MP4, then burn in the
+//! editor's text boxes, if any (DESIGN.md 5.4).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use serde::Deserialize;
 
 use crate::calib::BLEND_WIDTH;
 use crate::jobs::{Context, JobError, Progress, check_free_space};
-use crate::media::{RunError, Tools, concat, concat_list};
+use crate::media::{OverlayPlan, RunError, Tools, add_overlays, concat, concat_list};
 use crate::store::{ExportStatus, Fps, Quality, Step, original_file};
 
 /// A keep-range in synced frames, end exclusive.
@@ -24,6 +25,22 @@ use crate::store::{ExportStatus, Fps, Quality, Step, original_file};
 pub struct Segment {
     pub start_frame: u64,
     pub end_frame: u64,
+}
+
+/// Most text boxes in one export (DESIGN.md 5.4).
+pub const MAX_OVERLAYS: usize = 50;
+/// Largest picture of one text box (they are mostly see-through, so small).
+pub const MAX_OVERLAY_PNG: usize = 4 * 1024 * 1024;
+
+/// One text box of `POST /exports`: a PNG the size of the video, drawn by
+/// the editor, and when it shows.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayBody {
+    pub png_base64: String,
+    /// `[start, end]` seconds of the finished video. `null` is what a
+    /// browser sends for a number JSON cannot hold (NaN, infinity).
+    pub ranges: Vec<Vec<Option<f64>>>,
 }
 
 /// The JSON body of `POST /exports`.
@@ -35,6 +52,16 @@ pub struct ExportBody {
     pub height: u32,
     pub quality: Quality,
     pub path_base64: String,
+    #[serde(default)]
+    pub overlays: Vec<OverlayBody>,
+}
+
+/// A checked text box.
+#[derive(Debug)]
+pub struct Overlay {
+    pub png: Vec<u8>,
+    /// [start, end) seconds of the finished video, sorted, not overlapping.
+    pub ranges: Vec<(f64, f64)>,
 }
 
 /// A checked export request.
@@ -45,6 +72,72 @@ pub struct ExportRequest {
     pub height: u32,
     pub quality: Quality,
     pub path: Arc<Vec<[f32; 3]>>,
+    /// Text boxes to burn in, in drawing order; empty for none.
+    pub overlays: Vec<Overlay>,
+}
+
+/// Width and height from a PNG's header, or None when it is not a PNG.
+pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if png.len() < 24 || &png[..8] != SIGNATURE || &png[12..16] != b"IHDR" {
+        return None;
+    }
+    let be = |i: usize| u32::from_be_bytes([png[i], png[i + 1], png[i + 2], png[i + 3]]);
+    Some((be(16), be(20)))
+}
+
+/// Check the text boxes of an export of `width` x `height`. Boxes that show
+/// at no time (they were only in cut parts) are dropped.
+fn validate_overlays(
+    bodies: Vec<OverlayBody>,
+    width: u32,
+    height: u32,
+) -> Result<Vec<Overlay>, String> {
+    if bodies.len() > MAX_OVERLAYS {
+        return Err(format!(
+            "A video can have at most {MAX_OVERLAYS} texts. Please delete some."
+        ));
+    }
+    let mut out = Vec::new();
+    for (i, body) in bodies.into_iter().enumerate() {
+        let n = i + 1;
+        let unreadable = || format!("Text {n} could not be read. Please try again.");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(body.png_base64.trim())
+            .map_err(|_| unreadable())?;
+        if png.len() > MAX_OVERLAY_PNG {
+            return Err(format!("Text {n} is too big. Please try again."));
+        }
+        match png_size(&png) {
+            None => return Err(unreadable()),
+            Some(size) if size != (width, height) => {
+                return Err(format!(
+                    "Text {n} was made for a different video size. Please press Make video \
+                     again."
+                ));
+            }
+            Some(_) => {}
+        }
+        let bad_times =
+            || format!("The times of text {n} are not valid. Please check it on the timeline.");
+        let mut ranges = Vec::new();
+        let mut prev_end = 0.0;
+        for r in &body.ranges {
+            let [Some(a), Some(b)] = r[..] else {
+                return Err(bad_times());
+            };
+            // Finite, not negative, in order and not overlapping.
+            if !a.is_finite() || !b.is_finite() || a < prev_end || b <= a {
+                return Err(bad_times());
+            }
+            prev_end = b;
+            ranges.push((a, b));
+        }
+        if !ranges.is_empty() {
+            out.push(Overlay { png, ranges });
+        }
+    }
+    Ok(out)
 }
 
 /// Check an export body against the project. Errors are plain words.
@@ -74,12 +167,14 @@ pub fn validate(body: ExportBody, frame_count: u64) -> Result<ExportRequest, Str
     if path.iter().flatten().any(|v| !v.is_finite()) {
         return Err("The camera path contains invalid numbers.".into());
     }
+    let overlays = validate_overlays(body.overlays, w, h)?;
     Ok(ExportRequest {
         segments: body.segments,
         width: w,
         height: h,
         quality: body.quality,
         path: Arc::new(path),
+        overlays,
     })
 }
 
@@ -259,6 +354,50 @@ pub fn join_parts(
     Ok(())
 }
 
+/// Burn the text boxes into `joined`, writing `output`; the pictures and
+/// `joined` are removed afterwards. Reports `total` frames of progress.
+fn add_text(
+    tools: &Tools,
+    out_dir: &Path,
+    joined: &Path,
+    output: &Path,
+    req: &ExportRequest,
+    fps: Fps,
+    cancel: &AtomicBool,
+    on_frames: impl FnMut(u64),
+) -> Result<(), JobError> {
+    let mut pngs = Vec::new();
+    for (i, o) in req.overlays.iter().enumerate() {
+        let path = out_dir.join(format!("text-{i:03}.png"));
+        std::fs::write(&path, &o.png)
+            .map_err(|e| JobError::failed("We couldn't write the video file.", e))?;
+        pngs.push(path);
+    }
+    let plan = OverlayPlan {
+        input: joined.to_path_buf(),
+        pngs: pngs.clone(),
+        ranges: req.overlays.iter().map(|o| o.ranges.clone()).collect(),
+        fps,
+        quality: req.quality,
+        output: output.to_path_buf(),
+    };
+    tracing::info!("Adding {} text(s)", pngs.len());
+    match add_overlays(tools, &plan, cancel, on_frames) {
+        Ok(()) => {}
+        Err(RunError::Cancelled) => return Err(JobError::Cancelled),
+        Err(RunError::Failed(e)) => {
+            return Err(JobError::failed(
+                "We couldn't add your text to the video.",
+                e,
+            ));
+        }
+    }
+    for p in pngs.iter().map(PathBuf::as_path).chain([joined]) {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
+}
+
 /// A safe file name: `<project name> <date>.mp4`.
 pub fn file_name(project_name: &str, when: chrono::DateTime<chrono::Local>) -> String {
     let clean: String = project_name
@@ -307,7 +446,13 @@ pub fn run(
     }) else {
         return Err(JobError::Cancelled);
     };
-    let mut progress = Progress::new(store, id, Some(export_id), 2);
+    // Rendering, joining and, with text boxes, adding the text. That
+    // re-encodes the whole video, so it gets the last 40 % of the progress.
+    let with_text = !req.overlays.is_empty();
+    let mut progress = Progress::new(store, id, Some(export_id), if with_text { 3 } else { 2 });
+    if with_text {
+        progress.span(0.0, 0.6);
+    }
     progress.step(Step::Export, 0, "Making your video");
 
     let not_ready = |d: &str| {
@@ -355,9 +500,26 @@ pub fn run(
 
     progress.step(Step::Finalize, 1, "Finishing the video file");
     let tmp = out_dir.join("export.tmp.mp4");
-    if let Err(e) = join_parts(&ctx.tools, &out_dir, &parts, &tmp, cancel) {
+    let joined = if with_text {
+        out_dir.join("joined.tmp.mp4")
+    } else {
+        tmp.clone()
+    };
+    if let Err(e) = join_parts(&ctx.tools, &out_dir, &parts, &joined, cancel) {
         let _ = std::fs::remove_dir_all(&out_dir);
         return Err(e);
+    }
+    if with_text {
+        progress.step(Step::Overlay, 2, "Adding text");
+        progress.span(0.6, 1.0);
+        let on_frames = |n| progress.frames(n, total);
+        let added = add_text(
+            &ctx.tools, &out_dir, &joined, &tmp, req, fps, cancel, on_frames,
+        );
+        if let Err(e) = added {
+            let _ = std::fs::remove_dir_all(&out_dir);
+            return Err(e);
+        }
     }
     let name = file_name(&meta.name, chrono::Local::now());
     let final_path: PathBuf = out_dir.join(&name);
@@ -392,7 +554,133 @@ mod tests {
             height: h,
             quality: Quality::Balanced,
             path_base64: STANDARD.encode(crate::ai::encode_path(path)),
+            overlays: Vec::new(),
         }
+    }
+
+    /// The start of a PNG of `w` x `h` (all the checks look at).
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend(w.to_be_bytes());
+        png.extend(h.to_be_bytes());
+        png.extend([8, 6, 0, 0, 0]);
+        png
+    }
+
+    fn text(png: &[u8], ranges: &[[Option<f64>; 2]]) -> OverlayBody {
+        OverlayBody {
+            png_base64: STANDARD.encode(png),
+            ranges: ranges.iter().map(|r| r.to_vec()).collect(),
+        }
+    }
+
+    #[test]
+    fn reads_png_sizes() {
+        assert_eq!(png_size(&png_header(1920, 1080)), Some((1920, 1080)));
+        assert_eq!(png_size(&png_header(3840, 2160)), Some((3840, 2160)));
+        assert_eq!(png_size(&png_header(1920, 1080)[..20]), None);
+        let mut not_png = png_header(1920, 1080);
+        not_png[1] = b'X';
+        assert_eq!(png_size(&not_png), None);
+        let mut no_header = png_header(1920, 1080);
+        no_header[12..16].copy_from_slice(b"IDAT");
+        assert_eq!(png_size(&no_header), None);
+    }
+
+    #[test]
+    fn validates_text_boxes() {
+        let path = vec![[0.0, 0.0, 30.0]; 100];
+        let with = |overlays: Vec<OverlayBody>| {
+            let mut b = body(vec![(0, 100)], 1920, 1080, &path);
+            b.overlays = overlays;
+            validate(b, 100)
+        };
+        let png = png_header(1920, 1080);
+        let (a, b) = (Some(0.0), Some(1.5));
+        let ok = with(vec![
+            text(&png, &[[a, b], [Some(2.0), Some(3.0)]]),
+            text(&png, &[[Some(1.5), Some(3.3)]]),
+        ])
+        .unwrap();
+        assert_eq!(ok.overlays.len(), 2);
+        assert_eq!(ok.overlays[0].ranges, vec![(0.0, 1.5), (2.0, 3.0)]);
+        assert_eq!(ok.overlays[0].png, png);
+        assert!(with(vec![]).unwrap().overlays.is_empty());
+        // Shown at no time (only in cut parts): nothing to add.
+        assert!(with(vec![text(&png, &[])]).unwrap().overlays.is_empty());
+
+        // The picture must be a PNG the size of the video.
+        let err = with(vec![text(&png_header(1280, 720), &[[a, b]])]).unwrap_err();
+        assert!(err.contains("different video size"), "{err}");
+        let err = with(vec![text(&png[..16], &[[a, b]])]).unwrap_err();
+        assert!(err.contains("Text 1 could not be read"), "{err}");
+        let mut bad = text(&png, &[[a, b]]);
+        bad.png_base64 = "!!!".into();
+        assert!(with(vec![bad]).is_err());
+        let mut big = png.clone();
+        big.resize(MAX_OVERLAY_PNG + 1, 0);
+        assert!(
+            with(vec![text(&big, &[[a, b]])])
+                .unwrap_err()
+                .contains("too big")
+        );
+        let mut max = png.clone();
+        max.resize(MAX_OVERLAY_PNG, 0);
+        assert!(with(vec![text(&max, &[[a, b]])]).is_ok());
+
+        // Times: numbers, not negative, sorted, not overlapping.
+        let nan = Some(f64::NAN);
+        for ranges in [
+            vec![[None, b]],
+            vec![[a, None]],
+            vec![[nan, b]],
+            vec![[a, Some(f64::INFINITY)]],
+            vec![[Some(-0.5), b]],
+            vec![[Some(2.0), Some(1.0)]],
+            vec![[Some(1.0), Some(1.0)]],
+            vec![[Some(2.0), Some(3.0)], [a, b]],
+            vec![[a, Some(2.0)], [b, Some(3.0)]],
+        ] {
+            let err = with(vec![text(&png, &[[a, b]]), text(&png, &ranges)]).unwrap_err();
+            assert!(err.contains("times of text 2"), "{ranges:?}: {err}");
+        }
+        let mut short = text(&png, &[]);
+        short.ranges = vec![vec![Some(1.0)]];
+        assert!(with(vec![short]).is_err());
+
+        // At most 50.
+        assert!(with((0..50).map(|_| text(&png, &[[a, b]])).collect()).is_ok());
+        let err = with((0..51).map(|_| text(&png, &[[a, b]])).collect()).unwrap_err();
+        assert!(err.contains("at most 50"), "{err}");
+    }
+
+    #[test]
+    fn text_boxes_in_the_json_body() {
+        let path = STANDARD.encode(crate::ai::encode_path(&[[0.0, 0.0, 30.0]; 10]));
+        let json = |overlays: &str| {
+            format!(
+                r#"{{"segments":[{{"startFrame":0,"endFrame":10}}],"width":1920,"height":1080,
+                "quality":"fast","pathBase64":"{path}"{overlays}}}"#
+            )
+        };
+        // Without overlays (older editors) nothing changes.
+        let body: ExportBody = serde_json::from_str(&json("")).unwrap();
+        assert!(validate(body, 10).unwrap().overlays.is_empty());
+        // A browser turns NaN into null: refused in plain words, not as broken JSON.
+        let png = STANDARD.encode(png_header(1920, 1080));
+        let body: ExportBody = serde_json::from_str(&json(&format!(
+            r#","overlays":[{{"pngBase64":"{png}","ranges":[[null,1]]}}]"#
+        )))
+        .unwrap();
+        assert!(validate(body, 10).unwrap_err().contains("not valid"));
+        let body: ExportBody = serde_json::from_str(&json(&format!(
+            r#","overlays":[{{"pngBase64":"{png}","ranges":[[0,0.3333333333333333]]}}]"#
+        )))
+        .unwrap();
+        assert_eq!(
+            validate(body, 10).unwrap().overlays[0].ranges,
+            vec![(0.0, 1.0 / 3.0)]
+        );
     }
 
     #[test]
@@ -601,6 +889,7 @@ mod tests {
             height: 360,
             quality: Quality::Fast,
             path: Arc::new(path),
+            overlays: Vec::new(),
         };
         let out_dir = tmp.path().join("export");
         std::fs::create_dir_all(&out_dir).unwrap();

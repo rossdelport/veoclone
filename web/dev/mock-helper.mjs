@@ -111,6 +111,7 @@ const EXPORT_STEPS = [
   { step: "export", seconds: 3, message: "Making your video", frames: true },
   { step: "finalize", seconds: 0.5, message: "Putting the parts together" },
 ];
+const TEXT_STEP = { step: "overlay", seconds: 1, message: "Adding text", frames: true };
 
 function runJob(p, kind, steps, { exportId, onDone, onFail }) {
   const speed = /slow/i.test(p.name) ? SPEED / 10 : SPEED;
@@ -196,8 +197,8 @@ function startProcess(p) {
   });
 }
 
-function startExport(p, e) {
-  runJob(p, "export", EXPORT_STEPS, {
+function startExport(p, e, withText) {
+  runJob(p, "export", withText ? [...EXPORT_STEPS, TEXT_STEP] : EXPORT_STEPS, {
     exportId: e.id,
     onDone: () => {
       const date = new Date().toISOString().slice(0, 10);
@@ -294,7 +295,37 @@ function validateExport(body) {
   if (!["fast", "balanced", "high"].includes(body.quality)) return "Bad quality";
   const bytes = Buffer.from(String(body.pathBase64 ?? ""), "base64");
   if (bytes.length !== FRAME_COUNT * 12) return `Path has ${bytes.length} bytes, expected ${FRAME_COUNT * 12}`;
+  return validateOverlays(body);
+}
+
+/** Text boxes (DESIGN.md 5.4): PNGs the size of the video, shown during sorted ranges in seconds. */
+function validateOverlays(body) {
+  const overlays = body.overlays ?? [];
+  if (!Array.isArray(overlays) || overlays.length > 50) return "Bad overlays (at most 50)";
+  for (const [i, o] of overlays.entries()) {
+    const png = Buffer.from(String(o?.pngBase64 ?? ""), "base64");
+    if (png.length > 4 << 20) return `Overlay ${i}: PNG over 4 MB`;
+    if (png.length < 24 || !png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) || png.toString("latin1", 12, 16) !== "IHDR") {
+      return `Overlay ${i}: not a PNG`;
+    }
+    const [w, h] = [png.readUInt32BE(16), png.readUInt32BE(20)];
+    if (w !== body.width || h !== body.height) return `Overlay ${i}: PNG is ${w}x${h}, the video ${body.width}x${body.height}`;
+    if (!Array.isArray(o.ranges)) return `Overlay ${i}: no ranges`;
+    let last = 0;
+    for (const r of o.ranges) {
+      if (!Array.isArray(r) || r.length !== 2 || !r.every(Number.isFinite) || r[0] < last || r[1] <= r[0]) return `Overlay ${i}: bad range ${JSON.stringify(r)}`;
+      last = r[1];
+    }
+  }
   return null;
+}
+
+/** What the editor sent for each text box (for the UI tests). */
+function overlaySummary(overlays = []) {
+  return overlays.map((o) => {
+    const png = Buffer.from(o.pngBase64, "base64");
+    return { width: png.readUInt32BE(16), height: png.readUInt32BE(20), bytes: png.length, ranges: o.ranges };
+  });
 }
 
 function pathSummary(b64) {
@@ -471,13 +502,14 @@ async function handle(req, res) {
     case "POST exports": {
       if (p.status !== "ready") return fail(res, 409, "This match is not ready to export yet. Wait until processing has finished.");
       if (busy(p)) return fail(res, 409, BUSY);
-      const body = await readJson(req, 64 << 20);
+      const body = await readJson(req, 400 << 20);
       const problem = validateExport(body);
       if (problem) return fail(res, 400, "The video settings were not accepted.", problem);
       const e = { id: newId(), status: "queued", progress: 0, createdAt: now(), width: body.width, height: body.height, quality: body.quality };
       p.exports.push(e);
-      mock.lastExport = { segments: body.segments, width: body.width, height: body.height, quality: body.quality, path: pathSummary(body.pathBase64) };
-      setTimeout(() => e.status === "queued" && startExport(p, e), 300 / SPEED);
+      const overlays = overlaySummary(body.overlays);
+      mock.lastExport = { segments: body.segments, width: body.width, height: body.height, quality: body.quality, path: pathSummary(body.pathBase64), overlays };
+      setTimeout(() => e.status === "queued" && startExport(p, e, overlays.length > 0), 300 / SPEED);
       return send(res, 201, e);
     }
     case "GET exports":

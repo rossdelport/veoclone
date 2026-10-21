@@ -4,7 +4,7 @@ import type { CalibInfo, Edits, ExportQuality, Fps } from "./engine";
 export type Style = "broadcast" | "action" | "frame_all";
 export type ProjectStatus = "new" | "uploaded" | "queued" | "processing" | "ready" | "failed" | "cancelled";
 export type Side = "left" | "right";
-export type JobStep = "probe" | "calibrate" | "proxy" | "track" | "export" | "finalize";
+export type JobStep = "probe" | "calibrate" | "proxy" | "track" | "export" | "finalize" | "overlay";
 export type ExportStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 
 export interface Health {
@@ -94,12 +94,22 @@ export interface ProjectMeta {
   exports: ExportMeta[];
 }
 
+/** A text box burned into the export (DESIGN.md 5.4). */
+export interface ExportOverlay {
+  /** PNG the size of the video, mostly see-through. */
+  pngBase64: string;
+  /** When it shows, as [start, end) seconds of the finished video, sorted. */
+  ranges: [number, number][];
+}
+
 export interface ExportRequest {
   segments: { startFrame: number; endFrame: number }[];
   width: number;
   height: number;
   quality: ExportQuality;
   pathBase64: string;
+  /** At most 50; each PNG at most 4 MB. */
+  overlays: ExportOverlay[];
 }
 
 /** An error with a plain-English message; `detail` holds the technical part. */

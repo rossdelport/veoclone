@@ -325,6 +325,8 @@ pub struct Progress<'a> {
     started_at: String,
     kind: JobKind,
     step_count: u32,
+    /// The part of an export's overall progress the current step covers.
+    span: (f64, f64),
 }
 
 impl<'a> Progress<'a> {
@@ -341,7 +343,14 @@ impl<'a> Progress<'a> {
                 JobKind::Process
             },
             step_count,
+            span: (0.0, 1.0),
         }
+    }
+
+    /// The current step covers `from..to` of the export's overall progress
+    /// (`ExportMeta.progress`), so the bar moves forward through every step.
+    pub fn span(&mut self, from: f64, to: f64) {
+        self.span = (from, to);
     }
 
     /// Start a new step (saved to disk right away).
@@ -385,8 +394,15 @@ impl<'a> Progress<'a> {
             0.0
         };
         let elapsed = self.step_started.elapsed().as_secs_f64();
-        let eta = (done > 0 && elapsed > 2.0)
-            .then(|| elapsed / done as f64 * total.saturating_sub(done) as f64);
+        let (from, to) = self.span;
+        // Time left in this step, plus the later steps if they take as long
+        // per share of the progress.
+        let later = (1.0 - to) / (to - from).max(0.01);
+        let eta = (done > 0 && elapsed > 2.0).then(|| {
+            let step_secs = elapsed / done as f64 * total as f64;
+            (step_secs - elapsed).max(0.0) + step_secs * later
+        });
+        let overall = from + (to - from) * progress;
         let export = self.export.clone();
         self.store.update_progress(&self.project, |m| {
             if let Some(job) = m.job.as_mut() {
@@ -398,7 +414,7 @@ impl<'a> Progress<'a> {
             if let Some(id) = export
                 && let Some(ex) = m.exports.iter_mut().find(|e| e.id == id)
             {
-                ex.progress = progress;
+                ex.progress = overall;
             }
         });
     }

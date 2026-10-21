@@ -4,3 +4,4 @@ export * from "./clamp";
 export * from "./path";
 export * from "./projection";
 export * from "./render";
+export * from "./overlay";

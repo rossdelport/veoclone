@@ -127,6 +127,8 @@ pub enum Step {
     Track,
     Export,
     Finalize,
+    /// Burning the editor's text boxes into the finished video.
+    Overlay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

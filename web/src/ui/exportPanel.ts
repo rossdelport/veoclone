@@ -1,6 +1,18 @@
 // Export drawer: size and quality, "Make video", progress, past videos.
-import { api, type ExportMeta, type ProjectMeta } from "../api";
-import { encodePathBase64, frameToTime, keptFrameCount, type CalibInfo, type ExportQuality } from "../engine";
+import { api, type ExportMeta, type ExportOverlay, type ProjectMeta } from "../api";
+import {
+  bytesToBase64,
+  drawOverlay,
+  encodePathBase64,
+  frameToTime,
+  keptFrameCount,
+  overlayOutputRanges,
+  type CalibInfo,
+  type Edits,
+  type ExportQuality,
+  type Fps,
+  type Overlay,
+} from "../engine";
 import { button, confirmDialog, describeError, details, errorBox, iconButton, progressBar, setProgress, toast } from "./common";
 import { formatBytes, formatDate, formatDuration, formatTimeLeft, h, icon, setChildren } from "./dom";
 import type { EditStore } from "./editStore";
@@ -19,6 +31,32 @@ const QUALITIES: { id: ExportQuality; name: string; text: string }[] = [
 
 const sizeName = (e: { width: number; height: number }) => SIZES.find((s) => s.w === e.width)?.name ?? `${e.width}x${e.height}`;
 const qualityName = (q: ExportQuality) => QUALITIES.find((x) => x.id === q)?.name ?? q;
+
+/** One text box as a PNG of the whole video picture (see-through around the box). */
+async function overlayPng(o: Overlay, width: number, height: number): Promise<string> {
+  let blob: Blob;
+  if (typeof OffscreenCanvas !== "undefined") {
+    const canvas = new OffscreenCanvas(width, height);
+    drawOverlay(canvas.getContext("2d")!, o, width, height);
+    blob = await canvas.convertToBlob({ type: "image/png" });
+  } else {
+    const canvas = h("canvas", { width, height });
+    drawOverlay(canvas.getContext("2d")!, o, width, height);
+    blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("canvas.toBlob gave nothing"))), "image/png"));
+  }
+  return bytesToBase64(new Uint8Array(await blob.arrayBuffer()));
+}
+
+/** The text boxes for the export: those with words that are in a kept part. */
+async function exportOverlays(edits: Edits, fps: Fps): Promise<ExportOverlay[]> {
+  const out: ExportOverlay[] = [];
+  for (const o of edits.overlays) {
+    const ranges = overlayOutputRanges(o, edits.segments, fps);
+    if (!o.text.trim() || ranges.length === 0) continue;
+    out.push({ pngBase64: await overlayPng(o, edits.export.width, edits.export.height), ranges });
+  }
+  return out;
+}
 
 export class ExportPanel {
   readonly el: HTMLDialogElement;
@@ -180,7 +218,9 @@ export class ExportPanel {
   }
 
   private progressText(p: ProjectMeta, e: ExportMeta): string {
-    return e.status === "queued" ? "Waiting to start…" : [`Making your video… ${Math.round(e.progress * 100)}%`, this.timeLeft(p, e)].filter(Boolean).join(" · ");
+    if (e.status === "queued") return "Waiting to start…";
+    const adding = p.job?.exportId === e.id && p.job.step === "overlay";
+    return [`${adding ? "Adding your text" : "Making your video"}… ${Math.round(e.progress * 100)}%`, this.timeLeft(p, e)].filter(Boolean).join(" · ");
   }
 
   private timeLeft(p: ProjectMeta, e: ExportMeta): string {
@@ -248,6 +288,7 @@ export class ExportPanel {
         height: edits.export.height,
         quality: edits.export.quality,
         pathBase64: encodePathBase64(path),
+        overlays: await exportOverlays(edits, this.calib.fps),
       });
       if (this.project) this.update({ ...this.project, exports: [...this.project.exports.filter((x) => x.id !== exp.id), exp] });
       this.list.scrollIntoView({ behavior: "smooth", block: "nearest" });

@@ -36,7 +36,8 @@ veoclone-helper [--port 47863] [--data-dir DIR] [--web-dir DIR] [--model FILE]
 cargo test -p veoclone-helper
 # Renders real video (needs ffmpeg on PATH and a GPU; llvmpipe works):
 cargo test -p veoclone-helper -- --ignored export_frame_alignment
-# Whole HTTP flow against a release binary (Python 3, ffprobe on PATH):
+# Whole HTTP flow against a release binary, including text burned into an
+# export and checked frame by frame (Python 3, ffmpeg + ffprobe on PATH):
 python3 crates/veoclone-helper/scripts/e2e.py --helper target/release/veoclone-helper \
   --left left.mp4 --right right.mp4 --model yolo26n_640.onnx --work /tmp/veoclone-e2e
 ```
@@ -51,6 +52,10 @@ python3 crates/veoclone-helper/scripts/e2e.py --helper target/release/veoclone-h
   names.
 - `ExportMeta.error` is a plain string.
 - Export accepts any even 16:9 size from 320 to 3840 pixels wide.
+- Export `overlays` (text boxes, DESIGN.md 5.4) is optional; a text box with
+  no `ranges` is ignored. With text the export has three steps
+  (`export`, `finalize`, `overlay`) and the text pass gets the last 40 % of
+  `ExportMeta.progress`.
 - `/api/health` `gpu.name`/`gpu.backend` are empty and `ai.provider` is
   `"checking"` for the first second or two after start; `ai.provider` is
   `"DirectML"`, `"CPU"` or `"none"`.

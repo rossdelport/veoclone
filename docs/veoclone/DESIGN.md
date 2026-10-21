@@ -213,7 +213,8 @@ Body (JSON):
   "segments": [{ "startFrame": 0, "endFrame": 81000 }],
   "width": 1920, "height": 1080,
   "quality": "balanced",
-  "pathBase64": "<Float32 LE array, frameCount*3, [yaw,pitch,fov] per synced frame>"
+  "pathBase64": "<Float32 LE array, frameCount*3, [yaw,pitch,fov] per synced frame>",
+  "overlays": [{ "pngBase64": "<PNG, export size>", "ranges": [[2.0, 7.0]] }]
 }
 ```
 
@@ -237,6 +238,8 @@ Body (JSON):
   (timestamp gap) before a trim still shifts that camera by one frame.
 - Then concat the parts with ffmpeg (`-f concat -c copy`) into
   `exports/<id>/<project name> <date>.mp4` with `-movflags +faststart`.
+- `overlays` (optional, default none): text boxes burned in after the
+  concat, section 5.4.
 - Export status is tracked in `project.json` (`exports[]`).
 
 ### 4.4 Editor data
@@ -299,7 +302,7 @@ cap/clamp (the editor applies them).
   status: "new" | "uploaded" | "queued" | "processing" | "ready" | "failed" | "cancelled";
   files: { left?: FileInfo; right?: FileInfo };  // FileInfo = { name, sizeBytes, probe?: {...} }
   job: null | { kind: "process" | "export"; exportId?: string;
-                step: "probe" | "calibrate" | "proxy" | "track" | "export" | "finalize";
+                step: "probe" | "calibrate" | "proxy" | "track" | "export" | "finalize" | "overlay";
                 stepIndex: number; stepCount: number; progress: number;
                 framesDone?: number; framesTotal?: number; etaSeconds?: number;
                 message: string; startedAt: string };

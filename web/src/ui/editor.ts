@@ -5,6 +5,7 @@ import {
   buildRig,
   CameraViewRenderer,
   clampPose,
+  drawOverlay,
   formatFrameTime,
   frameToTime,
   frustumOutline,
@@ -30,6 +31,7 @@ import type { Page, PageContext } from "./page";
 import { STYLES } from "./newMatch";
 import { editableTitle } from "./project";
 import { cutOut, cutParts, isKept, keep, nextKept, setEnd, setStart } from "./segments";
+import { TextPanel } from "./textPanel";
 import { Timeline } from "./timeline";
 
 const ASPECT = 16 / 9;
@@ -97,6 +99,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   let shownFrame = 0; // frame the video is showing
   let livePose: Pose | null = null; // while dragging / zooming
   let selected: number | null = null;
+  let picked: "fix" | "text" = "fix"; // what Delete removes: the last one picked
   let cutStart: number | null = null;
   let skipCuts = true;
   let wantFrame = 0;
@@ -105,6 +108,8 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   let ovDirty = true;
   let lastOverview = 0;
   let videoReady = false;
+  let hintDone = false; // the user has moved the camera once
+  let textShown = ""; // what the text canvas shows
 
   // ---------------------------------------------------------------------
   // Layout
@@ -116,7 +121,9 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const badge = h("div", { class: "view-badge" });
   const viewerMsg = h("div", { class: "viewer-msg" }, h("div", { class: "spinner", "aria-hidden": "true" }), h("p", null, "Loading the preview…"));
   const hint = h("div", { class: "viewer-hint" }, "Drag or scroll to fix the camera here · Whole video: Zoom slider");
-  const viewerBox = h("div", { class: "viewer-box", "data-testid": "camera-view" }, camCanvas, badge, hint, viewerMsg);
+  // Text boxes, drawn by the same function as the export (DESIGN.md 5.4).
+  const textCanvas = h("canvas", { class: "text-canvas", "aria-hidden": "true", "data-testid": "text-canvas" });
+  const viewerBox = h("div", { class: "viewer-box", "data-testid": "camera-view" }, camCanvas, textCanvas, badge, hint, viewerMsg);
   const video = h("video", { class: "proxy-video", preload: "auto", playsInline: true, crossOrigin: "anonymous", "aria-hidden": "true" });
 
   const ovCanvas = h("canvas", { class: "overview-canvas" });
@@ -185,8 +192,14 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     selectKeyframe: (f) => {
       pause();
       selected = f;
+      picked = "fix";
       seek(f);
       renderSide();
+    },
+    selectOverlay: (overlayId, f) => {
+      pause();
+      seek(f);
+      textPanel.select(overlayId, false);
     },
   });
   const timelineWrap = h(
@@ -201,6 +214,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
         h("span", { class: "legend-kept" }, "Kept"),
         h("span", { class: "legend-cut" }, "Cut out"),
         h("span", { class: "legend-fix" }, "Your fixes"),
+        h("span", { class: "legend-text" }, "Text"),
         h("span", { class: "legend-curve" }, "Camera left/right"),
       ),
       h("label", { class: "check small" }, skipBox, "Skip cut parts when playing"),
@@ -219,6 +233,19 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   );
 
   // Sidebar.
+  const textPanel = new TextPanel(store, {
+    frameCount: n,
+    fps,
+    playhead: () => frame,
+    goTo: (f) => {
+      pause();
+      seek(f);
+    },
+    selectionChanged: (textId) => {
+      if (textId) picked = "text";
+      requestDraw();
+    },
+  });
   const sliders = h("div", { class: "sliders" });
   const fixList = h("div", { class: "fix-list" });
   const trimInfo = h("div", { class: "trim-info" });
@@ -266,6 +293,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     ),
     h("section", { class: "side-section" }, h("h2", null, "Your fixes"), fixList),
     h("section", { class: "side-section" }, h("h2", null, "Trim"), trimInfo),
+    textPanel.el,
     h(
       "details",
       { class: "side-section shortcuts" },
@@ -278,7 +306,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
           ["← →", "1 frame back / forward"],
           ["Shift + ← →", "5 seconds back / forward"],
           ["K", "Add a fix with the current view"],
-          ["Delete", "Remove the selected fix"],
+          ["Delete", "Remove the selected fix or text"],
           ["Ctrl + Z", "Undo"],
           ["Ctrl + Y", "Redo"],
         ].map(([k, v]) => [h("dt", null, h("kbd", null, k)), h("dd", null, v)]),
@@ -490,9 +518,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       ovR.render();
       ovDirty = false;
     }
-    drawOverlay(pose);
+    drawPitchOverlay(pose);
+    drawText();
+    textPanel.playheadMoved(frame);
     updateBadge();
-    timeline.setModel({ frameCount: n, fps, frame, edits: store.edits, finalPath: store.finalPath, yawRange, selected, cutStart });
+    timeline.setModel({ frameCount: n, fps, frame, edits: store.edits, finalPath: store.finalPath, yawRange, selected, selectedText: textPanel.selected, cutStart });
     timeLabel.textContent = `${formatFrameTime(frame, fps)} / ${formatFrameTime(n, fps)}`;
   }
 
@@ -509,7 +539,24 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     return [g, w, hh];
   }
 
-  function drawOverlay(pose: Pose) {
+  /** The text boxes on screen at the frame shown, at the canvas's real pixel size. */
+  function drawText() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(textCanvas.clientWidth * dpr);
+    const hh = Math.round(textCanvas.clientHeight * dpr);
+    const shown = store.edits.overlays.filter((o) => o.text.trim() && shownFrame >= o.start && shownFrame < o.end);
+    // The hint would sit on top of text at the bottom.
+    hint.classList.toggle("hidden", hintDone || shown.length > 0);
+    const key = JSON.stringify([w, hh, shown]);
+    if (key === textShown) return;
+    textShown = key;
+    textCanvas.width = w; // also clears it
+    textCanvas.height = hh;
+    const g = textCanvas.getContext("2d");
+    if (g) for (const o of shown) drawOverlay(g, o, w, hh);
+  }
+
+  function drawPitchOverlay(pose: Pose) {
     const [g, w, hh] = sizeCanvas(ovOverlay);
     g.clearRect(0, 0, w, hh);
     const pts = frustumOutline(pose, rig, ASPECT, 12).map((p) => ovR.yawPitchToCanvas(p.yaw, p.pitch));
@@ -594,7 +641,8 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     store.recompute.flush();
     livePose = null;
     selected = f;
-    hint.classList.add("hidden");
+    picked = "fix";
+    hintDone = true;
     renderSide();
     requestDraw();
   }
@@ -795,6 +843,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
                     onClick: () => {
                       pause();
                       selected = k.frame;
+                      picked = "fix";
                       seek(k.frame);
                       renderSide();
                     },
@@ -848,6 +897,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       cuts.length ? button("Keep everything", () => store.change((e) => (e.segments = [{ start: 0, end: n }])), { variant: "ghost", class: "btn-small" }) : null,
     );
 
+    textPanel.render();
     undoBtn.disabled = !store.canUndo;
     redoBtn.disabled = !store.canRedo;
   }
@@ -986,7 +1036,10 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
         break;
       case "Delete":
       case "Backspace":
-        if (selected !== null) {
+        if (picked === "text" && textPanel.selected) {
+          e.preventDefault();
+          textPanel.deleteSelected();
+        } else if (selected !== null) {
           e.preventDefault();
           removeFix(selected);
         }

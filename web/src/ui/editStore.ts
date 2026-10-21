@@ -59,9 +59,10 @@ export class EditStore {
 
   /**
    * Change the edits with an undo point. Calls with the same `merge` key
-   * within a second share one undo point (slider drags).
+   * within a second share one undo point (slider drags, typing). Pass
+   * `moves = false` for changes that leave the camera path alone (text).
    */
-  change(fn: (e: Edits) => void, merge = ""): void {
+  change(fn: (e: Edits) => void, merge = "", moves = true): void {
     const now = performance.now();
     if (!merge || merge !== this.lastMerge.key || now - this.lastMerge.time > 1000) {
       this.undoStack.push(structuredClone(this.edits));
@@ -72,7 +73,7 @@ export class EditStore {
     const next = structuredClone(this.edits);
     fn(next);
     this.edits = next;
-    this.changed(true);
+    this.changed(moves);
   }
 
   /** Export settings: saved, but no undo point and no new path. */

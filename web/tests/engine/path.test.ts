@@ -49,6 +49,7 @@ describe("defaultEdits", () => {
       holdSeconds: 1,
       fadeSeconds: 1.5,
       joinSeconds: 4,
+      overlays: [],
       export: { width: 1920, height: 1080, quality: "balanced" },
     });
   });
@@ -70,6 +71,10 @@ describe("normalizeEdits", () => {
       holdSeconds: 0.5,
       fadeSeconds: 3,
       joinSeconds: 2,
+      overlays: [
+        { id: "a", kind: "title", text: "Reds vs Blues\nSat 25 Oct 2026", position: "top-center", size: "medium", start: 0, end: 1000 },
+        { id: "b", kind: "player", text: "#9 Sam", position: "bottom-right", size: "large", start: 120, end: 270 },
+      ],
       export: { width: 3840, height: 2160, quality: "high" },
     });
     expect(normalizeEdits(JSON.parse(JSON.stringify(good)), n)).toEqual(good);

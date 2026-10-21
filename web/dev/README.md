@@ -20,7 +20,9 @@ with a warning instead, like the real helper, DESIGN.md 4.7); "slow" makes its
 jobs 10 times slower. Like the real helper it refuses to delete a match while
 a video is still arriving, and it supports `POST /api/projects/:id/swap`.
 `GET /__mock/state` shows what the editor sent (edits, last export with a
-summary of the camera path, "Show in folder" calls, swaps); `POST /__mock/reset`
+summary of the camera path and of the text PNGs, "Show in folder" calls,
+swaps); like the real helper it checks the text PNGs (size, times) and adds
+an "Adding text" step to exports with text. `POST /__mock/reset`
 (`?seed` for the example match) forgets everything.
 
 To use another helper address, open the editor with `?helper=http://127.0.0.1:PORT`

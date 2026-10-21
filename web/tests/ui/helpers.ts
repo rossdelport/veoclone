@@ -28,13 +28,25 @@ export interface MockState {
     files: { left?: { name: string }; right?: { name: string } };
     exports: { id: string; status: string }[];
   }[];
-  edits: Record<string, { segments: { start: number; end: number }[]; keyframes: { frame: number }[]; zoom: number; smoothSeconds: number; export: { width: number } }>;
+  edits: Record<
+    string,
+    {
+      segments: { start: number; end: number }[];
+      keyframes: { frame: number }[];
+      zoom: number;
+      smoothSeconds: number;
+      overlays: { id: string; kind: string; text: string; position: string; size: string; start: number; end: number }[];
+      export: { width: number };
+    }
+  >;
   lastExport: null | {
     segments: { startFrame: number; endFrame: number }[];
     width: number;
     height: number;
     quality: string;
     path: { frames: number; finite: boolean; first: { yaw: number; pitch: number; fov: number } };
+    /** Size of each text PNG and when it shows (seconds of the finished video). */
+    overlays: { width: number; height: number; bytes: number; ranges: [number, number][] }[];
   };
   editsPuts: number;
   openFolder: { project: string; export: string | null }[];

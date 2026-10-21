@@ -35,7 +35,10 @@ use crate::store::{
 };
 
 const EDITS_LIMIT: usize = 10 * 1024 * 1024;
-const EXPORT_LIMIT: usize = 64 * 1024 * 1024;
+/// The camera path of a long match, plus the most text boxes allowed
+/// (base64 makes them a third bigger).
+const EXPORT_LIMIT: usize =
+    64 * 1024 * 1024 + crate::export::MAX_OVERLAYS * crate::export::MAX_OVERLAY_PNG / 3 * 4;
 const JSON_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]

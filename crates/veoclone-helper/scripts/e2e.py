@@ -2,10 +2,11 @@
 """End-to-end test of a running-from-scratch veoclone-helper over HTTP.
 
 Starts the helper binary, uploads two videos, processes them, checks the
-editor data, exports two segments, and exercises cancel, delete, restart
-recovery, re-runs that keep the earlier result, lens choices, swapping left
-and right, the single-instance check, CORS and the Host check. Python 3
-standard library only; needs ffprobe on PATH.
+editor data, exports two segments (also with text boxes burned in, checked
+frame by frame), and exercises cancel, delete, restart recovery, re-runs
+that keep the earlier result, lens choices, swapping left and right, the
+single-instance check, CORS and the Host check. Python 3 standard library
+only; needs ffmpeg and ffprobe on PATH.
 
 Usage:
   e2e.py --helper target/release/veoclone-helper --left L.mp4 --right R.mp4 \
@@ -26,6 +27,7 @@ import struct
 import subprocess
 import sys
 import time
+import zlib
 
 PORT = 47871
 HOST = f"127.0.0.1:{PORT}"
@@ -312,6 +314,8 @@ def run(args, helper):
     status, p = request("DELETE", f"/api/projects/{pid}/exports/{ex2['id']}")
     check(status == 200 and len(p["exports"]) == 1, "cancelled export deleted")
 
+    text_checks(args, pid, body, out, kept)
+
     # A second copy of VeoClone (double-clicked again) must leave the running
     # one alone, also on another port with the same folder.
     folder = os.path.join(args.data, "projects", pid)
@@ -394,6 +398,162 @@ def run(args, helper):
 
 def data_path(poses):
     return b"".join(struct.pack("<3f", *p) for p in poses)
+
+
+def png_rgba(width, height, boxes):
+    """A see-through PNG with boxes [(x, y, w, h, (r, g, b, a))], later ones on top."""
+    rows = []
+    for y in range(height):
+        row = bytearray(width * 4)
+        for bx, by, bw, bh, rgba in boxes:
+            if by <= y < by + bh:
+                row[bx * 4:(bx + bw) * 4] = bytes(rgba) * bw
+        rows.append(b"\0" + bytes(row))
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
+def patches(video, x, y, size=16):
+    """Average colour of a size x size patch at (x, y) in every frame."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", video, "-vf",
+                          f"crop={size}:{size}:{x}:{y},scale=1:1:flags=area",
+                          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                         capture_output=True, check=True).stdout
+    return [tuple(raw[i:i + 3]) for i in range(0, len(raw), 3)]
+
+
+def luma(c):
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def text_checks(args, pid, body, plain_video, kept):
+    """Text boxes (DESIGN.md 5.4): refused when wrong, burned in exactly
+    during their times, temp files cleaned up, cancel honoured."""
+    w, h = body["width"], body["height"]
+    b64 = lambda data: base64.b64encode(data).decode()
+    # Like the editor's: a see-through dark box with light "text" (an opaque
+    # magenta stripe, a colour the footage never has), top left.
+    title = png_rgba(w, h, [(40, 30, 360, 90, (8, 12, 18, 184)), (70, 60, 300, 30, (255, 0, 255, 255))])
+    # An opaque cyan box bottom right, shown twice.
+    tag = png_rgba(w, h, [(w - 260, h - 110, 220, 70, (0, 255, 255, 255))])
+    fps = 30
+    overlays = [{"pngBase64": b64(title), "ranges": [[2.0, 5.0]]},           # frames 60..149
+                {"pngBase64": b64(tag), "ranges": [[0.0, 1.0], [8.0, 9.5]]}]  # 0..29, 240..284
+
+    # Refused in plain words, and nothing is queued.
+    _, before = request("GET", f"/api/projects/{pid}")
+    bad = [
+        ("a picture of the wrong size", [{"pngBase64": b64(png_rgba(640, 360, [])), "ranges": [[0, 1]]}],
+         "different video size"),
+        ("something that is not a PNG", [{"pngBase64": b64(b"GIF89a" + bytes(40)), "ranges": [[0, 1]]}],
+         "could not be read"),
+        ("times out of order", [{"pngBase64": b64(tag), "ranges": [[3, 4], [1, 2]]}], "not valid"),
+        ("a negative time", [{"pngBase64": b64(tag), "ranges": [[-1, 2]]}], "not valid"),
+        ("an end before the start", [{"pngBase64": b64(tag), "ranges": [[2, 1]]}], "not valid"),
+        ("NaN (sent as null)", [{"pngBase64": b64(tag), "ranges": [[None, 2]]}], "not valid"),
+        ("51 texts", [{"pngBase64": b64(tag), "ranges": [[0, 1]]}] * 51, "at most 50"),
+    ]
+    for what, ov, words in bad:
+        status, res = request("POST", f"/api/projects/{pid}/exports", {**body, "overlays": ov})
+        check(status == 400 and words in res.get("error", ""),
+              f"refused {what}: {status} {res.get('error')!r}")
+    _, after = request("GET", f"/api/projects/{pid}")
+    check(len(after["exports"]) == len(before["exports"]), "nothing queued by refused requests")
+
+    # Export with two text boxes.
+    seen = set()
+    status, ex = request("POST", f"/api/projects/{pid}/exports", {**body, "overlays": overlays})
+    check(status == 201, f"export with text queued {ex}")
+    t0 = time.time()
+    progress = []
+
+    def done(p):
+        e = [e for e in p["exports"] if e["id"] == ex["id"]][0]
+        progress.append(e["progress"])
+        return e["status"] in ("done", "failed", "cancelled")
+
+    p = wait_for(pid, done, seen=seen)
+    ex = [e for e in p["exports"] if e["id"] == ex["id"]][0]
+    log(f"export with text took {time.time() - t0:.0f} s: {ex}")
+    check(ex["status"] == "done", f"export with text done ({ex.get('error')})")
+    check({("ready", "export"), ("ready", "overlay")} <= seen,
+          f"steps include Adding text: {sorted(seen, key=str)}")
+    check(all(a <= b + 1e-9 for a, b in zip(progress, progress[1:])),
+          "export progress only moves forward")
+    folder = os.path.join(args.data, "projects", pid, "exports", ex["id"])
+    check(os.listdir(folder) == [ex["fileName"]], f"only the video is left: {os.listdir(folder)}")
+
+    out = os.path.join(args.work, "export-text.mp4")
+    status, _, video = request("GET", f"/api/projects/{pid}/exports/{ex['id']}/file", raw=True)
+    open(out, "wb").write(video)
+    v = ffprobe(out, "stream=width,height,nb_read_packets,codec_name")["streams"][0]
+    a = ffprobe(out, "stream=codec_name", stream="a:0")["streams"]
+    dur = float(ffprobe(out, "format=duration")["format"]["duration"])
+    check(v["width"] == w and v["height"] == h and v["codec_name"] == "h264"
+          and int(v["nb_read_packets"]) == kept and abs(dur - kept / fps) < 0.1 and len(a) == 1,
+          f"export with text: {v}, {dur:.3f} s, audio {a}")
+    check(0 <= video.find(b"moov") < video.find(b"mdat"), "export with text is faststart")
+
+    # Frame by frame against the same export without text.
+    plain = {k: patches(plain_video, *xy) for k, xy in
+             {"stripe": (210, 67), "box": (330, 90), "tag": (w - 160, h - 85), "free": (w // 2, h // 2)}.items()}
+    text = {k: patches(out, *xy) for k, xy in
+            {"stripe": (210, 67), "box": (330, 90), "tag": (w - 160, h - 85), "free": (w // 2, h // 2)}.items()}
+    check(all(len(x) == kept for x in list(plain.values()) + list(text.values())), "patches of every frame")
+    magenta = lambda c: c[0] > 200 and c[1] < 80 and c[2] > 200
+    cyan = lambda c: c[0] < 80 and c[1] > 200 and c[2] > 200
+    wrong = []
+    title_on = range(60, 150)
+    tag_on = list(range(0, 30)) + list(range(240, 285))
+    for k in range(kept):
+        darker = luma(plain["box"][k]) - luma(text["box"][k])
+        if k in title_on:
+            ok = magenta(text["stripe"][k]) and darker > 0.5 * luma(plain["box"][k]) - 12
+        else:
+            ok = not magenta(text["stripe"][k]) and abs(darker) < 15
+        if k in tag_on:
+            ok = ok and cyan(text["tag"][k])
+        else:
+            ok = ok and not cyan(text["tag"][k]) and abs(luma(plain["tag"][k]) - luma(text["tag"][k])) < 15
+        ok = ok and abs(luma(plain["free"][k]) - luma(text["free"][k])) < 15
+        if not ok:
+            wrong.append((k, text["stripe"][k], plain["box"][k], text["box"][k], text["tag"][k]))
+    check(not wrong, f"text shows on exactly frames 60-149 (title) and 0-29, 240-284 (tag) of {kept}; "
+          f"wrong: {wrong[:5]}")
+    log(f"  title frame 59/60/149/150 stripe: {[text['stripe'][k] for k in (59, 60, 149, 150)]}; "
+        f"box luma plain/text at 100: {luma(plain['box'][100]):.0f}/{luma(text['box'][100]):.0f}")
+
+    # Stop while adding text: cancelled, nothing left behind.
+    status, ex3 = request("POST", f"/api/projects/{pid}/exports",
+                          {**body, "quality": "high", "overlays": overlays})
+    check(status == 201, "second export with text queued")
+    deadline = time.time() + 1800
+    while time.time() < deadline:
+        _, p = request("GET", f"/api/projects/{pid}")
+        job = p.get("job") or {}
+        if job.get("step") == "overlay" and (job.get("framesDone") or 0) > 0:
+            break
+        time.sleep(0.05)
+    e3 = [e for e in p["exports"] if e["id"] == ex3["id"]][0]
+    check(job.get("step") == "overlay" and job.get("message") == "Adding text" and e3["progress"] >= 0.6,
+          f"caught it adding text: {job.get('framesDone')}/{job.get('framesTotal')} frames, "
+          f"export at {e3['progress']:.2f}")
+    request("POST", f"/api/projects/{pid}/cancel")
+    p = wait_for(pid, lambda p: p["job"] is None)
+    e3 = [e for e in p["exports"] if e["id"] == ex3["id"]][0]
+    folder3 = os.path.join(args.data, "projects", pid, "exports", ex3["id"])
+    check(e3["status"] == "cancelled" and not os.path.exists(folder3),
+          "stopped while adding text, its folder removed")
+
+    for e in (ex, e3):
+        status, p = request("DELETE", f"/api/projects/{pid}/exports/{e['id']}")
+    check(status == 200 and len(p["exports"]) == 1, "text exports deleted")
 
 
 if __name__ == "__main__":

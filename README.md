@@ -173,6 +173,22 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
   seconds, **K** add a fix with the current view, **Ctrl + Z** undo.
 - Your changes are saved by themselves.
 
+**Adding text** (team names, the date, a player's name, anything):
+
+- Under **Text** on the right, click **Match title**, **Player name** or
+  **Text**. A match title ("Home team vs Away team" and today's date) is
+  shown at the top for the whole video; a player name or text is shown for
+  5 seconds from the playhead.
+- Type your words in the box. Press **Enter** for a new line. The camera
+  view shows the text straight away.
+- Pick where it goes on the picture (**Place**) and how big it is (**Size**).
+- To change when it is shown, move the playhead and click **Show from here**
+  or **Hide from here**. The purple bars on the timeline show when each text
+  is on screen; click a bar to change that text.
+- Click the bin next to a text to delete it (**Undo** brings it back).
+- Your text is added to the video when you export it, looking just like it
+  does in the camera view.
+
 **Exporting:**
 
 1. Click **Export**.

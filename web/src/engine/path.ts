@@ -1,6 +1,7 @@
 // The final camera path (DESIGN.md section 5.3).
 import { clampInto, maxFovOf } from "./clamp";
-import type { CalibInfo, Edits, ExportQuality, Keyframe, Pose, Segment } from "./types";
+import { MAX_OVERLAY_TEXT, MAX_OVERLAYS, OVERLAY_KINDS, OVERLAY_POSITIONS, OVERLAY_SIZES } from "./overlay";
+import type { CalibInfo, Edits, ExportQuality, Keyframe, Overlay, Pose, Segment } from "./types";
 
 const EXPORT_SIZES: [number, number][] = [
   [1920, 1080],
@@ -20,6 +21,7 @@ export function defaultEdits(frameCount: number): Edits {
     holdSeconds: 1.0,
     fadeSeconds: 1.5,
     joinSeconds: 4.0,
+    overlays: [],
     export: { width: 1920, height: 1080, quality: "balanced" },
   };
 }
@@ -83,6 +85,7 @@ export function normalizeEdits(raw: unknown, frameCount: number): Edits {
   out.holdSeconds = num(raw.holdSeconds, out.holdSeconds, 0, 60);
   out.fadeSeconds = num(raw.fadeSeconds, out.fadeSeconds, 0, 60);
   out.joinSeconds = num(raw.joinSeconds, out.joinSeconds, 0, 60);
+  out.overlays = normalizeOverlays(raw.overlays, n);
 
   if (isRecord(raw.export)) {
     const { width, height, quality } = raw.export;
@@ -91,6 +94,37 @@ export function normalizeEdits(raw: unknown, frameCount: number): Edits {
       out.export.height = height as number;
     }
     if (QUALITIES.includes(quality as ExportQuality)) out.export.quality = quality as ExportQuality;
+  }
+  return out;
+}
+
+/**
+ * Text boxes that can be used: an id (unique), text (cut to 200 characters)
+ * and whole frames inside [0, n] with end > start. Unknown kinds, places
+ * and sizes fall back to the defaults. At most 50 are kept.
+ */
+function normalizeOverlays(raw: unknown, n: number): Overlay[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Overlay[] = [];
+  const ids = new Set<string>();
+  for (const o of raw) {
+    if (out.length >= MAX_OVERLAYS) break;
+    if (!isRecord(o) || typeof o.id !== "string" || !o.id || ids.has(o.id) || typeof o.text !== "string") continue;
+    if (!finite(o.start) || !finite(o.end)) continue;
+    const start = Math.min(Math.max(Math.round(o.start), 0), n);
+    const end = Math.min(Math.max(Math.round(o.end), 0), n);
+    if (end <= start) continue;
+    ids.add(o.id);
+    const pick = <T>(list: T[], v: unknown, fallback: T): T => (list.includes(v as T) ? (v as T) : fallback);
+    out.push({
+      id: o.id,
+      kind: pick(OVERLAY_KINDS, o.kind, "text"),
+      text: o.text.slice(0, MAX_OVERLAY_TEXT),
+      position: pick(OVERLAY_POSITIONS, o.position, "bottom-center"),
+      size: pick(OVERLAY_SIZES, o.size, "medium"),
+      start,
+      end,
+    });
   }
   return out;
 }
@@ -247,6 +281,11 @@ export function encodePathBase64(path: Float32Array): string {
   const bytes = new Uint8Array(path.length * 4);
   const view = new DataView(bytes.buffer);
   for (let i = 0; i < path.length; i++) view.setFloat32(i * 4, path[i], true);
+  return bytesToBase64(bytes);
+}
+
+/** Standard base64 of some bytes. */
+export function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.length; i += CHUNK) {

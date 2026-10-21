@@ -82,6 +82,31 @@ export interface Segment {
 
 export type ExportQuality = "fast" | "balanced" | "high";
 
+export type OverlayKind = "title" | "player" | "text";
+export type OverlayPosition =
+  | "top-left"
+  | "top-center"
+  | "top-right"
+  | "center"
+  | "bottom-left"
+  | "bottom-center"
+  | "bottom-right";
+export type OverlaySize = "small" | "medium" | "large";
+
+/** A text box shown on the video (DESIGN.md 5.4). */
+export interface Overlay {
+  id: string;
+  /** Only affects the defaults when it is added. */
+  kind: OverlayKind;
+  /** May contain line breaks, at most 200 characters. */
+  text: string;
+  position: OverlayPosition;
+  size: OverlaySize;
+  /** Synced frames, end exclusive. */
+  start: number;
+  end: number;
+}
+
 export interface Edits {
   version: 1;
   segments: Segment[];
@@ -96,6 +121,8 @@ export interface Edits {
   fadeSeconds: number;
   /** Keyframes closer than this are joined into one move. */
   joinSeconds: number;
+  /** Text boxes, drawn in this order (later ones on top). */
+  overlays: Overlay[];
   export: { width: number; height: number; quality: ExportQuality };
 }
 

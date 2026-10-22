@@ -385,6 +385,54 @@ test("change phone or lens from the editor: two choices, then everything is proc
   await expect(page).toHaveURL(new RegExp(`#/edit/${id}$`), { timeout: 30_000 });
 });
 
+test("two different iPhones: a phone and lens for each, also when changing them later", async ({ page }) => {
+  await resetMock();
+  await open(page, "/new");
+  await page.getByLabel("Name of the match").fill("Two different phones");
+  await page.getByTestId("file-left").setInputFiles(path.join(FIXTURES, "left-small.mp4"));
+  await page.getByTestId("file-right").setInputFiles(path.join(FIXTURES, "right-small.mp4"));
+  await expect(page.getByLabel("Which iPhone?")).toBeEnabled();
+  // One choice for both phones unless the box is ticked.
+  const differ = page.getByLabel("The two phones are different models");
+  await expect(differ).not.toBeChecked();
+  await expect(page.getByRole("group", { name: "Right phone" })).toBeHidden();
+  await expect(page.locator(".phones-picker").getByRole("heading", { name: "Left phone" })).toBeHidden();
+  await page.getByLabel("Which iPhone?").selectOption("iPhone 13 Pro Max");
+  await differ.check();
+  const left = page.getByRole("group", { name: "Left phone" });
+  const right = page.getByRole("group", { name: "Right phone" });
+  await expect(left.getByRole("heading", { name: "Left phone" })).toBeVisible();
+  await expect(right.getByRole("heading", { name: "Right phone" })).toBeVisible();
+  await expect(left.getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max");
+  await expect(right.getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max"); // starts as the left one
+  await right.getByLabel("Which iPhone?").selectOption("iPhone 11");
+  await expect(left.getByRole("radio", { name: /Ultra wide/ })).toBeChecked();
+  await expect(right.getByRole("radio", { name: /Ultra wide/ })).toBeChecked();
+  await expect(left.getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max");
+  await shot(page, "16-two-phones");
+  await page.getByRole("button", { name: "Start" }).click();
+  await expect(page).toHaveURL(/#\/project\/\w+/);
+  const id = (await mockState()).projects[0].id;
+  expect((await mockState()).projects[0]).toMatchObject({ lensId: "iphone-13-pro-max:ultra", rightLensId: "iphone-11:ultra" });
+  await expect(page.locator(".facts")).toContainText("Left phone: iPhone 13 Pro Max · Ultra wide (0.5×); right phone: iPhone 11 · Ultra wide (0.5×)", { timeout: 30_000 });
+
+  // "Change phone or lens" shows both phones; one phone for both again.
+  await expect(page).toHaveURL(new RegExp(`#/edit/${id}$`), { timeout: 10_000 });
+  await page.getByRole("link", { name: "Change phone or lens" }).click();
+  const dialog = page.getByRole("dialog", { name: "Change phone or lens" });
+  await expect(dialog.getByLabel("The two phones are different models")).toBeChecked();
+  await expect(dialog.getByRole("group", { name: "Left phone" }).getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max");
+  await expect(dialog.getByRole("group", { name: "Right phone" }).getByLabel("Which iPhone?")).toHaveValue("iPhone 11");
+  await shot(page, "17-change-two-phones");
+  await dialog.getByLabel("The two phones are different models").uncheck();
+  await expect(dialog.getByRole("group", { name: "Right phone" })).toBeHidden();
+  await expect(dialog.getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max");
+  await dialog.getByRole("button", { name: "Process again" }).click();
+  await expect(page).toHaveURL(new RegExp(`#/project/${id}$`));
+  expect((await mockState()).projects[0]).toMatchObject({ lensId: "iphone-13-pro-max:ultra", rightLensId: null });
+  await expect(page.locator(".facts dd").filter({ hasText: "Ultra wide" })).toHaveText("iPhone 13 Pro Max · Ultra wide (0.5×)", { timeout: 30_000 });
+});
+
 test("a re-run that fails keeps the match ready, and the editor still opens", async ({ page }) => {
   await resetMock(true);
   const id = (await mockState()).projects[0].id;

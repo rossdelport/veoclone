@@ -1,23 +1,31 @@
-//! The processing pipeline behind `POST /process`: check the files, line up
+//! The processing pipeline behind `POST /process`: check the files (and make
+//! matching copies when the phones filmed in different formats), line up
 //! and calibrate the cameras, make the preview video, run AI tracking.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
 use reco_calibrate::types::{CalibrationProgress, CalibrationStep};
 use reco_calibrate::video::{CalibrateVideosError, CalibrateVideosOptions, calibrate_videos};
 use reco_core::calibration::MatchCalibration;
+use serde::{Deserialize, Serialize};
 
 use crate::ai::{PoseSink, encode_path, fill_path};
 use crate::calib::{BLEND_WIDTH, LensChoice, calib_info, choose_lens};
 use crate::jobs::{Context, JobError, Progress, check_free_space};
-use crate::media::{ProxyPlan, RunError, check_pair, make_proxy, probe, tile_size};
+use crate::media::{
+    Conversion, MatchJob, MatchPlan, ProxyPlan, RunError, WASHED_OUT, check_pair, has_filter,
+    make_matching_copy, make_proxy, matching_warning, plan_matching, probe, tile_size,
+};
 use crate::store::{
-    CalibSummary, Fps, ProbeInfo, ProjectMeta, Status, Step, new_id, original_file, write_atomic,
+    CalibSummary, DERIVED_FILES, Fps, ProbeInfo, ProjectMeta, Status, Step, matched_file,
+    matched_record, new_id, original_file, remove_matched, working_file, write_atomic,
 };
 
 const STEPS: u32 = 4;
+const SIDES: [&str; 2] = ["left", "right"];
 
 /// When the two views cannot be lined up, the most common cause is that
 /// the left and right videos were added the wrong way round.
@@ -25,6 +33,9 @@ const NOT_LINED_UP: &str = "We couldn't line up the two videos. Maybe the left a
                             are the wrong way round: click “Swap left and right and try \
                             again”. Otherwise make sure both phones film the same pitch with \
                             some overlap in the middle, and try again.";
+
+const NO_FFMPEG: &str =
+    "VeoClone's video tools (ffmpeg) are missing. Please download VeoClone again.";
 
 const DAMAGED: &str = "One of the files may be damaged: copy the videos from the phones again, \
                        add them to this match and press Start.";
@@ -64,7 +75,8 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     let mut progress = Progress::new(store, id, None, STEPS);
     let mut warnings: Vec<String> = Vec::new();
 
-    // 1. Check the files.
+    // 1. Check the files, and make matching copies when the phones filmed
+    // in different formats (DESIGN.md 4.2).
     progress.step(Step::Probe, 0, "Checking the video files");
     let left = original_file(&dir, "left");
     let right = original_file(&dir, "right");
@@ -76,7 +88,7 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     };
     if ctx.tools.ffmpeg.is_none() || ctx.tools.ffprobe.is_none() {
         return Err(JobError::failed(
-            "VeoClone's video tools (ffmpeg) are missing. Please download VeoClone again.",
+            NO_FFMPEG,
             "ffmpeg/ffprobe not found next to the helper or on PATH",
         ));
     }
@@ -91,7 +103,48 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
             f.probe = Some(rp.clone());
         }
     });
-    warnings.extend(check_pair(&lp, &rp).map_err(|msg| JobError::failed(msg, "file check"))?);
+    let plan = plan_matching(&lp, &rp).map_err(|msg| JobError::failed(msg, "file check"))?;
+    // Before the long work, so a broken AI setup shows straight away.
+    progress.fraction(0.6, Some("Getting the AI ready"));
+    let provider = crate::ai::check(ctx.model.as_deref())
+        .map_err(|(msg, detail)| JobError::failed(msg, detail))?;
+    tracing::info!("AI runs on: {provider}");
+    cancelled(cancel)?;
+    let [left_copy, right_copy] = match_videos(
+        ctx,
+        &dir,
+        &plan,
+        [(&left, &lp), (&right, &rp)],
+        &mut progress,
+        cancel,
+    )?;
+    let copies = [&left_copy, &right_copy];
+    warnings.extend(matching_warning(
+        &lp,
+        &rp,
+        copies.map(|c| c.as_ref().map(|c| c.tone_mapped)),
+    ));
+    if copies
+        .iter()
+        .any(|c| c.as_ref().is_some_and(|c| c.hdr_kept))
+    {
+        warnings.push(WASHED_OUT.into());
+    }
+    // From here on every step reads the working files.
+    let lp = left_copy.map_or(lp, |c| c.probe);
+    let rp = right_copy.map_or(rp, |c| c.probe);
+    let (Some(left), Some(right)) = (working_file(&dir, "left"), working_file(&dir, "right"))
+    else {
+        return Err(JobError::failed(
+            "Both videos are needed. Add the left and the right phone's video.",
+            "upload disappeared",
+        ));
+    };
+    for w in check_pair(&lp, &rp).map_err(|msg| JobError::failed(msg, "file check"))? {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
     // Reco's own frame-rate choice is what the stitcher will use.
     let fps = reco_io::adapters::FfmpegFileSource::frame_rate(&left)
         .ok()
@@ -101,17 +154,19 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
             den: d as u32,
         })
         .unwrap_or(lp.fps);
-    progress.fraction(0.6, Some("Getting the AI ready"));
-    let provider = crate::ai::check(ctx.model.as_deref())
-        .map_err(|(msg, detail)| JobError::failed(msg, detail))?;
-    tracing::info!("AI runs on: {provider}");
     set_warnings(ctx, id, &warnings);
     cancelled(cancel)?;
 
     // 2. Line up & calibrate (reused when the uploads and lens are unchanged).
     progress.step(Step::Calibrate, 1, "Lining up and calibrating the cameras");
     let match_path = dir.join("match.json");
-    let lens = choose_lens(meta.lens_id.as_deref(), lp.width, lp.height);
+    // One lens per phone, each scaled to its own video.
+    let left_lens = choose_lens(meta.lens_id.as_deref(), lp.width, lp.height);
+    let right_lens = choose_lens(
+        meta.right_lens_id.as_deref().or(meta.lens_id.as_deref()),
+        rp.width,
+        rp.height,
+    );
     let summary = match (&meta.calibration, MatchCalibration::from_file(&match_path)) {
         (Some(summary), Ok(_)) => {
             tracing::info!("Using the earlier calibration");
@@ -123,12 +178,19 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
             for f in ["proxy.mp4", "calib.json", "ai_path.bin"] {
                 let _ = std::fs::remove_file(dir.join(f));
             }
-            tracing::info!("Lens: {}", lens.name);
+            for (side, lens) in [("Left", &left_lens), ("Right", &right_lens)] {
+                tracing::info!(
+                    "{side} lens: {} (fx {:.1}, k1 {:.4})",
+                    lens.name,
+                    lens.params.fx,
+                    lens.params.d[0]
+                );
+            }
             calibrate(
                 &left,
                 &right,
                 &lp,
-                &lens,
+                [&left_lens, &right_lens],
                 fps,
                 &match_path,
                 &progress,
@@ -144,7 +206,14 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
                 .into(),
         );
     }
-    warnings.extend(lens.warning);
+    for w in [left_lens.warning, right_lens.warning]
+        .into_iter()
+        .flatten()
+    {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
     let frame_count =
         synced_frame_count(lp.frame_count, rp.frame_count, summary.sync_offset_frames);
     if frame_count < 2 {
@@ -260,6 +329,211 @@ fn set_warnings(ctx: &Context, id: &str, warnings: &[String]) {
     ctx.store.update(id, |m| m.warnings = warnings.to_vec());
 }
 
+/// One side's matching copy, made now or on an earlier run.
+struct MatchedCopy {
+    probe: ProbeInfo,
+    /// Its HDR colours were changed to normal colours.
+    tone_mapped: bool,
+    /// HDR video copied with its colours as they are (no `zscale`).
+    hdr_kept: bool,
+}
+
+/// What a matching copy was made from (`matched-<side>.json`). The copy is
+/// used again only while the upload and the plan are still the same.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MatchedRecord {
+    source_bytes: u64,
+    /// Last change of the upload, in milliseconds since 1970.
+    source_modified: u64,
+    conversion: Conversion,
+    tone_mapped: bool,
+}
+
+/// Size and last change of a file, to notice a different upload.
+fn file_stamp(path: &Path) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let modified = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((m.len(), modified.as_millis() as u64))
+}
+
+/// The earlier matching copy of `side`, if it was made from this upload
+/// with this plan and can still be read.
+fn reusable_copy(
+    ctx: &Context,
+    dir: &Path,
+    side: &str,
+    conversion: &Conversion,
+    source: &Path,
+) -> Option<MatchedCopy> {
+    let (bytes, modified) = file_stamp(source)?;
+    let record: MatchedRecord =
+        serde_json::from_slice(&std::fs::read(matched_record(dir, side)).ok()?).ok()?;
+    if (record.source_bytes, record.source_modified) != (bytes, modified)
+        || &record.conversion != conversion
+    {
+        return None;
+    }
+    let probe = probe(&ctx.tools, &matched_file(dir, side)).ok()?;
+    if (probe.width, probe.height) != (conversion.width, conversion.height) {
+        return None;
+    }
+    Some(MatchedCopy {
+        probe,
+        tone_mapped: record.tone_mapped,
+        hdr_kept: conversion.tone_map && !record.tone_mapped,
+    })
+}
+
+/// Make the matching copies `plan` asks for (DESIGN.md 4.2), reusing ones
+/// from an earlier run, and delete copies that are no longer needed.
+/// Returns the copy for each side (left, right).
+fn match_videos(
+    ctx: &Context,
+    dir: &Path,
+    plan: &MatchPlan,
+    originals: [(&Path, &ProbeInfo); 2],
+    progress: &mut Progress,
+    cancel: &AtomicBool,
+) -> Result<[Option<MatchedCopy>; 2], JobError> {
+    let mut copies = [None, None];
+    let mut todo = Vec::new();
+    let mut removed = false;
+    for (i, side) in SIDES.into_iter().enumerate() {
+        let Some(conversion) = plan.side(side) else {
+            removed |= remove_matched(dir, side);
+            continue;
+        };
+        let (source, source_probe) = originals[i];
+        if let Some(copy) = reusable_copy(ctx, dir, side, conversion, source) {
+            tracing::info!("Using the earlier matching copy of the {side} video");
+            copies[i] = Some(copy);
+            continue;
+        }
+        removed |= remove_matched(dir, side);
+        let fps = conversion.fps.unwrap_or(source_probe.fps);
+        let frames = match conversion.fps {
+            Some(f) => (source_probe.duration * f.as_f64()).round() as u64,
+            None => source_probe.frame_count,
+        };
+        todo.push((i, side, conversion, fps, frames));
+    }
+    if removed || !todo.is_empty() {
+        // Results made from other videos than the ones used from now on.
+        for f in DERIVED_FILES {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+    }
+    if todo.is_empty() {
+        return Ok(copies);
+    }
+
+    let ffmpeg = ctx
+        .tools
+        .ffmpeg()
+        .map_err(|e| JobError::failed(NO_FFMPEG, e))?;
+    let hdr = todo.iter().any(|(_, _, c, _, _)| c.tone_map);
+    let tone_map = hdr && has_filter(ffmpeg, "zscale");
+    if hdr && !tone_map {
+        tracing::warn!("This ffmpeg has no zscale filter: HDR colours are copied as they are");
+    }
+    // Room for the copies: high-quality H.264 takes up to about 0.2 bits
+    // per pixel, plus some to spare.
+    let need: u64 = todo
+        .iter()
+        .map(|(_, _, c, _, frames)| {
+            (c.width as f64 * c.height as f64 * *frames as f64 * 0.025) as u64
+        })
+        .sum();
+    check_free_space(dir, need + (1 << 30))?;
+
+    progress.step(Step::Probe, 0, "Making the two videos match…");
+    let total: u64 = todo.iter().map(|t| t.4).sum();
+    let mut done_before = 0;
+    for (i, side, conversion, fps, frames) in todo {
+        tracing::info!("Making a matching copy of the {side} video: {conversion:?}");
+        // A new name every time, like the preview.
+        let tmp = dir.join(format!("matched-{side}.{}.tmp.mp4", new_id()));
+        let job = MatchJob {
+            input: originals[i].0.to_path_buf(),
+            output: tmp.clone(),
+            conversion: conversion.clone(),
+            fps,
+        };
+        let made = make_matching_copy(&ctx.tools, &job, tone_map, cancel, |n| {
+            progress.frames(done_before + n.min(frames), total)
+        });
+        let saved = match made {
+            Ok(()) => std::fs::rename(&tmp, matched_file(dir, side)),
+            Err(RunError::Cancelled) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(JobError::Cancelled);
+            }
+            Err(RunError::Failed(e)) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(JobError::failed(
+                    format!("We couldn't make a matching copy of the {side} video."),
+                    e,
+                ));
+            }
+        };
+        saved.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            JobError::failed(
+                format!("We couldn't save the matching copy of the {side} video."),
+                e,
+            )
+        })?;
+        let copy_probe = probe(&ctx.tools, &matched_file(dir, side)).map_err(|e| {
+            remove_matched(dir, side);
+            JobError::failed(
+                format!("We couldn't read the matching copy of the {side} video."),
+                e,
+            )
+        })?;
+        // A copy that ends early would quietly cut the match short.
+        if stopped_early(copy_probe.frame_count, frames, fps) {
+            remove_matched(dir, side);
+            return Err(JobError::failed(
+                format!(
+                    "We could only read the first {} of the {side} video. {DAMAGED}",
+                    fps.clock(copy_probe.frame_count)
+                ),
+                format!(
+                    "matching copy has {} of {frames} frames",
+                    copy_probe.frame_count
+                ),
+            ));
+        }
+        let (source_bytes, source_modified) = file_stamp(originals[i].0).unwrap_or_default();
+        let record = MatchedRecord {
+            source_bytes,
+            source_modified,
+            conversion: conversion.clone(),
+            tone_mapped: tone_map && conversion.tone_map,
+        };
+        write_atomic(
+            &matched_record(dir, side),
+            &serde_json::to_vec_pretty(&record).expect("json"),
+        )
+        .map_err(|e| JobError::failed("We couldn't save the matching copy.", e))?;
+        tracing::info!(
+            "Matching copy of the {side} video: {}x{}, {} frames",
+            copy_probe.width,
+            copy_probe.height,
+            copy_probe.frame_count
+        );
+        copies[i] = Some(MatchedCopy {
+            probe: copy_probe,
+            tone_mapped: record.tone_mapped,
+            hdr_kept: conversion.tone_map && !record.tone_mapped,
+        });
+        done_before += frames;
+        cancelled(cancel)?;
+    }
+    Ok(copies)
+}
+
 fn calibration_message(step: CalibrationStep) -> (f64, &'static str) {
     match step {
         CalibrationStep::Probing | CalibrationStep::DetectingProfiles => {
@@ -274,12 +548,21 @@ fn calibration_message(step: CalibrationStep) -> (f64, &'static str) {
     }
 }
 
+/// The lens for the calibration summary: one name, or one per phone.
+fn lens_summary(left: &LensChoice, right: &LensChoice) -> String {
+    if left.name == right.name {
+        left.name.clone()
+    } else {
+        format!("Left phone: {}; right phone: {}", left.name, right.name)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn calibrate(
     left: &Path,
     right: &Path,
     probe: &ProbeInfo,
-    lens: &LensChoice,
+    [left_lens, right_lens]: [&LensChoice; 2],
     fps: Fps,
     match_path: &Path,
     progress: &Progress,
@@ -298,8 +581,8 @@ fn calibrate(
     // stock Camera app and would pick an action camera.
     let options = CalibrateVideosOptions {
         config: Some(config),
-        left_params: Some(lens.params.clone()),
-        right_params: Some(lens.params.clone()),
+        left_params: Some(left_lens.params.clone()),
+        right_params: Some(right_lens.params.clone()),
         ..Default::default()
     };
 
@@ -341,7 +624,7 @@ fn calibrate(
         confidence: result.confidence,
         sync_offset_frames: cal.sync_offset,
         sync_offset_seconds: cal.sync_offset as f64 / fps.as_f64(),
-        lens: lens.name.clone(),
+        lens: lens_summary(left_lens, right_lens),
     })
 }
 
@@ -517,6 +800,22 @@ mod tests {
         assert!(stopped_early(2399, 6000, fps));
         assert_eq!(fps.clock(2399), "1:19");
         assert_eq!(fps.clock(30 * 3725), "1:02:05");
+    }
+
+    #[test]
+    fn lens_per_phone_summary() {
+        let left = choose_lens(Some("iphone-13-pro-max:ultra"), 1920, 1080);
+        let right = choose_lens(Some("iphone-11:ultra"), 1920, 1080);
+        assert_ne!(left.params.fx, right.params.fx);
+        assert_eq!(
+            lens_summary(&left, &right),
+            "Left phone: iPhone 13 Pro Max · Ultra wide (0.5×); right phone: iPhone 11 · \
+             Ultra wide (0.5×)"
+        );
+        assert_eq!(
+            lens_summary(&left, &left),
+            "iPhone 13 Pro Max · Ultra wide (0.5×)"
+        );
     }
 
     #[test]

@@ -26,14 +26,17 @@ browser to the helper on the same PC.
 
 1. Home: list of matches (projects) with status, size, delete. A banner shows
    whether the helper is running; if not, explain how to start/download it.
-2. New match: name, "Which iPhone?" + "Which lens?" (4.6), camera style
+2. New match: name, "Which iPhone?" + "Which lens?" (4.6; once for both
+   phones, or once per phone with "The two phones are different models"
+   ticked), camera style
    (Broadcast / Action / Wide), and two drop boxes: **Left phone** and
    **Right phone**. Filming tips shown alongside. "Start" uploads both files
    to the helper (progress bar per file) and then starts processing.
 3. Processing: steps with progress bars and time remaining:
-   check files → line up & calibrate → make preview → AI ball tracking.
-   Cancel button. Warnings (HDR footage, generic lens, low calibration
-   confidence) are shown in plain words. On failure: plain-language error +
+   check files (and make matching copies, 4.2) → line up & calibrate →
+   make preview → AI ball tracking.
+   Cancel button. Warnings (HDR footage, videos in different formats,
+   generic lens, low calibration confidence) are shown in plain words. On failure: plain-language error +
    "Try again".
 4. Editor (opens when processing is done):
    - Big **camera view**: what the final video will look like at the playhead.
@@ -119,6 +122,8 @@ workflows stay but only run on manual dispatch (section 6).
 project.json      ProjectMeta (below), written atomically (tmp + rename)
 left.<ext>        uploaded original (extension kept)
 right.<ext>
+matched-<side>.mp4   matching copy, only when the two phones filmed in
+matched-<side>.json  different formats (4.2), and what it was made from
 match.json        Reco MatchCalibration
 calib.json        CalibInfo for the editor (section 4.4)
 proxy.mp4         stacked preview video (section 4.3)
@@ -151,19 +156,59 @@ log.txt           human-readable log of jobs for this project
 
 1. **Probe** both files (ffprobe JSON): width, height, fps, frame count
    (`nb_frames`, else duration×fps), duration, codec, pixel format,
-   `color_transfer`, rotation, audio presence. Fail with a clear message if:
-   resolutions differ, fps differ by > 0.5, rotation is 90/270 (portrait),
-   a file has no video. Warn if HDR (`color_transfer` = `arib-std-b67` or
-   `smpte2084`): "Colours may look washed out — turn off HDR Video on the
-   phones next time". Warn if fps > 31 ("60 fps works but 30 fps is
+   `color_transfer`, rotation, audio presence. Fail with a clear message if
+   rotation is 90/270 (portrait) or a file has no video. Warn if HDR
+   (`color_transfer` = `arib-std-b67` or `smpte2084`) and the colours were
+   not changed (below): "Colours may look washed out — turn off HDR Video on
+   the phones next time". Warn if fps > 31 ("60 fps works but 30 fps is
    recommended").
+
+   **Matching copies.** Reco needs both videos in the same size, frame rate
+   and pixel format (it takes size and format from the left probe; the
+   Windows D3D11 zero-copy path uses one staging format for both). Two
+   different iPhones often differ (e.g. 1920x1440 8-bit SDR and 1920x1080
+   10-bit HLG). `media::plan_matching` (pure, unit-tested) finds a mismatch
+   when the sizes differ, the fps differ by > 0.5 or one is 10-bit and the
+   other 8-bit. Then the reference is the video whose aspect is closest to
+   16:9 (tie: fewer pixels; tie: left). The other is centre-cropped to the
+   reference's aspect, scaled to its width x height, and made 8-bit `yuv420p`
+   H.264 BT.709; a 10-bit or HDR reference also gets an 8-bit SDR copy at
+   its own size. Both end up at the lower of the two frame rates (`fps`
+   filter only when the rates differ by > 0.5; dropping frames looks smooth,
+   doubling them judders). A video already in that format is left alone; identical
+   formats need no copies at all. HDR sources are tone-mapped
+   (`zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p`)
+   when `ffmpeg -filters` lists `zscale` (BtbN's build does), otherwise
+   only converted (with the washed-out warning). Encoder `h264_amf`
+   (`-quality quality -rc cqp -qp_i 16 -qp_p 18`) with `-hwaccel auto`,
+   else / on failure `libx264 -preset veryfast -crf 17` (sound as AAC then);
+   keyframe every 2 s; sound copied; `-fps_mode passthrough` so no frame is
+   dropped or doubled (Reco pairs by count). ffmpeg turns 180° videos
+   upright and writes no rotation, so Reco does not turn them again.
+   Written to a temp name, renamed to `matched-<side>.mp4`, with
+   `matched-<side>.json` (upload size + modified time + plan): reused while
+   those still match, otherwise made again (and everything derived from
+   the old copy is deleted). Removed when that side is uploaded again, on
+   swap, and when no longer needed. Runs inside step 1 with its own message
+   ("Making the two videos match…"), frame progress and time left, after a
+   free-disk check; cancel kills ffmpeg. Warning, e.g.: "The two phones
+   filmed in different formats (1920x1440 and 1920x1080 HDR), so VeoClone
+   made matching copies of both videos and changed the right video's HDR
+   colours to normal colours. Next time set both phones the same: Settings
+   › Camera › Record Video › 4K at 30 fps, and turn off HDR Video."
+   From here on every step and every export reads the **working file** per
+   side (`store::working_file`: the matching copy when there is one, else
+   the original) and its probe; `original_file` never returns a copy.
 2. **Calibrate** with `reco_calibrate::video::calibrate_videos`, GUI-like
    config: 4 frames, AKAZE detect y 0.05–0.95, skip_start = min(10 s, 10%
-   of duration). Lens: always the project's lens choice (4.6; `null` =
-   `generic:ultra`), loaded from `LensDatabase::embedded()`, scaled to the
-   file resolution the way reco-gui does (`fx *= w/p.width` …), and passed
-   as `left_params`/`right_params` (never Reco's auto-detect; warn when the
-   lens is a "Not sure" guess). Audio sync is automatic (needs ffmpeg). Save
+   of duration). Lens: always the project's lens choice per phone (4.6):
+   `left_params` from `lensId` (`null` = `generic:ultra`), `right_params`
+   from `rightLensId` (`null` = the same as `lensId`), each loaded from
+   `LensDatabase::embedded()` and scaled to that side's working file the
+   way reco-gui does (`fx *= w/p.width` …); never Reco's auto-detect. Warn
+   when a lens is a "Not sure" guess (once, also when both are). The
+   summary's `lens` names both phones when they differ ("Left phone: …;
+   right phone: …"). Audio sync is automatic (needs ffmpeg). Save
    `match.json` and check it loads before the preview step. Warn if
    confidence < 0.5 (mention swapped videos), if a file has no sound, or if
    a file's frame count and duration × fps differ by more than
@@ -223,8 +268,9 @@ Body (JSON):
   smoothed, keyframed and clamped) for every synced frame. The helper never
   re-implements the editing algorithm — the editor is the single source of
   truth, so preview == export.
-- For each segment: a `StitchJob::with_calibration` from the originals,
-  `start_time(startFrame/fps)`, `end_time(endFrame/fps)`, `force_cpu_decode()`
+- For each segment: a `StitchJob::with_calibration` from the working files
+  (4.2), `start_time(startFrame/fps)`, `end_time(endFrame/fps)`,
+  `force_cpu_decode()`
   (exact frame accounting and fast seeking for trims; the D3D11 zero-copy
   immediate path drops the first frame), lookahead 0, no AI model,
   `blend_width(0.15)`, resolution, `Quality`, h264, `Format::Mkv`, audio from
@@ -276,11 +322,11 @@ cap/clamp (the editor applies them).
 | `GET /api/health` | `{ app:"veoclone-helper", version, gpu:{name,backend}, ai:{available, provider, model}, ffmpeg:bool, dataDir, freeDiskBytes }` |
 | `GET /api/lenses` | Curated lens choices, see 4.6 |
 | `GET /api/projects` | `ProjectMeta[]` newest first |
-| `POST /api/projects` | body `{ name, lensId?, style }` → `ProjectMeta` |
+| `POST /api/projects` | body `{ name, lensId?, rightLensId?, style }` → `ProjectMeta` |
 | `GET /api/projects/:id` | `ProjectMeta` |
-| `PATCH /api/projects/:id` | `{ name?, lensId?, style? }` |
+| `PATCH /api/projects/:id` | `{ name?, lensId?, rightLensId?, style? }` |
 | `DELETE /api/projects/:id` | deletes the folder (refuse while a job runs on it) |
-| `PUT /api/projects/:id/files/:side` | side = `left`/`right`; raw body streamed to disk (write `*.part`, rename at end); header `X-Filename` (original name, for the extension); returns updated `ProjectMeta` |
+| `PUT /api/projects/:id/files/:side` | side = `left`/`right`; raw body streamed to disk (write `*.part`, rename at end); header `X-Filename` (original name, for the extension); deletes that side's matching copy; returns updated `ProjectMeta` |
 | `POST /api/projects/:id/process` | start/queue the pipeline (also used for "Try again" and "Re-run AI with a different style") |
 | `POST /api/projects/:id/cancel` | cancel the running/queued job of this project |
 | `GET /api/projects/:id/calibration` | `CalibInfo` |
@@ -291,14 +337,16 @@ cap/clamp (the editor applies them).
 | `GET /api/projects/:id/exports/:eid/file` | download (`Content-Disposition: attachment`, Range) |
 | `DELETE /api/projects/:id/exports/:eid` | delete an export |
 | `POST /api/projects/:id/open-folder` | open the project (or `?export=eid`) folder in Explorer/Finder |
-| `POST /api/projects/:id/swap` | swap the left and right videos (no re-upload); clears calibration, preview and AI path; status back to `uploaded` |
+| `POST /api/projects/:id/swap` | swap the left and right videos (no re-upload) and, when `rightLensId` is set, the two lens ids; clears calibration, preview, AI path and matching copies; status back to `uploaded` |
 
 `ProjectMeta`:
 
 ```ts
 {
   id: string; name: string; createdAt: string; updatedAt: string;
-  lensId: string | null; style: "broadcast" | "action" | "frame_all";
+  lensId: string | null;       // the left phone (and the right one unless rightLensId)
+  rightLensId: string | null;  // the right phone when it is another model; null = same as left
+  style: "broadcast" | "action" | "frame_all";
   status: "new" | "uploaded" | "queued" | "processing" | "ready" | "failed" | "cancelled";
   files: { left?: FileInfo; right?: FileInfo };  // FileInfo = { name, sizeBytes, probe?: {...} }
   job: null | { kind: "process" | "export"; exportId?: string;
@@ -319,13 +367,22 @@ cap/clamp (the editor applies them).
 `ExportMeta.error` is the plain-words message, then (after a newline) the
 technical detail. `lensId` is never null for new matches: `POST`/`PATCH`
 with no or a `null` lensId store `"generic:ultra"`; only the ids from
-`GET /api/lenses` are accepted. `swap` also works with only one video
+`GET /api/lenses` are accepted. `rightLensId` (missing in older
+`project.json` files: `null`) accepts those ids or `null`; changing either
+id clears `calibration` so the next `process` calibrates again. `swap` also works with only one video
 uploaded (it moves sides; status `new`) and refuses while busy (409).
 
 ### 4.6 Lens choices
 
 The raw lens database has ~160 crowd-sourced Apple entries with messy names.
 The user picks two simple things instead: **which iPhone** and **which lens**.
+Normally once for both phones (`lensId`). Ticking **"The two phones are
+different models"** (off by default; on when `rightLensId` is set) shows
+the choice twice, headed **Left phone** (`lensId`) and **Right phone**
+(`rightLensId`); unticking sends `rightLensId: null`. The same picker is
+used on the new match page, the match page before processing and the
+"Change phone or lens" dialog. Copy: "Two identical phones work best, but
+different iPhones are fine".
 
 `GET /api/lenses` → `LensOption[]`:
 
@@ -536,7 +593,11 @@ VeoClone/
 ## 7. Known limits (tell the user, don't hide)
 
 - HDR iPhone footage: Reco has no HDR handling → washed-out colours. Record
-  with HDR Video off.
+  with HDR Video off. (Only when the two videos differ in format does the
+  matching copy turn HDR into normal colours, 4.2.)
+- Phones filming in different formats cost an extra conversion in step 1
+  (about as long as decoding and encoding the video once) and disk space
+  for the copy; a 4:3 video loses a strip at the top and bottom.
 - One file per phone per project. If the phones were stopped at half-time,
   make two projects.
 - Audio sync needs the phones started within about 15 s of each other.

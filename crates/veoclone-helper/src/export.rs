@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::calib::BLEND_WIDTH;
 use crate::jobs::{Context, JobError, Progress, check_free_space};
 use crate::media::{OverlayPlan, RunError, Tools, add_overlays, concat, concat_list};
-use crate::store::{ExportStatus, Fps, Quality, Step, original_file};
+use crate::store::{ExportStatus, Fps, Quality, Step, working_file};
 
 /// A keep-range in synced frames, end exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -462,8 +462,9 @@ pub fn run(
         )
     };
     let fps = meta.fps.ok_or_else(|| not_ready("no fps"))?;
-    let left = original_file(&dir, "left").ok_or_else(|| not_ready("left file missing"))?;
-    let right = original_file(&dir, "right").ok_or_else(|| not_ready("right file missing"))?;
+    // The videos processing used: the matching copies, if there are any.
+    let left = working_file(&dir, "left").ok_or_else(|| not_ready("left file missing"))?;
+    let right = working_file(&dir, "right").ok_or_else(|| not_ready("right file missing"))?;
     let calibration = MatchCalibration::from_file(&dir.join("match.json"))
         .map_err(|e| not_ready(&e.to_string()))?;
     let out_dir = dir.join("exports").join(export_id);

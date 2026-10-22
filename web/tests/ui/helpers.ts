@@ -23,6 +23,7 @@ export interface MockState {
     name: string;
     status: string;
     lensId: string | null;
+    rightLensId?: string | null;
     style: string;
     warnings: string[];
     files: { left?: { name: string }; right?: { name: string } };

@@ -1,6 +1,7 @@
 //! Everything that shells out to the bundled `ffmpeg` / `ffprobe`: probing
-//! uploads, making the stacked preview proxy, joining export parts and
-//! adding the editor's text boxes.
+//! uploads, making matching copies of videos filmed in different formats,
+//! making the stacked preview proxy, joining export parts and adding the
+//! editor's text boxes.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::store::{Fps, ProbeInfo, Quality};
@@ -259,20 +261,40 @@ pub fn is_hdr(p: &ProbeInfo) -> bool {
     )
 }
 
-/// Check the two uploads can be stitched. Returns warnings, or the
-/// plain-language reason they cannot be used.
-pub fn check_pair(left: &ProbeInfo, right: &ProbeInfo) -> Result<Vec<String>, String> {
-    for (side, p) in [("left", left), ("right", right)] {
-        if p.width == 0 || p.height == 0 {
-            return Err(format!("The {side} file has no picture in it."));
-        }
-        if p.rotation == 90 || p.rotation == 270 {
-            return Err(format!(
-                "The {side} video was filmed upright (portrait). Hold both phones sideways \
-                 (landscape) when filming."
-            ));
-        }
+/// More than 8 bits per colour, like iPhone HDR video (`yuv420p10le`).
+pub fn is_10bit(p: &ProbeInfo) -> bool {
+    let f = p.pixel_format.as_str();
+    ["p10", "p12", "p14", "p16", "p010", "p016", "p210", "p410"]
+        .iter()
+        .any(|s| f.contains(s))
+        || ["10le", "10be", "12le", "12be"]
+            .iter()
+            .any(|s| f.ends_with(s))
+}
+
+/// Shown when HDR video is stitched with its colours as they are.
+pub const WASHED_OUT: &str =
+    "Colours may look washed out — turn off HDR Video on the phones next time.";
+
+/// A video Reco cannot use at all, in plain words.
+fn check_usable(side: &str, p: &ProbeInfo) -> Result<(), String> {
+    if p.width == 0 || p.height == 0 {
+        return Err(format!("The {side} file has no picture in it."));
     }
+    if p.rotation == 90 || p.rotation == 270 {
+        return Err(format!(
+            "The {side} video was filmed upright (portrait). Hold both phones sideways \
+             (landscape) when filming."
+        ));
+    }
+    Ok(())
+}
+
+/// Check the two videos (after any matching copies) can be stitched.
+/// Returns warnings, or the plain-language reason they cannot be used.
+pub fn check_pair(left: &ProbeInfo, right: &ProbeInfo) -> Result<Vec<String>, String> {
+    check_usable("left", left)?;
+    check_usable("right", right)?;
     if (left.width, left.height) != (right.width, right.height) {
         return Err(format!(
             "The two videos are different sizes ({}x{} and {}x{}). Film with both phones set \
@@ -290,9 +312,7 @@ pub fn check_pair(left: &ProbeInfo, right: &ProbeInfo) -> Result<Vec<String>, St
     }
     let mut warnings = Vec::new();
     if is_hdr(left) || is_hdr(right) {
-        warnings.push(
-            "Colours may look washed out — turn off HDR Video on the phones next time.".into(),
-        );
+        warnings.push(WASHED_OUT.into());
     }
     if left.fps.as_f64() > 31.0 {
         warnings.push("60 fps works but 30 fps is recommended.".into());
@@ -423,6 +443,316 @@ pub fn has_encoder(ffmpeg: &Path, name: &str) -> bool {
                 .any(|w| w == name)
         })
         .unwrap_or(false)
+}
+
+/// Filters compiled into this ffmpeg (`ffmpeg -filters`, e.g. `zscale`).
+pub fn has_filter(ffmpeg: &Path, name: &str) -> bool {
+    output(command(ffmpeg).args(["-hide_banner", "-filters"]))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == Some(name))
+        })
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Matching copies (DESIGN.md 4.2)
+// ---------------------------------------------------------------------------
+
+/// How one video is converted so that both videos have the same size, frame
+/// rate and pixel format, which Reco needs to stitch them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Conversion {
+    /// The centred part of the picture to keep before scaling, when its
+    /// shape differs from the other video's.
+    pub crop: Option<(u32, u32)>,
+    pub width: u32,
+    pub height: u32,
+    /// The other video's frame rate; `None` keeps every frame as it is.
+    pub fps: Option<Fps>,
+    /// HDR colours are changed to normal (SDR) colours.
+    pub tone_map: bool,
+}
+
+/// Which videos need a matching copy. Both `None`: use the uploads as they are.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MatchPlan {
+    pub left: Option<Conversion>,
+    pub right: Option<Conversion>,
+}
+
+impl MatchPlan {
+    pub fn side(&self, side: &str) -> Option<&Conversion> {
+        if side == "left" {
+            self.left.as_ref()
+        } else {
+            self.right.as_ref()
+        }
+    }
+}
+
+/// Frame rates closer than this pair up fine (Reco pairs frames by count).
+const SAME_FPS: f64 = 0.5;
+
+fn fps_differ(a: Fps, b: Fps) -> bool {
+    (a.as_f64() - b.as_f64()).abs() > SAME_FPS
+}
+
+/// Decide which videos need a matching copy. Reco takes the size and pixel
+/// format from the left video only, so the two must have the same size,
+/// frame rate (within half a frame per second) and bit depth. When they
+/// don't, the reference is the video whose shape is closest to 16:9 (then
+/// the one with fewer pixels, then the left one): the other is cropped to
+/// its shape and scaled to its size as 8-bit normal colours. Both end up at
+/// the lower of the two frame rates (dropping frames looks smooth, doubling
+/// them judders); a 10-bit or HDR reference gets an 8-bit normal-colour copy of
+/// its own size, so both decode the same way. Videos that already match
+/// need nothing. Errors are plain words.
+pub fn plan_matching(left: &ProbeInfo, right: &ProbeInfo) -> Result<MatchPlan, String> {
+    check_usable("left", left)?;
+    check_usable("right", right)?;
+    let differ = (left.width, left.height) != (right.width, right.height)
+        || fps_differ(left.fps, right.fps)
+        || is_10bit(left) != is_10bit(right);
+    if !differ {
+        return Ok(MatchPlan::default());
+    }
+    let reference = if left_is_reference(left, right) {
+        left
+    } else {
+        right
+    };
+    let fps = if left.fps.as_f64() <= right.fps.as_f64() {
+        left.fps
+    } else {
+        right.fps
+    };
+    Ok(MatchPlan {
+        left: conversion_to(left, reference, fps),
+        right: conversion_to(right, reference, fps),
+    })
+}
+
+/// The left video sets the format, unless the right one is closer to 16:9
+/// or, equally close, smaller.
+fn left_is_reference(left: &ProbeInfo, right: &ProbeInfo) -> bool {
+    let off_16_9 = |p: &ProbeInfo| (p.width as f64 / p.height as f64 - 16.0 / 9.0).abs();
+    let (l, r) = (off_16_9(left), off_16_9(right));
+    if (l - r).abs() > 1e-3 {
+        return l < r;
+    }
+    let pixels = |p: &ProbeInfo| p.width as u64 * p.height as u64;
+    pixels(left) <= pixels(right)
+}
+
+/// How `p` becomes 8-bit, normal-colour video in the reference's size at
+/// `target_fps`; `None` when it already is.
+fn conversion_to(p: &ProbeInfo, reference: &ProbeInfo, target_fps: Fps) -> Option<Conversion> {
+    let (width, height) = (reference.width, reference.height);
+    let fps = fps_differ(p.fps, target_fps).then_some(target_fps);
+    if (p.width, p.height) == (width, height) && fps.is_none() && !is_10bit(p) && !is_hdr(p) {
+        return None;
+    }
+    Some(Conversion {
+        crop: centre_crop(p.width, p.height, width, height),
+        width,
+        height,
+        fps,
+        tone_map: is_hdr(p),
+    })
+}
+
+/// The largest centred part of a `w` x `h` picture with the shape of
+/// `tw` x `th` (even sizes), or `None` when the shapes already match.
+fn centre_crop(w: u32, h: u32, tw: u32, th: u32) -> Option<(u32, u32)> {
+    let (w64, h64, tw64, th64) = (w as u64, h as u64, tw as u64, th as u64);
+    let (cw, ch) = if w64 * th64 > h64 * tw64 {
+        ((h64 * tw64 / th64) as u32 / 2 * 2, h)
+    } else {
+        (w, (w64 * th64 / tw64) as u32 / 2 * 2)
+    };
+    ((cw, ch) != (w, h)).then_some((cw, ch))
+}
+
+/// "1920x1080", plus what else sets it apart from `other` ("at 60 fps", "HDR").
+fn format_label(p: &ProbeInfo, other: &ProbeInfo) -> String {
+    let mut label = format!("{}x{}", p.width, p.height);
+    if fps_differ(p.fps, other.fps) {
+        label.push_str(&format!(" at {:.0} fps", p.fps.as_f64()));
+    }
+    if is_hdr(p) && !is_hdr(other) {
+        label.push_str(" HDR");
+    } else if is_10bit(p) && !is_10bit(other) {
+        label.push_str(" 10-bit");
+    }
+    label
+}
+
+/// The warning for matching copies: `copies` says per side (left, right)
+/// whether a copy is used and whether its HDR colours were changed.
+pub fn matching_warning(
+    left: &ProbeInfo,
+    right: &ProbeInfo,
+    copies: [Option<bool>; 2],
+) -> Option<String> {
+    let sides = ["left", "right"];
+    let copied: Vec<&str> = (0..2)
+        .filter(|&i| copies[i].is_some())
+        .map(|i| sides[i])
+        .collect();
+    let toned: Vec<&str> = (0..2)
+        .filter(|&i| copies[i] == Some(true))
+        .map(|i| sides[i])
+        .collect();
+    let made = match copied[..] {
+        [] => return None,
+        [side] => format!("a matching copy of the {side} video"),
+        _ => "matching copies of both videos".to_string(),
+    };
+    let colours = match (&toned[..], copied.len()) {
+        ([], _) => String::new(),
+        ([_], 1) => " and changed its HDR colours to normal colours".to_string(),
+        ([side], _) => format!(" and changed the {side} video's HDR colours to normal colours"),
+        _ => " and changed their HDR colours to normal colours".to_string(),
+    };
+    Some(format!(
+        "The two phones filmed in different formats ({} and {}), so VeoClone made {made}{colours}. \
+         Next time set both phones the same: Settings › Camera › Record Video › 4K at 30 fps, \
+         and turn off HDR Video.",
+        format_label(left, right),
+        format_label(right, left),
+    ))
+}
+
+/// Everything needed to make one matching copy.
+#[derive(Debug, Clone)]
+pub struct MatchJob {
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub conversion: Conversion,
+    /// Frame rate of the copy (for the keyframe distance).
+    pub fps: Fps,
+}
+
+/// HDR (HLG or PQ) to normal BT.709 colours.
+const TONE_MAP: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
+                        tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+
+/// The video filter for a matching copy. `tone_map` is false when this
+/// ffmpeg has no `zscale`; HDR colours are then kept as they are, like Reco
+/// shows them.
+pub fn matching_filter(c: &Conversion, tone_map: bool) -> String {
+    let tone_map = tone_map && c.tone_map;
+    let mut f = Vec::new();
+    if let Some(fps) = c.fps {
+        f.push(format!("fps={}/{}", fps.num, fps.den));
+    }
+    if !tone_map {
+        // Labelled BT.709 like Reco and the preview treat every video, so
+        // `scale` does not convert the colours (see `proxy_args`).
+        f.push("setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709".to_string());
+    }
+    if let Some((w, h)) = c.crop {
+        f.push(format!("crop={w}:{h}"));
+    }
+    f.push(format!(
+        "scale={}:{}:flags=bicubic,setsar=1",
+        c.width, c.height
+    ));
+    f.push(if tone_map { TONE_MAP } else { "format=yuv420p" }.to_string());
+    f.join(",")
+}
+
+/// ffmpeg arguments for a matching copy: 8-bit H.264 with BT.709 colours, a
+/// keyframe every 2 seconds and the sound copied (or, as a fallback, made
+/// AAC: MP4 cannot hold every phone sound format). Every frame is kept
+/// unless the frame rate changes, because Reco pairs frames by count.
+/// ffmpeg turns upside-down (180°) videos upright and then writes no
+/// rotation, so Reco does not turn them again.
+pub fn matching_args(
+    job: &MatchJob,
+    encoder: Encoder,
+    hwaccel: bool,
+    tone_map: bool,
+    aac: bool,
+) -> Vec<String> {
+    let filter = matching_filter(&job.conversion, tone_map);
+    let gop = ((2.0 * job.fps.as_f64()).round() as u32).max(1).to_string();
+    let mut a: Vec<String> = Vec::new();
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
+    push(&["-hide_banner", "-nostdin", "-y", "-loglevel", "error"]);
+    push(&["-progress", "pipe:1", "-nostats"]);
+    if hwaccel {
+        push(&["-hwaccel", "auto"]);
+    }
+    push(&["-i", &job.input.to_string_lossy()]);
+    push(&["-map", "0:v:0", "-map", "0:a:0?", "-filter:v", &filter]);
+    push(&["-fps_mode", "passthrough"]);
+    match encoder {
+        Encoder::Amf => push(&[
+            "-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "16", "-qp_p", "18",
+        ]),
+        Encoder::X264 => push(&["-c:v", "libx264", "-preset", "veryfast", "-crf", "17"]),
+    }
+    push(&[
+        "-g",
+        &gop,
+        "-pix_fmt",
+        "yuv420p",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        "-color_range",
+        "tv",
+    ]);
+    if aac {
+        push(&["-c:a", "aac", "-b:a", "192k"]);
+    } else {
+        push(&["-c:a", "copy"]);
+    }
+    push(&["-f", "mp4", &job.output.to_string_lossy()]);
+    a
+}
+
+/// Make a matching copy: AMD hardware encoding with hardware decoding first,
+/// then plain software (with AAC sound) as a fallback, like the preview.
+/// `tone_map` says whether this ffmpeg can change HDR colours (`zscale`).
+pub fn make_matching_copy(
+    tools: &Tools,
+    job: &MatchJob,
+    tone_map: bool,
+    cancel: &AtomicBool,
+    mut on_frame: impl FnMut(u64),
+) -> Result<(), RunError> {
+    let ffmpeg = tools.ffmpeg().map_err(RunError::Failed)?;
+    let first = if has_encoder(ffmpeg, "h264_amf") {
+        Encoder::Amf
+    } else {
+        Encoder::X264
+    };
+    match run_ffmpeg(
+        ffmpeg,
+        &matching_args(job, first, true, tone_map, false),
+        cancel,
+        &mut on_frame,
+    ) {
+        Err(RunError::Failed(e)) => {
+            log::warn!("Making a matching copy failed ({e}); trying again with software encoding");
+            on_frame(0);
+            run_ffmpeg(
+                ffmpeg,
+                &matching_args(job, Encoder::X264, false, tone_map, true),
+                cancel,
+                &mut on_frame,
+            )
+        }
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +1232,294 @@ mod tests {
         assert!(check_pair(&a, &silent).unwrap()[0].contains("no sound"));
     }
 
+    /// 10-bit HLG HEVC, like an iPhone filming with HDR Video on.
+    fn hdr(mut p: ProbeInfo) -> ProbeInfo {
+        p.codec = "hevc".into();
+        p.pixel_format = "yuv420p10le".into();
+        p.color_transfer = Some("arib-std-b67".into());
+        p
+    }
+
+    fn convert(
+        crop: Option<(u32, u32)>,
+        (width, height): (u32, u32),
+        fps: Option<u32>,
+        tone_map: bool,
+    ) -> Option<Conversion> {
+        Some(Conversion {
+            crop,
+            width,
+            height,
+            fps: fps.map(|num| Fps { num, den: 1 }),
+            tone_map,
+        })
+    }
+
+    #[test]
+    fn bit_depths() {
+        let mut p = probe_info(1920, 1080, 30, 0);
+        for (fmt, deep) in [
+            ("yuv420p", false),
+            ("yuvj420p", false),
+            ("nv12", false),
+            ("yuv444p", false),
+            ("yuv420p10le", true),
+            ("yuv422p10le", true),
+            ("p010le", true),
+            ("yuv420p12be", true),
+            ("gray10le", true),
+        ] {
+            p.pixel_format = fmt.into();
+            assert_eq!(is_10bit(&p), deep, "{fmt}");
+        }
+    }
+
+    #[test]
+    fn identical_videos_need_no_copies() {
+        let a = probe_info(1920, 1080, 30, 0);
+        assert_eq!(plan_matching(&a, &a).unwrap(), MatchPlan::default());
+        // Both HDR in the same format: stitched as they are (with the HDR
+        // warning, as before).
+        let h = hdr(probe_info(3840, 2160, 30, 180));
+        assert_eq!(plan_matching(&h, &h).unwrap(), MatchPlan::default());
+        // 29.97 and 30 fps pair up fine.
+        let ntsc = ProbeInfo {
+            fps: Fps {
+                num: 30000,
+                den: 1001,
+            },
+            ..a.clone()
+        };
+        assert_eq!(plan_matching(&a, &ntsc).unwrap(), MatchPlan::default());
+        // An upside-down phone is turned by Reco itself.
+        let flipped = probe_info(1920, 1080, 30, 180);
+        assert_eq!(plan_matching(&a, &flipped).unwrap(), MatchPlan::default());
+    }
+
+    /// The user's match: an iPhone 11 filming 1920x1440 (4:3) and an iPhone
+    /// 13 Pro Max filming 1920x1080 in HDR.
+    #[test]
+    fn four_by_three_sdr_and_hdr_1080p() {
+        let sdr_4_3 = probe_info(1920, 1440, 30, 0);
+        let hdr_1080 = hdr(probe_info(1920, 1080, 30, 0));
+        let plan = plan_matching(&sdr_4_3, &hdr_1080).unwrap();
+        // 16:9 sets the format: the 4:3 video loses a strip at the top and
+        // bottom, the HDR one gets normal colours at its own size.
+        assert_eq!(
+            plan.left,
+            convert(Some((1920, 1080)), (1920, 1080), None, false)
+        );
+        assert_eq!(plan.right, convert(None, (1920, 1080), None, true));
+        let plan = plan_matching(&hdr_1080, &sdr_4_3).unwrap();
+        assert_eq!(plan.left, convert(None, (1920, 1080), None, true));
+        assert_eq!(
+            plan.right,
+            convert(Some((1920, 1080)), (1920, 1080), None, false)
+        );
+        assert_eq!(plan.side("right"), plan.right.as_ref());
+    }
+
+    #[test]
+    fn four_k_and_1080p() {
+        let uhd = probe_info(3840, 2160, 30, 0);
+        let fhd = probe_info(1920, 1080, 30, 0);
+        // The smaller one sets the size.
+        let plan = plan_matching(&uhd, &fhd).unwrap();
+        assert_eq!(plan.left, convert(None, (1920, 1080), None, false));
+        assert_eq!(plan.right, None);
+        let plan = plan_matching(&fhd, &uhd).unwrap();
+        assert_eq!(plan.left, None);
+        assert_eq!(plan.right, convert(None, (1920, 1080), None, false));
+        // 4K HDR and 1080p: the 4K one becomes 1080p with normal colours.
+        let plan = plan_matching(&hdr(uhd.clone()), &fhd).unwrap();
+        assert_eq!(plan.left, convert(None, (1920, 1080), None, true));
+        assert_eq!(plan.right, None);
+        // 4K 4:3 against 1080p: 16:9 wins over size.
+        let plan = plan_matching(&probe_info(4032, 3024, 30, 0), &uhd).unwrap();
+        assert_eq!(
+            plan.left,
+            convert(Some((4032, 2268)), (3840, 2160), None, false)
+        );
+        assert_eq!(plan.right, None);
+    }
+
+    #[test]
+    fn thirty_and_sixty_fps() {
+        let thirty = probe_info(1920, 1080, 30, 0);
+        let sixty = probe_info(1920, 1080, 60, 0);
+        // The lower frame rate wins, whichever side it is on.
+        let plan = plan_matching(&thirty, &sixty).unwrap();
+        assert_eq!(plan.left, None);
+        assert_eq!(plan.right, convert(None, (1920, 1080), Some(30), false));
+        let plan = plan_matching(&sixty, &thirty).unwrap();
+        assert_eq!(plan.left, convert(None, (1920, 1080), Some(30), false));
+        assert_eq!(plan.right, None);
+        // Size from the 16:9 video, frame rate the lower one.
+        let plan = plan_matching(&probe_info(1920, 1440, 60, 0), &thirty).unwrap();
+        assert_eq!(
+            plan.left,
+            convert(Some((1920, 1080)), (1920, 1080), Some(30), false)
+        );
+        assert_eq!(plan.right, None);
+        let plan = plan_matching(&probe_info(1920, 1440, 30, 0), &sixty).unwrap();
+        assert_eq!(
+            plan.left,
+            convert(Some((1920, 1080)), (1920, 1080), None, false)
+        );
+        assert_eq!(plan.right, convert(None, (1920, 1080), Some(30), false));
+    }
+
+    #[test]
+    fn only_the_bit_depth_differs() {
+        let sdr = probe_info(1920, 1080, 30, 0);
+        let h = hdr(sdr.clone());
+        // Same size: the 10-bit one becomes 8-bit; the other is fine as it is.
+        let plan = plan_matching(&h, &sdr).unwrap();
+        assert_eq!(plan.left, convert(None, (1920, 1080), None, true));
+        assert_eq!(plan.right, None);
+        let plan = plan_matching(&sdr, &h).unwrap();
+        assert_eq!(
+            (plan.left, plan.right),
+            (None, convert(None, (1920, 1080), None, true))
+        );
+        // 10-bit without HDR: 8-bit, no colour change.
+        let mut ten = sdr.clone();
+        ten.pixel_format = "yuv420p10le".into();
+        let plan = plan_matching(&sdr, &ten).unwrap();
+        assert_eq!(plan.right, convert(None, (1920, 1080), None, false));
+    }
+
+    #[test]
+    fn unusable_videos_are_still_refused() {
+        let a = probe_info(1920, 1080, 30, 0);
+        let err = plan_matching(&a, &probe_info(1920, 1440, 30, 90)).unwrap_err();
+        assert!(err.contains("right video was filmed upright"), "{err}");
+        let err = plan_matching(&probe_info(0, 0, 30, 0), &a).unwrap_err();
+        assert!(err.contains("left file has no picture"), "{err}");
+    }
+
+    #[test]
+    fn centre_crops() {
+        assert_eq!(centre_crop(1920, 1440, 1920, 1080), Some((1920, 1080)));
+        assert_eq!(centre_crop(1920, 1080, 1920, 1080), None);
+        assert_eq!(centre_crop(3840, 2160, 1920, 1080), None);
+        assert_eq!(centre_crop(1920, 1080, 1440, 1080), Some((1440, 1080)));
+        assert_eq!(centre_crop(4032, 3024, 1920, 1080), Some((4032, 2268)));
+        // Odd results are made even.
+        assert_eq!(centre_crop(1000, 999, 16, 9), Some((1000, 562)));
+    }
+
+    #[test]
+    fn matching_warnings() {
+        let sdr_4_3 = probe_info(1920, 1440, 30, 0);
+        let hdr_1080 = hdr(probe_info(1920, 1080, 30, 0));
+        assert_eq!(matching_warning(&sdr_4_3, &hdr_1080, [None, None]), None);
+        let w = matching_warning(&sdr_4_3, &hdr_1080, [Some(false), Some(true)]).unwrap();
+        assert_eq!(
+            w,
+            "The two phones filmed in different formats (1920x1440 and 1920x1080 HDR), so \
+             VeoClone made matching copies of both videos and changed the right video's HDR \
+             colours to normal colours. Next time set both phones the same: Settings › Camera \
+             › Record Video › 4K at 30 fps, and turn off HDR Video."
+        );
+        // Without the tone-mapping filter the colours stay as they are.
+        let w = matching_warning(&sdr_4_3, &hdr_1080, [Some(false), Some(false)]).unwrap();
+        assert!(
+            w.contains("made matching copies of both videos. Next time"),
+            "{w}"
+        );
+
+        let uhd = probe_info(3840, 2160, 30, 0);
+        let fhd = probe_info(1920, 1080, 30, 0);
+        let w = matching_warning(&uhd, &fhd, [Some(false), None]).unwrap();
+        assert!(w.contains("(3840x2160 and 1920x1080), so VeoClone made a matching copy of the left video. Next"), "{w}");
+        let w = matching_warning(&hdr(fhd.clone()), &fhd, [Some(true), None]).unwrap();
+        assert!(w.contains("(1920x1080 HDR and 1920x1080)"), "{w}");
+        assert!(
+            w.contains("copy of the left video and changed its HDR colours to normal colours."),
+            "{w}"
+        );
+        let w = matching_warning(&hdr(uhd), &hdr(fhd.clone()), [Some(true), Some(true)]).unwrap();
+        assert!(w.contains("and changed their HDR colours"), "{w}");
+        let w =
+            matching_warning(&fhd, &probe_info(1920, 1080, 60, 0), [None, Some(false)]).unwrap();
+        assert!(
+            w.contains("(1920x1080 at 30 fps and 1920x1080 at 60 fps)"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn matching_filters_and_arguments() {
+        let crop = Conversion {
+            crop: Some((1920, 1080)),
+            width: 1920,
+            height: 1080,
+            fps: None,
+            tone_map: false,
+        };
+        assert_eq!(
+            matching_filter(&crop, true),
+            "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,crop=1920:1080,\
+             scale=1920:1080:flags=bicubic,setsar=1,format=yuv420p"
+        );
+        let tone = Conversion {
+            crop: None,
+            fps: Some(Fps { num: 30, den: 1 }),
+            tone_map: true,
+            ..crop.clone()
+        };
+        assert_eq!(
+            matching_filter(&tone, true),
+            format!("fps=30/1,scale=1920:1080:flags=bicubic,setsar=1,{TONE_MAP}")
+        );
+        assert!(TONE_MAP.starts_with("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"));
+        assert!(
+            TONE_MAP.ends_with(
+                "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+            )
+        );
+        // Without zscale: plain conversion, colours as Reco shows them.
+        assert_eq!(
+            matching_filter(&tone, false),
+            "fps=30/1,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+             scale=1920:1080:flags=bicubic,setsar=1,format=yuv420p"
+        );
+
+        let job = MatchJob {
+            input: "right.mov".into(),
+            output: "matched-right.x.tmp.mp4".into(),
+            conversion: tone,
+            fps: Fps { num: 30, den: 1 },
+        };
+        let a = matching_args(&job, Encoder::Amf, true, true, false).join(" ");
+        assert!(a.contains("-progress pipe:1"));
+        assert!(
+            a.contains("-hwaccel auto -i right.mov -map 0:v:0 -map 0:a:0? -filter:v fps=30/1,")
+        );
+        assert!(a.contains(
+            "-fps_mode passthrough -c:v h264_amf -quality quality -rc cqp -qp_i 16 -qp_p 18 -g 60 \
+             -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+             -color_range tv -c:a copy -f mp4 matched-right.x.tmp.mp4"
+        ));
+        let a = matching_args(&job, Encoder::X264, false, true, true).join(" ");
+        assert!(!a.contains("hwaccel"));
+        assert!(a.contains("-c:v libx264 -preset veryfast -crf 17 -g 60"));
+        assert!(a.contains("-c:a aac -b:a 192k -f mp4"));
+        let job = MatchJob {
+            fps: Fps {
+                num: 60000,
+                den: 1001,
+            },
+            ..job
+        };
+        assert!(
+            matching_args(&job, Encoder::X264, false, true, false)
+                .join(" ")
+                .contains("-g 120")
+        );
+    }
+
     #[test]
     fn tiles() {
         assert_eq!(tile_size(3840, 2160), (1280, 720));
@@ -1198,6 +1816,152 @@ mod tests {
             ],
         );
         assert_eq!(String::from_utf8_lossy(&streams).trim(), "video\naudio");
+    }
+
+    /// Makes real matching copies of an upside-down 4:3 8-bit video and a
+    /// 16:9 10-bit HLG one, like two different iPhones, and checks they come
+    /// out upright, in one format, with every frame and the sound. Skipped
+    /// when ffmpeg is not installed.
+    #[test]
+    fn matching_copies_are_upright_and_keep_every_frame() {
+        let tools = Tools::find();
+        let (Some(ffmpeg), Some(_)) = (tools.ffmpeg.clone(), tools.ffprobe.clone()) else {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let p = |path: &Path| path.to_str().unwrap().to_string();
+        // Left: white above black as seen upright, stored upside down with a
+        // 180° rotation, like a phone held the other way up.
+        let flipped = dir.join("flipped.mp4");
+        let left = dir.join("left.mp4");
+        run_tool(
+            &ffmpeg,
+            &[
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=white:s=320x240:r=30:d=2,\
+                 drawbox=x=0:y=120:w=320:h=120:c=black:t=fill,vflip,hflip",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=f=440:sample_rate=48000:d=2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                &p(&flipped),
+            ],
+        );
+        run_tool(
+            &ffmpeg,
+            &[
+                "-v",
+                "error",
+                "-y",
+                "-display_rotation",
+                "180",
+                "-i",
+                &p(&flipped),
+                "-c",
+                "copy",
+                &p(&left),
+            ],
+        );
+        // Right: 16:9, 10-bit, HLG, with sound MP4 cannot copy.
+        let right = dir.join("right.mov");
+        run_tool(
+            &ffmpeg,
+            &[
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x180:r=30:d=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=f=660:sample_rate=48000:d=2",
+                "-c:v",
+                "prores_ks",
+                "-pix_fmt",
+                "yuv422p10le",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "arib-std-b67",
+                "-colorspace",
+                "bt2020nc",
+                "-c:a",
+                "pcm_s16le",
+                "-shortest",
+                &p(&right),
+            ],
+        );
+        let lp = probe(&tools, &left).unwrap();
+        let rp = probe(&tools, &right).unwrap();
+        assert_eq!(
+            (lp.rotation, is_10bit(&lp), is_hdr(&lp)),
+            (180, false, false)
+        );
+        assert_eq!((is_10bit(&rp), is_hdr(&rp)), (true, true));
+        let plan = plan_matching(&lp, &rp).unwrap();
+        assert_eq!(plan.left.as_ref().unwrap().crop, Some((320, 180)));
+        assert!(plan.right.as_ref().unwrap().tone_map);
+
+        let tone_map = has_filter(&ffmpeg, "zscale");
+        assert!(has_filter(&ffmpeg, "crop") && !has_filter(&ffmpeg, "no-such-filter"));
+        let mut copies = Vec::new();
+        for (input, c, source) in [
+            (&left, plan.left.unwrap(), &lp),
+            (&right, plan.right.unwrap(), &rp),
+        ] {
+            let output = dir.join(format!("copy-{}.mp4", copies.len()));
+            let job = MatchJob {
+                input: input.clone(),
+                output: output.clone(),
+                conversion: c,
+                fps: source.fps,
+            };
+            let mut last = 0;
+            make_matching_copy(&tools, &job, tone_map, &AtomicBool::new(false), |n| {
+                last = n
+            })
+            .unwrap();
+            assert_eq!(last, 60, "progress counts every frame");
+            copies.push(probe(&tools, &output).unwrap());
+        }
+        for c in &copies {
+            assert_eq!(
+                (c.width, c.height, c.fps, c.frame_count),
+                (320, 180, Fps { num: 30, den: 1 }, 60)
+            );
+            assert_eq!((c.pixel_format.as_str(), c.rotation), ("yuv420p", 0));
+            assert!(c.has_audio && !is_hdr(c));
+        }
+        assert!(check_pair(&copies[0], &copies[1]).unwrap().is_empty());
+        // Upright, and cropped in the middle: white on top, black below.
+        let patch = |y: u32| {
+            let crop = format!("crop=8:8:156:{y},scale=1:1:flags=area");
+            let copy = p(&dir.join("copy-0.mp4"));
+            let args = ["-v", "error", "-i", &copy, "-vf", &crop];
+            run_tool(
+                &ffmpeg,
+                &[&args[..], &["-f", "rawvideo", "-pix_fmt", "gray", "-"]].concat(),
+            )
+        };
+        assert!(patch(20).iter().all(|&v| v > 200), "{:?}", patch(20));
+        assert!(patch(150).iter().all(|&v| v < 50), "{:?}", patch(150));
     }
 
     #[test]

@@ -6,7 +6,7 @@ import { formatBytes, formatTimeLeft, h, icon, setChildren } from "./dom";
 import { dropZone, assignFiles, type DropZone } from "./dropzone";
 import { currentHealth } from "./health";
 import { I } from "./icons";
-import { changeLens, lensOptions, lensPicker, lensUnavailable } from "./lens";
+import { changeLens, lensOptions, lensUnavailable, phonesPicker } from "./lens";
 import { sendVideos, slowAiNotice, stylePicker, STYLES } from "./newMatch";
 import type { Page, PageContext } from "./page";
 
@@ -120,7 +120,7 @@ export function projectPage(ctx: PageContext, id: string): Page {
     if (uploading) return;
     // Rebuild only when something on the page changes, so open boxes, choices
     // and the button under the mouse survive the polls; progress moves in place.
-    const key = JSON.stringify([mode, p.status, p.job?.kind, p.job?.step, p.job?.startedAt, p.error, p.warnings, p.calibration, p.style, p.lensId, p.files, p.exports.map((e) => e.status), currentHealth()?.ai.provider]);
+    const key = JSON.stringify([mode, p.status, p.job?.kind, p.job?.step, p.job?.startedAt, p.error, p.warnings, p.calibration, p.style, p.lensId, p.rightLensId, p.files, p.exports.map((e) => e.status), currentHealth()?.ai.provider]);
     if (key === shown && !force) return live?.(p);
     shown = key;
     live = null;
@@ -307,7 +307,7 @@ export function projectPage(ctx: PageContext, id: string): Page {
     };
     const lensHost = h("div", { class: "lens-host" }, lensUnavailable("Loading the list…"));
     lensOptions().then(
-      (options) => setChildren(lensHost, lensPicker(options, p.lensId, (lensId) => void api.updateProject(id, { lensId }).catch((e) => toast(describeError(e).message, "error")))),
+      (options) => setChildren(lensHost, phonesPicker(options, p, (lenses) => void api.updateProject(id, lenses).catch((e) => toast(describeError(e).message, "error")))),
       () => setChildren(lensHost, lensUnavailable()),
     );
     const both = p.files.left && p.files.right;

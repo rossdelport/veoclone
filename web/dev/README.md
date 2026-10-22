@@ -18,7 +18,8 @@ Test hooks: a match whose name contains "fail" fails once while lining up the
 videos (Try again then works; a re-run of a ready match goes back to ready
 with a warning instead, like the real helper, DESIGN.md 4.7); "slow" makes its
 jobs 10 times slower. Like the real helper it refuses to delete a match while
-a video is still arriving, and it supports `POST /api/projects/:id/swap`.
+a video is still arriving, and it supports `POST /api/projects/:id/swap` and
+`rightLensId` (a lens per phone; swapping swaps the two lenses).
 `GET /__mock/state` shows what the editor sent (edits, last export with a
 summary of the camera path and of the text PNGs, "Show in folder" calls,
 swaps); like the real helper it checks the text PNGs (size, times) and adds

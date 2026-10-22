@@ -31,7 +31,8 @@ use crate::jobs::{Job, Jobs};
 use crate::media::Tools;
 use crate::store::{
     DERIVED_FILES, ExportMeta, ExportStatus, FileInfo, Files, ProjectMeta, Status, Store, Style,
-    dir_size, end_unfinished_run, new_id, now_iso, original_file, valid_id, write_atomic,
+    dir_size, end_unfinished_run, new_id, now_iso, original_file, remove_matched, valid_id,
+    write_atomic,
 };
 
 const EDITS_LIMIT: usize = 10 * 1024 * 1024;
@@ -336,6 +337,9 @@ struct NewProject {
     name: String,
     #[serde(default)]
     lens_id: Option<String>,
+    /// The right phone's lens when it is another model; `None`: the same.
+    #[serde(default)]
+    right_lens_id: Option<String>,
     #[serde(default)]
     style: Option<Style>,
 }
@@ -352,7 +356,12 @@ async fn create_project(State(s): State<AppState>, body: Body) -> ApiResult<Resp
     let req: NewProject = read_json(body, JSON_LIMIT).await?;
     let name = clean_name(&req.name)?;
     let lens_id = req.lens_id.unwrap_or_else(|| DEFAULT_LENS.into());
-    if !is_lens_option(&lens_id) {
+    if !is_lens_option(&lens_id)
+        || req
+            .right_lens_id
+            .as_deref()
+            .is_some_and(|l| !is_lens_option(l))
+    {
         return Err(ApiError::bad_request(UNKNOWN_LENS));
     }
     let now = now_iso();
@@ -362,6 +371,7 @@ async fn create_project(State(s): State<AppState>, body: Body) -> ApiResult<Resp
         created_at: now.clone(),
         updated_at: now,
         lens_id: Some(lens_id),
+        right_lens_id: req.right_lens_id,
         style: req.style.unwrap_or(Style::Broadcast),
         status: Status::New,
         files: Files::default(),
@@ -400,6 +410,13 @@ async fn patch_project(
         Some(Value::String(l)) if is_lens_option(l) => Some(Some(l.clone())),
         Some(_) => return Err(ApiError::bad_request(UNKNOWN_LENS)),
     };
+    // `null`: the right phone is the same model as the left one.
+    let right_lens = match req.get("rightLensId") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(l)) if is_lens_option(l) => Some(Some(l.clone())),
+        Some(_) => return Err(ApiError::bad_request(UNKNOWN_LENS)),
+    };
     let style: Option<Style> = match req.get("style") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -407,7 +424,7 @@ async fn patch_project(
                 .map_err(|_| ApiError::bad_request("Unknown camera style."))?,
         ),
     };
-    let changes_processing = lens.is_some() || style.is_some();
+    let changes_processing = lens.is_some() || right_lens.is_some() || style.is_some();
     if changes_processing && s.jobs.busy(&id) {
         return Err(ApiError::conflict(BUSY));
     }
@@ -423,6 +440,12 @@ async fn patch_project(
                 m.lens_id = l;
                 // Forces a new calibration on the next "process"; the old
                 // results stay usable until then.
+                m.calibration = None;
+            }
+            if let Some(r) = right_lens
+                && r != m.right_lens_id
+            {
+                m.right_lens_id = r;
                 m.calibration = None;
             }
             if let Some(st) = style {
@@ -570,6 +593,7 @@ async fn upload(
             .await
             .map_err(|e| ApiError::internal("The old video could not be replaced.", e))?;
     }
+    remove_matched(&dir, &side);
     for f in DERIVED_FILES {
         let _ = tokio::fs::remove_file(dir.join(f)).await;
     }
@@ -696,6 +720,11 @@ async fn swap(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiRes
         .store
         .update(&id, |m| {
             std::mem::swap(&mut m.files.left, &mut m.files.right);
+            // Two different phones: each keeps its own lens.
+            if let Some(right) = m.right_lens_id.take() {
+                let left = m.lens_id.replace(right);
+                m.right_lens_id = Some(left.unwrap_or_else(|| DEFAULT_LENS.into()));
+            }
             m.status = if m.files.left.is_some() && m.files.right.is_some() {
                 Status::Uploaded
             } else {
@@ -712,7 +741,7 @@ async fn swap(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiRes
 }
 
 /// Rename `left.*` to `right.*` and back (each keeps its extension), then
-/// drop everything made from the old order.
+/// drop everything made from the old order (also the matching copies).
 fn swap_files(dir: &Path) -> std::io::Result<()> {
     let ext = |p: &Path| {
         p.extension()
@@ -737,6 +766,9 @@ fn swap_files(dir: &Path) -> std::io::Result<()> {
     }
     if let Some(l) = &left {
         std::fs::rename(&parked, dir.join(format!("right.{}", ext(l))))?;
+    }
+    for side in ["left", "right"] {
+        remove_matched(dir, side);
     }
     for f in DERIVED_FILES {
         let _ = std::fs::remove_file(dir.join(f));
@@ -1494,7 +1526,11 @@ mod tests {
                 let uri = format!("/api/projects/{id}/files/{side}");
                 call(&app, "PUT", &uri, &[("x-filename", name)], data).await;
             }
-            for f in DERIVED_FILES {
+            for f in DERIVED_FILES.into_iter().chain([
+                "matched-left.mp4",
+                "matched-left.json",
+                "matched-right.mp4",
+            ]) {
                 std::fs::write(dir.join(f), b"old").unwrap();
             }
             st.store.update(&id, |m| m.status = Status::Ready);
@@ -1510,12 +1546,113 @@ mod tests {
             assert_eq!(std::fs::read(dir.join("right.mov")).unwrap(), b"aaa");
             assert!(DERIVED_FILES.iter().all(|f| !dir.join(f).exists()));
             let names = std::fs::read_dir(&dir).unwrap().count();
-            assert_eq!(names, 3, "project.json, left.mp4, right.mov");
+            assert_eq!(
+                names, 3,
+                "project.json, left.mp4, right.mov (no matching copies)"
+            );
+            // One phone model for both: nothing to swap.
+            assert_eq!(
+                (&p["lensId"], &p["rightLensId"]),
+                (&json!(DEFAULT_LENS), &Value::Null)
+            );
 
-            // And back.
-            call(&app, "POST", &uri, &[], "").await;
+            // And back, with two different phones: each keeps its lens.
+            let lenses =
+                json!({"lensId": "iphone-13-pro-max:ultra", "rightLensId": "iphone-11:ultra"});
+            call(
+                &app,
+                "PATCH",
+                &format!("/api/projects/{id}"),
+                &[],
+                lenses.to_string(),
+            )
+            .await;
+            let (_, _, b) = call(&app, "POST", &uri, &[], "").await;
             assert_eq!(std::fs::read(dir.join("left.mov")).unwrap(), b"aaa");
             assert_eq!(std::fs::read(dir.join("right.mp4")).unwrap(), b"bbbb");
+            assert_eq!(v(&b)["lensId"], "iphone-11:ultra");
+            assert_eq!(v(&b)["rightLensId"], "iphone-13-pro-max:ultra");
+        });
+    }
+
+    /// A different iPhone on each side (DESIGN.md 4.6).
+    #[test]
+    fn a_lens_per_phone() {
+        rt().block_on(async {
+            let (_tmp, st) = state();
+            let app = app(&st);
+            let body = json!({"name": "x", "lensId": "iphone-13-pro-max:ultra", "rightLensId": "iphone-11:ultra"});
+            let (code, _, b) = call(&app, "POST", "/api/projects", &[], body.to_string()).await;
+            assert_eq!(code, StatusCode::CREATED);
+            assert_eq!(v(&b)["rightLensId"], "iphone-11:ultra");
+            let id = v(&b)["id"].as_str().unwrap().to_string();
+            let body = json!({"name": "x", "rightLensId": "Apple IPhone 11||3840x2160"});
+            let (code, _, _) = call(&app, "POST", "/api/projects", &[], body.to_string()).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            let (_, _, b) = call(&app, "POST", "/api/projects", &[], r#"{"name":"y","rightLensId":null}"#).await;
+            assert_eq!(v(&b)["rightLensId"], Value::Null);
+
+            // Changing it redoes the calibration, like the left lens.
+            let uri = format!("/api/projects/{id}");
+            let summary = crate::store::CalibSummary {
+                confidence: 0.9,
+                sync_offset_frames: 0,
+                sync_offset_seconds: 0.0,
+                lens: "x".into(),
+            };
+            st.store.update(&id, |m| m.calibration = Some(summary.clone()));
+            let (_, _, b) = call(&app, "PATCH", &uri, &[], r#"{"name":"Renamed"}"#).await;
+            assert!(v(&b)["calibration"].is_object(), "other changes keep it");
+            let (_, _, b) =
+                call(&app, "PATCH", &uri, &[], r#"{"rightLensId":"iphone-11:ultra"}"#).await;
+            assert!(v(&b)["calibration"].is_object(), "the same lens keeps it");
+            let (code, _, b) =
+                call(&app, "PATCH", &uri, &[], r#"{"rightLensId":"iphone-12:ultra"}"#).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(v(&b)["rightLensId"], "iphone-12:ultra");
+            assert!(v(&b).get("calibration").is_none());
+            st.store.update(&id, |m| m.calibration = Some(summary.clone()));
+            let (_, _, b) = call(&app, "PATCH", &uri, &[], r#"{"rightLensId":null}"#).await;
+            assert_eq!(v(&b)["rightLensId"], Value::Null);
+            assert_eq!(v(&b)["lensId"], "iphone-13-pro-max:ultra");
+            assert!(v(&b).get("calibration").is_none());
+            let (code, _, _) = call(&app, "PATCH", &uri, &[], r#"{"rightLensId":"nope"}"#).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            let (code, _, _) = call(&app, "PATCH", &uri, &[], r#"{"rightLensId":5}"#).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+        });
+    }
+
+    /// A new video for one side drops that side's matching copy only.
+    #[test]
+    fn new_upload_removes_its_matching_copy() {
+        rt().block_on(async {
+            let (_tmp, st) = state();
+            let app = app(&st);
+            let (_, _, b) = call(&app, "POST", "/api/projects", &[], r#"{"name":"x"}"#).await;
+            let id = v(&b)["id"].as_str().unwrap().to_string();
+            let dir = st.store.project_dir(&id);
+            for f in [
+                "matched-left.mp4",
+                "matched-left.json",
+                "matched-right.mp4",
+                "matched-right.json",
+            ] {
+                std::fs::write(dir.join(f), b"old").unwrap();
+            }
+            let uri = format!("/api/projects/{id}/files/left");
+            let (code, _, _) = call(&app, "PUT", &uri, &[("x-filename", "a.mov")], "new").await;
+            assert_eq!(code, StatusCode::OK);
+            assert!(
+                !dir.join("matched-left.mp4").exists() && !dir.join("matched-left.json").exists()
+            );
+            assert!(
+                dir.join("matched-right.mp4").exists() && dir.join("matched-right.json").exists()
+            );
+            assert_eq!(
+                crate::store::original_file(&dir, "left").unwrap(),
+                dir.join("left.mov")
+            );
         });
     }
 

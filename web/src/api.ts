@@ -80,7 +80,10 @@ export interface ProjectMeta {
   name: string;
   createdAt: string;
   updatedAt: string;
+  /** The left phone's lens (and the right one's, unless rightLensId is set). */
   lensId: string | null;
+  /** The right phone's lens when the two phones are different models; null (or missing, older VeoClone): the same as the left. */
+  rightLensId?: string | null;
   style: Style;
   status: ProjectStatus;
   files: { left?: FileInfo; right?: FileInfo };
@@ -228,10 +231,10 @@ export const api = {
   health: () => json<Health>("GET", "/api/health", undefined, 4000),
   lenses: () => json<LensOption[]>("GET", "/api/lenses"),
   listProjects: () => json<ProjectMeta[]>("GET", "/api/projects"),
-  createProject: (body: { name: string; lensId?: string | null; style: Style }) =>
+  createProject: (body: { name: string; lensId?: string | null; rightLensId?: string | null; style: Style }) =>
     json<ProjectMeta>("POST", "/api/projects", body),
   getProject: (id: string) => json<ProjectMeta>("GET", project(id)),
-  updateProject: (id: string, body: { name?: string; lensId?: string | null; style?: Style }) =>
+  updateProject: (id: string, body: { name?: string; lensId?: string | null; rightLensId?: string | null; style?: Style }) =>
     json<ProjectMeta>("PATCH", project(id), body),
   deleteProject: (id: string) => request("DELETE", project(id)).then(() => undefined),
   process: (id: string) => json<ProjectMeta>("POST", `${project(id)}/process`),

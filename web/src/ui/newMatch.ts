@@ -5,7 +5,7 @@ import { formatBytes, h, icon, setChildren } from "./dom";
 import { assignFiles, dropZone, type DropZone } from "./dropzone";
 import { currentHealth, onHelperState } from "./health";
 import { I } from "./icons";
-import { DEFAULT_LENS, initialLens, lensOptions, lensPicker, lensUnavailable } from "./lens";
+import { DEFAULT_LENS, initialLens, lensOptions, lensUnavailable, phonesPicker } from "./lens";
 import type { Page, PageContext } from "./page";
 
 export const STYLES: { id: Style; name: string; text: string }[] = [
@@ -33,6 +33,7 @@ export function stylePicker(value: Style, onChange: (s: Style) => void, name = "
 export function filmingTips(): HTMLElement {
   const tips: [string, string][] = [
     ["Side by side, up high", "Put both phones next to each other on a tripod or fence, as high as you can, near the halfway line. Point one at each half of the pitch so the views overlap a little in the middle."],
+    ["Two phones, same settings", "Two identical phones work best, but different iPhones are fine. Give both phones the settings below. If their videos still differ, VeoClone makes a matching copy first, which takes longer."],
     ["Use the 0.5× lens", "Choose the 0.5× (ultra wide) lens on both phones so together they see the whole pitch."],
     ["Landscape, 4K at 30 fps", "Hold the phones sideways. In Settings › Camera › Record Video choose 4K at 30 fps."],
     ["Turn HDR Video off", "In Settings › Camera › Record Video, switch off HDR Video, or the colours look washed out."],
@@ -97,6 +98,7 @@ export function newMatchPage(ctx: PageContext): Page {
   ctx.setTitle("New match");
   let style: Style = "broadcast";
   let lensId: string | null = DEFAULT_LENS;
+  let rightLensId: string | null = null; // the right phone is another model
   let lensesLoaded = false;
   let upload: Upload | null = null;
   let busy = false;
@@ -154,7 +156,7 @@ export function newMatchPage(ctx: PageContext): Page {
             "section",
             { class: "card form-section" },
             h("h2", null, "Which iPhone and lens filmed this?"),
-            h("p", { class: "muted small" }, "Both phones should be the same model and use the same lens. Not sure which iPhone? Leave it on Not sure."),
+            h("p", { class: "muted small" }, "Two identical phones work best, but different iPhones are fine: tick the box and choose each phone. Not sure which iPhone? Leave it on Not sure."),
             lensHost,
           ),
           h(
@@ -201,7 +203,13 @@ export function newMatchPage(ctx: PageContext): Page {
       const options = await lensOptions();
       lensId = initialLens(options, lensId)?.id ?? null;
       lensesLoaded = true;
-      setChildren(lensHost, lensPicker(options, lensId, (id) => (lensId = id)));
+      setChildren(
+        lensHost,
+        phonesPicker(options, { lensId, rightLensId }, (lenses) => {
+          lensId = lenses.lensId;
+          rightLensId = lenses.rightLensId;
+        }),
+      );
       if (busy) setBusy(true);
     } catch {
       setChildren(lensHost, lensUnavailable());
@@ -214,7 +222,9 @@ export function newMatchPage(ctx: PageContext): Page {
     zones.left.setDisabled(b);
     zones.right.setDisabled(b);
     stop.hidden = !b;
-    for (const el of ctx.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>(".choice input, #lens-model")) el.disabled = b || (!lensesLoaded && el.id === "lens-model");
+    for (const el of ctx.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>(".choice input, .lens-host input, .lens-host select")) {
+      el.disabled = b || (!lensesLoaded && el.closest(".lens-host") !== null);
+    }
     update();
   }
 
@@ -229,8 +239,8 @@ export function newMatchPage(ctx: PageContext): Page {
     setChildren(status, h("p", { class: "small" }, "Sending your videos to VeoClone. Keep this page open."));
     try {
       await stopping; // a Stop that is still tidying up
-      if (projectId) await api.updateProject(projectId, { name, lensId, style });
-      else projectId = (await api.createProject({ name, lensId, style })).id;
+      if (projectId) await api.updateProject(projectId, { name, lensId, rightLensId, style });
+      else projectId = (await api.createProject({ name, lensId, rightLensId, style })).id;
       await sendVideos(projectId, zones, (u) => (upload = u));
       await api.process(projectId);
       busy = false;

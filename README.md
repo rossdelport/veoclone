@@ -31,8 +31,8 @@ internet, not even when you use the online editor.
   are big.
 - **Google Chrome or Microsoft Edge.** The editor runs in your web browser.
 - **Two iPhones with an ultra wide (0.5×) lens** (iPhone 11 or newer, but not
-  the iPhone 16e or iPhone Air, which have no 0.5× lens). The same model on
-  both sides is best.
+  the iPhone 16e or iPhone Air, which have no 0.5× lens). Two identical
+  phones work best, but different iPhones are fine.
 - **Something to hold both phones side by side, up high**: a tall tripod or
   pole with a mount for two phones. The higher, the better.
 - Power banks for both phones, and enough free space on each phone (about
@@ -75,7 +75,10 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
 
 ## How to film
 
-**Settings on both iPhones** (open **Settings › Camera › Record Video**):
+**Settings on both iPhones** (open **Settings › Camera › Record Video**).
+Give both phones the same settings. If their videos still come out
+different (for example from two different iPhone models), VeoClone makes a
+matching copy first, which takes longer.
 
 - Choose **4K at 30 fps**.
 - Switch **HDR Video off**. Otherwise the colours look washed out.
@@ -131,12 +134,15 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
    iPhone model. Under **Which lens?** pick **Ultra wide (0.5×)** if you
    tapped 0.5× when filming (as this guide says), otherwise **Normal (1×)**.
    If you don't know the model, or it isn't in the list, leave it on **Not
-   sure**. You can change this later.
+   sure**. Two different iPhones? Tick **The two phones are different
+   models** and choose the iPhone and lens for the **Left phone** and the
+   **Right phone**. You can change this later.
 5. **Camera style**: **Broadcast** (calm, like TV; best for most matches),
    **Action** (follows the ball more closely) or **Wide** (keeps all the
    players in the picture). You can change it later.
 6. Click **Start**. Keep the page open until both videos have been sent to
-   VeoClone. Then VeoClone works through four steps: checking the videos,
+   VeoClone. Then VeoClone works through four steps: checking the videos
+   (and making them match if the phones filmed in different formats),
    lining them up and joining them, making a preview, and AI ball tracking.
    This takes a while: for a full match, allow an hour or more. You can leave
    the page, but **keep the black VeoClone window open**. VeoClone keeps the
@@ -209,7 +215,8 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
   uploaded to OneDrive. (If you already have a Videos\VeoClone folder,
   VeoClone keeps using it.)
 - Each match has its own folder inside the **projects** folder there, with
-  VeoClone's own copy of the two phone videos, the preview and your finished
+  VeoClone's own copy of the two phone videos (plus a matching copy when the
+  phones filmed in different formats), the preview and your finished
   videos (in the **exports** folder). The match folders have code names, so
   the easiest way to find a finished video is the **Show in folder** button
   in the editor.
@@ -268,7 +275,8 @@ choose **Show more options › Send to › Desktop (create shortcut)**.
   takes about as long as the first time, and the editor can't be used
   meanwhile. Your trims and fixes are kept.
 - Check that both phones used the same lens and the same settings, and did
-  not move during the match.
+  not move during the match. If the two phones are different iPhone models,
+  tick **The two phones are different models** and pick each one.
 
 **"We couldn't line up the two videos", or the two halves are in the wrong place**
 - The left and right videos may be the wrong way round. Click **Swap left

@@ -71,10 +71,10 @@ function probe(name) {
   };
 }
 
-function newProject({ name, lensId = null, style = "broadcast" }) {
+function newProject({ name, lensId = null, rightLensId = null, style = "broadcast" }) {
   const t = now();
   return {
-    id: newId(), name, createdAt: t, updatedAt: t, lensId, style, status: "new",
+    id: newId(), name, createdAt: t, updatedAt: t, lensId, rightLensId, style, status: "new",
     files: {}, job: null, error: null, warnings: [], diskBytes: 0, exports: [],
   };
 }
@@ -89,6 +89,7 @@ function seed() {
       right: { name: "IMG_0877.MOV", sizeBytes: 769186, probe: probe("IMG_0877.MOV") },
     },
     lensId: "generic:ultra",
+    rightLensId: null,
     warnings: [GENERIC_LENS],
     calibration: { confidence: 1, syncOffsetFrames: 12, syncOffsetSeconds: 0.4, lens: "Not sure · Ultra wide (0.5×)" },
     fps: FPS, frameCount: FRAME_COUNT, diskBytes: 4_538_000,
@@ -186,9 +187,12 @@ function startProcess(p) {
       p.status = "ready";
       p.fps = FPS;
       p.frameCount = FRAME_COUNT;
+      const label = (id) => lenses.find((l) => l.id === id)?.label ?? id;
+      const left = label(p.lensId ?? "generic:ultra");
+      const right = p.rightLensId ? label(p.rightLensId) : left;
       p.calibration = {
         confidence: 0.92, syncOffsetFrames: 12, syncOffsetSeconds: 0.4,
-        lens: lenses.find((l) => l.id === (p.lensId ?? "generic:ultra"))?.label ?? p.lensId,
+        lens: left === right ? left : `Left phone: ${left}; right phone: ${right}`,
       };
       if (!p.lensId || p.lensId.startsWith("generic:")) p.warnings.push(GENERIC_LENS);
       p.diskBytes += 4_000_000;
@@ -398,9 +402,11 @@ async function handle(req, res) {
     if (M === "POST") {
       const body = await readJson(req);
       if (!body?.name?.trim()) return fail(res, 400, "Please give the match a name.");
-      if (body.lensId && !lenses.some((l) => l.id === body.lensId)) return fail(res, 400, "That iPhone model is not in the list.");
+      for (const id of [body.lensId, body.rightLensId]) {
+        if (id && !lenses.some((l) => l.id === id)) return fail(res, 400, "That iPhone model is not in the list.");
+      }
       if (body.lensId === undefined) body.lensId = null;
-      const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, style: body.style ?? "broadcast" });
+      const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, rightLensId: body.rightLensId ?? null, style: body.style ?? "broadcast" });
       projects.set(p.id, p);
       return send(res, 201, p);
     }
@@ -416,12 +422,19 @@ async function handle(req, res) {
       return send(res, 200, p);
     case "PATCH ": {
       const body = await readJson(req);
-      if (body && "lensId" in body && body.lensId !== null && !lenses.some((l) => l.id === body.lensId)) return fail(res, 400, "That iPhone model is not in the list.");
-      if ((body?.lensId !== undefined || body?.style) && busy(p)) return fail(res, 409, BUSY);
+      for (const key of ["lensId", "rightLensId"]) {
+        if (body && key in body && body[key] !== null && !lenses.some((l) => l.id === body[key])) return fail(res, 400, "That iPhone model is not in the list.");
+      }
+      if ((body?.lensId !== undefined || body?.rightLensId !== undefined || body?.style) && busy(p)) return fail(res, 409, BUSY);
       if (typeof body?.name === "string") p.name = body.name.trim() || p.name;
       if (body && "lensId" in body && body.lensId !== p.lensId) {
         p.lensId = body.lensId;
         delete p.calibration; // the next "process" lines the videos up again
+      }
+      // null: the right phone is the same model as the left one.
+      if (body && "rightLensId" in body && body.rightLensId !== (p.rightLensId ?? null)) {
+        p.rightLensId = body.rightLensId;
+        delete p.calibration;
       }
       if (body?.style) p.style = body.style;
       p.updatedAt = now();
@@ -475,6 +488,7 @@ async function handle(req, res) {
       if (busy(p) || uploads.get(p.id)) return fail(res, 409, BUSY);
       if (!p.files.left || !p.files.right) return fail(res, 400, "Both videos are needed. Add the left and the right phone's video first.");
       [p.files.left, p.files.right] = [p.files.right, p.files.left];
+      if (p.rightLensId) [p.lensId, p.rightLensId] = [p.rightLensId, p.lensId ?? "generic:ultra"]; // each phone keeps its lens
       delete p.calibration;
       previous.delete(p.id);
       Object.assign(p, { status: "uploaded", error: null, warnings: [], updatedAt: now() });

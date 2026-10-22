@@ -1,8 +1,9 @@
 // "Which iPhone?" and "Which lens?": the two simple choices that pick the lens
-// profile (docs/veoclone/DESIGN.md 4.6), and changing them after processing.
+// profile (docs/veoclone/DESIGN.md 4.6), once for both phones or once for
+// each, and changing them after processing.
 import { api, type LensOption, type ProjectMeta } from "../api";
 import { confirmDialog, describeError, toast } from "./common";
-import { h } from "./dom";
+import { h, setChildren } from "./dom";
 
 export const DEFAULT_LENS = "generic:ultra";
 const NOT_SURE = "Not sure";
@@ -74,6 +75,82 @@ export function lensPicker(options: LensOption[], value: string | null, onChange
   );
 }
 
+/** The lenses of a match: one for both phones, or one for each. */
+export interface PhoneLenses {
+  lensId: string;
+  /** null: the right phone is the same model as the left one. */
+  rightLensId: string | null;
+}
+
+/**
+ * The phone and lens choice for a match. Normally one choice for both
+ * phones; with "The two phones are different models" ticked, one for the
+ * left and one for the right phone. `onChange` gets both ids (rightLensId is
+ * null while the box is not ticked).
+ */
+export function phonesPicker(
+  options: LensOption[],
+  value: { lensId: string | null; rightLensId?: string | null },
+  onChange: (lenses: PhoneLenses) => void,
+  name = "lens",
+): HTMLElement {
+  let left = initialLens(options, value.lensId)?.id ?? DEFAULT_LENS;
+  let right = value.rightLensId ? (initialLens(options, value.rightLensId)?.id ?? null) : null;
+  let two = right !== null;
+  const emit = () => onChange({ lensId: left, rightLensId: two ? right : null });
+  const leftHead = h("h3", { class: "phone-head" }, "Left phone");
+  const leftPhone = h(
+    "div",
+    { class: "phone" },
+    leftHead,
+    lensPicker(options, left, (id) => {
+      left = id;
+      emit();
+    }, name),
+  );
+  const rightPhone = h("div", { class: "phone", role: "group", "aria-label": "Right phone" });
+  const show = () => {
+    leftHead.hidden = !two;
+    // Only a group of its own when there are two phones.
+    if (two) {
+      leftPhone.setAttribute("role", "group");
+      leftPhone.setAttribute("aria-label", "Left phone");
+    } else {
+      leftPhone.removeAttribute("role");
+      leftPhone.removeAttribute("aria-label");
+    }
+    rightPhone.hidden = !two;
+    setChildren(rightPhone);
+    if (!two) return;
+    // Built afresh when shown: the earlier choice, else the same as the left phone.
+    right ??= left;
+    rightPhone.append(
+      h("h3", { class: "phone-head" }, "Right phone"),
+      lensPicker(options, right, (id) => {
+        right = id;
+        emit();
+      }, `${name}-right`),
+    );
+  };
+  const box = h("input", {
+    type: "checkbox",
+    checked: two,
+    onChange: () => {
+      two = box.checked;
+      show();
+      emit();
+    },
+  });
+  show();
+  return h(
+    "div",
+    { class: "phones-picker" },
+    h("label", { class: "check phones-differ" }, box, "The two phones are different models"),
+    leftPhone,
+    rightPhone,
+  );
+}
+
 /**
  * "Change phone or lens" for a processed match: pick, confirm, then process
  * the match again with it. Resolves true once processing has started.
@@ -86,12 +163,13 @@ export async function changeLens(p: ProjectMeta): Promise<boolean> {
     toast(describeError(e).message, "error", 6000);
     return false;
   }
-  let chosen = initialLens(options, p.lensId)?.id ?? DEFAULT_LENS;
+  const current: PhoneLenses = { lensId: initialLens(options, p.lensId)?.id ?? DEFAULT_LENS, rightLensId: p.rightLensId ?? null };
+  let chosen = current;
   const ok = await confirmDialog({
     title: "Change phone or lens",
     text: [
       h("p", null, "If the picture looks bent, or the two halves don't join up, tell VeoClone which iPhone and which lens filmed this match."),
-      lensPicker(options, p.lensId, (id) => (chosen = id), "change-lens"),
+      phonesPicker(options, p, (lenses) => (chosen = lenses), "change-lens"),
       h(
         "p",
         { class: "small" },
@@ -102,12 +180,12 @@ export async function changeLens(p: ProjectMeta): Promise<boolean> {
     wide: true,
   });
   if (!ok) return false;
-  if (chosen === p.lensId) {
+  if (chosen.lensId === p.lensId && chosen.rightLensId === current.rightLensId) {
     toast("This match already uses that phone and lens. Pick a different one to process it again.", "info", 6000);
     return false;
   }
   try {
-    await api.updateProject(p.id, { lensId: chosen });
+    await api.updateProject(p.id, chosen);
     await api.process(p.id);
     return true;
   } catch (e) {

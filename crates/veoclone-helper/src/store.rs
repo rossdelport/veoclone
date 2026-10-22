@@ -210,7 +210,12 @@ pub struct ProjectMeta {
     pub name: String,
     pub created_at: String,
     pub updated_at: String,
+    /// The left phone's lens (and the right one's, unless `right_lens_id`).
     pub lens_id: Option<String>,
+    /// The right phone's lens when the two phones are different models;
+    /// `None`: the same as the left phone.
+    #[serde(default)]
+    pub right_lens_id: Option<String>,
     pub style: Style,
     pub status: Status,
     pub files: Files,
@@ -485,6 +490,7 @@ fn recovered_meta(id: &str, dir: &Path) -> ProjectMeta {
         created_at: now.clone(),
         updated_at: now,
         lens_id: None,
+        right_lens_id: None,
         style: Style::Broadcast,
         status: Status::Failed,
         files,
@@ -593,7 +599,7 @@ fn earlier_results(dir: &Path) -> Option<u64> {
 }
 
 /// Remove leftovers of uploads and jobs that never finished
-/// (`*.part`, `*.tmp`, `proxy.*.tmp.mp4`, `ai_pass.tmp.mkv`).
+/// (`*.part`, `*.tmp`, `proxy.*.tmp.mp4`, `matched-*.tmp.mp4`, `ai_pass.tmp.mkv`).
 fn remove_part_files(dir: &Path) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -605,7 +611,9 @@ fn remove_part_files(dir: &Path) {
     }
 }
 
-/// The uploaded original for one side (`left.<ext>` / `right.<ext>`).
+/// The uploaded original for one side (`left.<ext>` / `right.<ext>`). Only
+/// the exact name counts, so the matching copy (`matched-left.mp4`) and
+/// unfinished files are never taken for it.
 pub fn original_file(dir: &Path, side: &str) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
@@ -616,6 +624,31 @@ pub fn original_file(dir: &Path, side: &str) -> Option<PathBuf> {
                 && p.file_stem().is_some_and(|s| s == side)
                 && p.extension().is_some_and(|x| x != "part" && x != "tmp")
         })
+}
+
+/// The matching copy of one side's video (DESIGN.md 4.2), made when the
+/// two phones filmed in different formats.
+pub fn matched_file(dir: &Path, side: &str) -> PathBuf {
+    dir.join(format!("matched-{side}.mp4"))
+}
+
+/// What the matching copy was made from; it is only used while this holds.
+pub fn matched_record(dir: &Path, side: &str) -> PathBuf {
+    dir.join(format!("matched-{side}.json"))
+}
+
+/// Delete one side's matching copy. Returns true if there was one.
+pub fn remove_matched(dir: &Path, side: &str) -> bool {
+    let _ = std::fs::remove_file(matched_record(dir, side));
+    std::fs::remove_file(matched_file(dir, side)).is_ok()
+}
+
+/// The video every processing step and export reads for one side: the
+/// matching copy when there is one, otherwise the uploaded original.
+pub fn working_file(dir: &Path, side: &str) -> Option<PathBuf> {
+    let original = original_file(dir, side)?;
+    let matched = matched_file(dir, side);
+    Some(if matched.is_file() { matched } else { original })
 }
 
 #[cfg(test)]
@@ -629,6 +662,7 @@ pub(crate) mod tests {
             created_at: now_iso(),
             updated_at: now_iso(),
             lens_id: None,
+            right_lens_id: None,
             style: Style::Broadcast,
             status: Status::New,
             files: Files::default(),
@@ -662,6 +696,7 @@ pub(crate) mod tests {
         m.style = Style::FrameAll;
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["lensId"], serde_json::Value::Null);
+        assert_eq!(v["rightLensId"], serde_json::Value::Null);
         assert_eq!(v["job"], serde_json::Value::Null);
         assert_eq!(v["error"], serde_json::Value::Null);
         assert_eq!(v["style"], "frame_all");
@@ -888,5 +923,39 @@ pub(crate) mod tests {
             tmp.path().join("left.MOV")
         );
         assert!(original_file(tmp.path(), "right").is_none());
+    }
+
+    /// The matching copy is used for processing, but is never an original.
+    #[test]
+    fn working_file_prefers_the_matching_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for name in [
+            "matched-right.mp4",
+            "matched-right.json",
+            "matched-right.0123456789ab.tmp.mp4",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        assert!(original_file(dir, "right").is_none());
+        assert!(
+            working_file(dir, "right").is_none(),
+            "no copy without an original"
+        );
+        std::fs::write(dir.join("right.mov"), b"").unwrap();
+        std::fs::write(dir.join("left.mp4"), b"").unwrap();
+        assert_eq!(original_file(dir, "right").unwrap(), dir.join("right.mov"));
+        assert_eq!(
+            working_file(dir, "right").unwrap(),
+            dir.join("matched-right.mp4")
+        );
+        assert_eq!(working_file(dir, "left").unwrap(), dir.join("left.mp4"));
+        assert!(remove_matched(dir, "right"));
+        assert!(!remove_matched(dir, "right"));
+        assert!(!matched_record(dir, "right").exists());
+        assert_eq!(working_file(dir, "right").unwrap(), dir.join("right.mov"));
+        // A copy left half-made is cleared away at the next start.
+        remove_part_files(dir);
+        assert!(!dir.join("matched-right.0123456789ab.tmp.mp4").exists());
     }
 }

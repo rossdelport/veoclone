@@ -59,6 +59,7 @@ python3 crates/veoclone-helper/scripts/e2e.py --helper target/release/veoclone-h
 - `/api/health` `gpu.name`/`gpu.backend` are empty and `ai.provider` is
   `"checking"` for the first second or two after start; `ai.provider` is
   `"DirectML"`, `"CPU"` or `"none"`.
-- Changing `lensId` with `PATCH` keeps the old results until the next
-  `process`, which then re-calibrates; uploading a new file deletes all
-  results made from the old one.
+- Changing `lensId` or `rightLensId` with `PATCH` keeps the old results
+  until the next `process`, which then re-calibrates; uploading a new file
+  deletes all results made from the old one (and that side's matching
+  copy, `matched-<side>.mp4`).

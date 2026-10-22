@@ -861,8 +861,22 @@ dialog {
   margin-top: 8px;
 }
 .dialog-text > p + .lens-picker,
-.dialog-text > .lens-picker + p {
+.dialog-text > .lens-picker + p,
+.dialog-text > p + .phones-picker,
+.dialog-text > .phones-picker + p {
   margin-top: 14px;
+}
+.phones-differ {
+  margin-bottom: 14px;
+}
+.phone-head {
+  font-size: 16px;
+  margin: 0 0 8px;
+}
+.phone + .phone {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
 }
 .fix-picture h2 {
   font-size: 17px;

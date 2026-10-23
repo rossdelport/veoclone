@@ -61,6 +61,36 @@ test("overview matches the CPU mirror and maps canvas <-> yaw/pitch", async ({ p
   expect(errors).toEqual([]);
 });
 
+for (const rig of [
+  { tilt: -0.25, roll: 0.05 },
+  { tilt: 0.3, roll: -0.12 },
+]) {
+  test(`straightened (rig tilt ${rig.tilt}, roll ${rig.roll}): both views match the CPU mirror`, async ({ page }) => {
+    const errors = await open(page);
+    await page.evaluate((r) => (window as any).engineTest.setup(undefined, undefined, undefined, r), rig);
+    for (const pose of poses.slice(0, 4)) {
+      const s: Stats = await page.evaluate((p) => (window as any).engineTest.compareView(p), pose);
+      console.log("view", JSON.stringify(rig), JSON.stringify(pose), `mean ${s.meanAbs.toFixed(3)} max ${s.maxAbs} >3: ${s.over3}/${s.pixels} lit ${s.litPixels}`);
+      expect(s.litPixels).toBeGreaterThan(s.pixels * 0.3);
+      expect(s.meanAbs).toBeLessThan(0.6);
+      expect(s.over3, JSON.stringify(s.worst)).toBeLessThan(s.pixels * 0.003);
+    }
+    const o: Stats = await page.evaluate(() => (window as any).engineTest.compareOverview());
+    expect(o.litPixels).toBeGreaterThan(o.pixels * 0.3);
+    expect(o.meanAbs).toBeLessThan(0.6);
+    expect(o.over3, JSON.stringify(o.worst)).toBeLessThan(o.pixels * 0.005);
+    // turning the sliders: the same renderers follow
+    await page.evaluate(() => (window as any).engineTest.setRigTilt(0.1, 0.2));
+    const v: Stats = await page.evaluate((p) => (window as any).engineTest.compareView(p), poses[1]);
+    expect(v.meanAbs).toBeLessThan(0.6);
+    expect(v.over3).toBeLessThan(v.pixels * 0.003);
+    const o2: Stats = await page.evaluate(() => (window as any).engineTest.compareOverview());
+    expect(o2.meanAbs).toBeLessThan(0.6);
+    expect(o2.over3).toBeLessThan(o2.pixels * 0.005);
+    expect(errors).toEqual([]);
+  });
+}
+
 test("survives losing the GPU context and draws again once it is back", async ({ page }) => {
   const errors = await open(page);
   await page.evaluate(() => (window as any).engineTest.setup());

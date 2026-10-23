@@ -43,6 +43,12 @@ pub struct OverlayBody {
     pub ranges: Vec<Vec<Option<f64>>>,
 }
 
+/// Largest "Straighten picture" tilt, in degrees either way (DESIGN.md 5.5).
+pub const MAX_RIG_TILT_DEG: f64 = 35.0;
+/// Largest "Straighten picture" level (roll), in degrees either way (Reco's
+/// IMU path keeps up to 25).
+pub const MAX_RIG_ROLL_DEG: f64 = 25.0;
+
 /// The JSON body of `POST /exports`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +60,24 @@ pub struct ExportBody {
     pub path_base64: String,
     #[serde(default)]
     pub overlays: Vec<OverlayBody>,
+    /// "Straighten picture": Reco's `rig_tilt` in degrees for this export,
+    /// instead of match.json's. Missing: match.json's (older editors);
+    /// `null` (what a browser sends for NaN) is refused.
+    #[serde(default, deserialize_with = "present")]
+    pub rig_tilt_deg: Option<Option<f64>>,
+    /// Like `rig_tilt_deg`, for Reco's `rig_roll`.
+    #[serde(default, deserialize_with = "present")]
+    pub rig_roll_deg: Option<Option<f64>>,
+}
+
+/// Tells a field that is there but `null` (`Some(None)`) from a missing one
+/// (`None`, through `#[serde(default)]`).
+fn present<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
 }
 
 /// A checked text box.
@@ -74,6 +98,42 @@ pub struct ExportRequest {
     pub path: Arc<Vec<[f32; 3]>>,
     /// Text boxes to burn in, in drawing order; empty for none.
     pub overlays: Vec<Overlay>,
+    /// Rig tilt and roll in radians for every part, replacing match.json's;
+    /// `None` keeps match.json's.
+    pub rig_tilt: Option<f64>,
+    pub rig_roll: Option<f64>,
+}
+
+impl ExportRequest {
+    /// The calibration to render with: match.json's, with this export's
+    /// "Straighten picture" rig tilt/roll. Reco's StitchJob hands them to the
+    /// renderer's view and to the session that turns the path's world poses
+    /// into render poses (`world_to_render_pose`). The file is not changed.
+    pub fn calibration_for(&self, from_file: &MatchCalibration) -> MatchCalibration {
+        let mut cal = from_file.clone();
+        if let Some(t) = self.rig_tilt {
+            cal.rig_tilt = t;
+        }
+        if let Some(r) = self.rig_roll {
+            cal.rig_roll = r;
+        }
+        cal
+    }
+}
+
+/// Check one "Straighten picture" angle (degrees) and return it in radians.
+fn rig_angle(value: Option<Option<f64>>, what: &str, max: f64) -> Result<Option<f64>, String> {
+    match value {
+        None => Ok(None),
+        Some(Some(v)) if v.is_finite() && v.abs() <= max => Ok(Some(v.to_radians())),
+        Some(Some(v)) if v.is_finite() => Err(format!(
+            "Straighten picture: the {what} must be between -{max} and {max} degrees (it was \
+             {v:.1}). Please set it again."
+        )),
+        _ => Err(format!(
+            "Straighten picture: the {what} is not a number. Please set it again."
+        )),
+    }
 }
 
 /// Width and height from a PNG's header, or None when it is not a PNG.
@@ -168,6 +228,8 @@ pub fn validate(body: ExportBody, frame_count: u64) -> Result<ExportRequest, Str
         return Err("The camera path contains invalid numbers.".into());
     }
     let overlays = validate_overlays(body.overlays, w, h)?;
+    let rig_tilt = rig_angle(body.rig_tilt_deg, "tilt", MAX_RIG_TILT_DEG)?;
+    let rig_roll = rig_angle(body.rig_roll_deg, "level", MAX_RIG_ROLL_DEG)?;
     Ok(ExportRequest {
         segments: body.segments,
         width: w,
@@ -175,6 +237,8 @@ pub fn validate(body: ExportBody, frame_count: u64) -> Result<ExportRequest, Str
         quality: body.quality,
         path: Arc::new(path),
         overlays,
+        rig_tilt,
+        rig_roll,
     })
 }
 
@@ -465,8 +529,19 @@ pub fn run(
     // The videos processing used: the matching copies, if there are any.
     let left = working_file(&dir, "left").ok_or_else(|| not_ready("left file missing"))?;
     let right = working_file(&dir, "right").ok_or_else(|| not_ready("right file missing"))?;
-    let calibration = MatchCalibration::from_file(&dir.join("match.json"))
+    let from_file = MatchCalibration::from_file(&dir.join("match.json"))
         .map_err(|e| not_ready(&e.to_string()))?;
+    let calibration = req.calibration_for(&from_file);
+    tracing::info!(
+        "Straighten picture: rig tilt {:.2} deg, roll {:.2} deg{}",
+        calibration.rig_tilt.to_degrees(),
+        calibration.rig_roll.to_degrees(),
+        if req.rig_tilt.is_none() && req.rig_roll.is_none() {
+            " (from match.json)"
+        } else {
+            ""
+        }
+    );
     let out_dir = dir.join("exports").join(export_id);
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| JobError::failed("We couldn't create the export folder.", e))?;
@@ -556,6 +631,8 @@ mod tests {
             quality: Quality::Balanced,
             path_base64: STANDARD.encode(crate::ai::encode_path(path)),
             overlays: Vec::new(),
+            rig_tilt_deg: None,
+            rig_roll_deg: None,
         }
     }
 
@@ -706,6 +783,79 @@ mod tests {
         let mut b = body(vec![(0, 10)], 1920, 1080, &path);
         b.path_base64 = "!!!".into();
         assert!(validate(b, 100).is_err());
+    }
+
+    #[test]
+    fn straighten_picture_settings() {
+        let path = STANDARD.encode(crate::ai::encode_path(&[[0.0, 0.0, 30.0]; 10]));
+        let json = |extra: &str| {
+            format!(
+                r#"{{"segments":[{{"startFrame":0,"endFrame":10}}],"width":1920,"height":1080,
+                "quality":"fast","pathBase64":"{path}"{extra}}}"#
+            )
+        };
+        let check = |extra: &str| {
+            let body: ExportBody = serde_json::from_str(&json(extra)).unwrap();
+            validate(body, 10)
+        };
+        // Older editors send none: match.json's values are kept.
+        let req = check("").unwrap();
+        assert_eq!((req.rig_tilt, req.rig_roll), (None, None));
+        let req = check(r#","rigTiltDeg":14.5,"rigRollDeg":-3"#).unwrap();
+        assert!((req.rig_tilt.unwrap() - 14.5_f64.to_radians()).abs() < 1e-12);
+        assert!((req.rig_roll.unwrap() + 3_f64.to_radians()).abs() < 1e-12);
+        let req = check(r#","rigTiltDeg":0,"rigRollDeg":0"#).unwrap();
+        assert_eq!((req.rig_tilt, req.rig_roll), (Some(0.0), Some(0.0)));
+        // Only one given: the other stays match.json's.
+        let req = check(r#","rigRollDeg":20"#).unwrap();
+        assert_eq!(req.rig_tilt, None);
+        assert!(check(r#","rigTiltDeg":35,"rigRollDeg":-25"#).is_ok());
+
+        let err = check(r#","rigTiltDeg":35.5"#).unwrap_err();
+        assert!(
+            err.contains("tilt must be between -35 and 35 degrees"),
+            "{err}"
+        );
+        let err = check(r#","rigRollDeg":-25.5"#).unwrap_err();
+        assert!(
+            err.contains("level must be between -25 and 25 degrees"),
+            "{err}"
+        );
+        let err = check(r#","rigTiltDeg":null"#).unwrap_err();
+        assert!(err.contains("tilt is not a number"), "{err}");
+        let err = check(r#","rigRollDeg":null"#).unwrap_err();
+        assert!(err.contains("level is not a number"), "{err}");
+        // Not a number at all: the body does not parse (a 400 from read_json).
+        assert!(serde_json::from_str::<ExportBody>(&json(r#","rigTiltDeg":"5""#)).is_err());
+    }
+
+    #[test]
+    fn straighten_picture_reaches_the_calibration() {
+        let cal: MatchCalibration = serde_json::from_str(crate::calib::tests::SYNTH_MATCH).unwrap();
+        assert_eq!((cal.rig_tilt, cal.rig_roll), (0.0, 0.0));
+        let path = vec![[0.0, 0.0, 30.0]; 10];
+        let mut b = body(vec![(0, 10)], 1920, 1080, &path);
+        b.rig_tilt_deg = Some(Some(-14.0));
+        b.rig_roll_deg = Some(Some(2.5));
+        let req = validate(b, 10).unwrap();
+        let used = req.calibration_for(&cal);
+        assert!((used.rig_tilt + 14_f64.to_radians()).abs() < 1e-12);
+        assert!((used.rig_roll - 2.5_f64.to_radians()).abs() < 1e-12);
+        // everything else as in match.json
+        let mut back = used.clone();
+        back.rig_tilt = 0.0;
+        back.rig_roll = 0.0;
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&cal).unwrap()
+        );
+        // Without the settings match.json's own values stay (an IMU camera's).
+        let mut imu = cal.clone();
+        imu.rig_tilt = 0.2;
+        imu.rig_roll = -0.1;
+        let plain = validate(body(vec![(0, 10)], 1920, 1080, &path), 10).unwrap();
+        let used = plain.calibration_for(&imu);
+        assert_eq!((used.rig_tilt, used.rig_roll), (0.2, -0.1));
     }
 
     #[test]
@@ -891,6 +1041,8 @@ mod tests {
             quality: Quality::Fast,
             path: Arc::new(path),
             overlays: Vec::new(),
+            rig_tilt: None,
+            rig_roll: None,
         };
         let out_dir = tmp.path().join("export");
         std::fs::create_dir_all(&out_dir).unwrap();

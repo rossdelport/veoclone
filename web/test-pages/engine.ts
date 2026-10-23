@@ -4,10 +4,13 @@
 import {
   buildRig,
   CameraViewRenderer,
+  clampPose,
+  worldToRenderPose,
   OverviewRenderer,
+  overviewRay,
   sampleRay,
   viewRay,
-  yawPitchToDirection,
+  withRigTilt,
   type CalibInfo,
   type MatchCalibration,
   type Pose,
@@ -134,20 +137,20 @@ function synthCalib(): CalibInfo {
 }
 
 const api = {
-  /** Synthetic stacked texture through both renderers. */
-  setup(viewCss: [number, number] = [320, 180], overviewCss: [number, number] = [400, 120], tile: [number, number] = [256, 144]) {
+  /** Synthetic stacked texture through both renderers (optionally with a rig tilt/roll, radians). */
+  setup(viewCss: [number, number] = [320, 180], overviewCss: [number, number] = [400, 120], tile: [number, number] = [256, 144], rigTilt?: { tilt: number; roll: number }) {
     document.body.innerHTML = "";
     state?.view.dispose();
     state?.overview.dispose();
     const calib = synthCalib();
     const viewCanvas = makeCanvas(...viewCss);
     const overviewCanvas = makeCanvas(...overviewCss);
-    const view = new CameraViewRenderer(viewCanvas, calib);
-    const overview = new OverviewRenderer(overviewCanvas, calib);
+    const view = new CameraViewRenderer(viewCanvas, calib, rigTilt);
+    const overview = new OverviewRenderer(overviewCanvas, calib, rigTilt);
     const img = stackedPattern(...tile);
     view.updateVideoFrame(img);
     overview.updateVideoFrame(img);
-    state = { calib, rig: buildRig(calib), img, view, overview, viewCanvas, overviewCanvas };
+    state = { calib, rig: buildRig(calib, rigTilt), img, view, overview, viewCanvas, overviewCanvas };
     return { dpr: window.devicePixelRatio };
   },
 
@@ -163,8 +166,18 @@ const api = {
     s.overview.render();
     const e = s.overview.extent;
     return compare(s.overviewCanvas, s.img, (x, y) =>
-      yawPitchToDirection(e.yawMax - (x * 0.5 + 0.5) * (e.yawMax - e.yawMin), e.pitchMax - (0.5 - y * 0.5) * (e.pitchMax - e.pitchMin), s.rig),
+      overviewRay(e.yawMax - (x * 0.5 + 0.5) * (e.yawMax - e.yawMin), e.pitchMax - (0.5 - y * 0.5) * (e.pitchMax - e.pitchMin), s.rig),
     );
+  },
+
+  /** Change the rig tilt/roll of both renderers (like the Straighten sliders) and refit the overview. */
+  setRigTilt(tilt: number, roll: number) {
+    const s = state!;
+    s.view.setRigTilt(tilt, roll);
+    s.overview.setRigTilt(tilt, roll);
+    s.overview.refit();
+    s.rig = withRigTilt(s.rig, tilt, roll);
+    return s.overview.extent;
   },
 
   overviewMapping() {
@@ -220,15 +233,24 @@ const api = {
     return { width: video.videoWidth, height: video.videoHeight, duration: video.duration };
   },
 
-  /** Render each pose at its synced frame; returns PNG data URLs. */
-  async renderProxyFrames(calib: CalibInfo, items: { frame: number; pose: Pose }[], size: [number, number]) {
+  /**
+   * Render each pose at its synced frame; returns PNG data URLs. An item with
+   * `input` instead of `pose` is a world pose for a Reco Panner: it gets the
+   * export's clamp first (coverage from the test port of from_calibration).
+   * The view uses match.json's rig_tilt / rig_roll, like `reco stitch`.
+   */
+  async renderProxyFrames(calib: CalibInfo, items: { frame: number; pose?: Pose; input?: Pose }[], size: [number, number]) {
     document.body.innerHTML = "";
     const video = (window as unknown as { parityVideo: HTMLVideoElement }).parityVideo;
     const canvas = makeCanvas(...size);
     const view = new CameraViewRenderer(canvas, calib);
+    const rig = buildRig(calib);
     const fps = calib.fps.num / calib.fps.den;
-    const out: { frame: number; mediaTime: number; png: string }[] = [];
-    for (const { frame, pose } of items) {
+    const coverage = items.some((i) => i.input) ? coverageFromMatch(calib.match) : null;
+    const out: { frame: number; mediaTime: number; png: string; pose: Pose; render: { yaw: number; pitch: number } }[] = [];
+    for (const item of items) {
+      const frame = item.frame;
+      const pose = item.input ? clampPose(item.input, coverage!, size[0] / size[1]) : item.pose!;
       const seeked = new Promise((r) => video.addEventListener("seeked", r, { once: true }));
       video.currentTime = (frame + 0.25) / fps;
       await seeked;
@@ -246,7 +268,7 @@ const api = {
       c2.width = canvas.width;
       c2.height = canvas.height;
       c2.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(px.buffer), canvas.width, canvas.height), 0, 0);
-      out.push({ frame, mediaTime, png: c2.toDataURL("image/png") });
+      out.push({ frame, mediaTime, png: c2.toDataURL("image/png"), pose, render: worldToRenderPose(pose, rig, rig.tilt) });
     }
     view.dispose();
     return out;

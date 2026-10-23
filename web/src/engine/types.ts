@@ -68,6 +68,10 @@ export interface CalibInfo {
 
 export interface Keyframe {
   frame: number;
+  /**
+   * Where the centre of the picture looks (an "aim", rigtilt.ts): the world
+   * pose without rig tilt/roll. Kept when the straightening changes.
+   */
   yaw: number;
   pitch: number;
   /** Pre-zoom fov (the fov the user saw multiplied by the zoom at the time). */
@@ -107,6 +111,19 @@ export interface Overlay {
   end: number;
 }
 
+/**
+ * "Straighten picture" (DESIGN.md 5.5): Reco's rig tilt and roll in degrees,
+ * used instead of match.json's for the preview and the export. The default is
+ * match.json's: 0/0 for iPhones (no level sensor in the video), a GoPro's or
+ * DJI's own level from its accelerometer.
+ */
+export interface Straighten {
+  /** Rig tilt: how far the phones pointed down (positive) or up (negative). -35..35. */
+  tiltDeg: number;
+  /** Rig roll: how far the phones lean to the right (positive) or left (negative). -25..25. */
+  rollDeg: number;
+}
+
 export interface Edits {
   version: 1;
   segments: Segment[];
@@ -123,6 +140,8 @@ export interface Edits {
   joinSeconds: number;
   /** Text boxes, drawn in this order (later ones on top). */
   overlays: Overlay[];
+  /** Rig tilt/roll for the preview and the export. */
+  straighten: Straighten;
   export: { width: number; height: number; quality: ExportQuality };
 }
 

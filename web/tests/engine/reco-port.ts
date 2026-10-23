@@ -249,10 +249,22 @@ export function coverageFromMatch(match: MatchCalibration): Coverage & { leftSli
   };
 }
 
-/** renderer.rs view_matrix (quaternion form, no rig tilt/roll) + look_at_rh. */
-export function viewMatrix(eye: V3, yaw: number, pitch: number): M4 {
-  const { bf, br } = basis(eye);
-  const up: V3 = [0, 1, 0];
+/**
+ * renderer.rs view_matrix (quaternion form) + look_at_rh, with Reco's rig
+ * tilt (about base right) and roll (about the tilted forward, negated).
+ */
+export function viewMatrix(eye: V3, yaw: number, pitch: number, rigTilt = 0, rigRoll = 0): M4 {
+  const { bf: bf0, br } = basis(eye);
+  let bf = bf0;
+  let up: V3 = [0, 1, 0];
+  if (Math.abs(rigTilt) > 1e-6) {
+    const tiltQ = m4axisAngle(br, rigTilt);
+    bf = applyRot(tiltQ, bf);
+    up = applyRot(tiltQ, up);
+  }
+  if (Math.abs(rigRoll) > 1e-6) {
+    up = applyRot(m4axisAngle(bf, -rigRoll), up);
+  }
   const yawQ = m4axisAngle(up, yaw);
   const right = applyRot(yawQ, br);
   const pitchQ = m4axisAngle(right, pitch);
@@ -269,6 +281,36 @@ export function viewMatrix(eye: V3, yaw: number, pitch: number): M4 {
     x[2], y[2], z[2], 0,
     -dot(x, eye), -dot(y, eye), -dot(z, eye), 1,
   ];
+}
+
+/** VirtualCamera::yaw_pitch_to_direction. */
+export function yawPitchToDir(yaw: number, pitch: number, eye: V3): V3 {
+  const { bf, br } = basis(eye);
+  const cp = Math.cos(pitch);
+  return [bf[0] * cp * Math.cos(yaw) - br[0] * cp * Math.sin(yaw), Math.sin(pitch), bf[2] * cp * Math.cos(yaw) - br[2] * cp * Math.sin(yaw)];
+}
+
+/** lens/rig_correction.rs world_to_render_pose (quaternion inversion of the tilt+roll). */
+export function worldToRenderPosePort(eye: V3, worldYaw: number, worldPitch: number, rigTilt: number, rigRoll: number): { yaw: number; pitch: number } {
+  if (Math.abs(rigTilt) < 1e-6 && Math.abs(rigRoll) < 1e-6) return { yaw: worldYaw, pitch: worldPitch };
+  const worldDir = yawPitchToDir(worldYaw, worldPitch, eye);
+  const { bf: bf0, br } = basis(eye);
+  let bf = bf0;
+  let combined: M4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  if (Math.abs(rigTilt) > 1e-6) {
+    const tiltQ = m4axisAngle(br, rigTilt);
+    bf = applyRot(tiltQ, bf);
+    combined = tiltQ;
+  }
+  if (Math.abs(rigRoll) > 1e-6) combined = m4mul(m4axisAngle(bf, -rigRoll), combined);
+  // inverse of a rotation = transpose
+  const inv: M4 = [
+    combined[0], combined[4], combined[8], 0,
+    combined[1], combined[5], combined[9], 0,
+    combined[2], combined[6], combined[10], 0,
+    0, 0, 0, 1,
+  ];
+  return dirToYawPitch(applyRot(inv, worldDir), eye);
 }
 
 /** nalgebra Perspective3::new(aspect, fovy, near, far) (OpenGL convention). */

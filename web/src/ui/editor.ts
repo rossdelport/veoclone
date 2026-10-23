@@ -2,6 +2,7 @@
 // trims, camera fixes (keyframes), sliders, autosave and export.
 import { api, helperUrl, watchProject, type ProjectMeta } from "../api";
 import {
+  aimOfWorld,
   buildRig,
   CameraViewRenderer,
   clampPose,
@@ -12,14 +13,26 @@ import {
   globalYawRange,
   keptFrameCount,
   keyframeFromView,
+  lookAcross,
   maxFovOf,
   normalizeEdits,
   OverviewRenderer,
+  overviewPointOf,
   poseAt,
+  renderToWorldPose,
+  STRAIGHTEN_LIMITS,
+  straightenOfMatch,
+  straightenRadians,
   timeToFrame,
+  withRigTilt,
+  worldToRenderPose,
+  yawPitchToDirection,
   type CalibInfo,
   type Edits,
+  type LookSide,
   type Pose,
+  type Rig,
+  type Straighten,
 } from "../engine";
 import { button, describeError, errorBox, iconButton, notice, toast } from "./common";
 import { debounce, formatDuration, h, icon, setChildren } from "./dom";
@@ -37,6 +50,10 @@ import { Timeline } from "./timeline";
 const ASPECT = 16 / 9;
 const MIN_FOV = 8;
 const DEG = Math.PI / 180;
+
+/** Straighten picture values as shown next to the sliders. */
+const fmtTilt = (v: number) => (Math.abs(v) < 0.05 ? "0°" : `${Math.abs(v).toFixed(1)}° ${v > 0 ? "down" : "up"}`);
+const fmtLevel = (v: number) => (Math.abs(v) < 0.05 ? "0°" : `${v > 0 ? "↻" : "↺"} ${Math.abs(v).toFixed(1)}°`);
 
 export function editorPage(ctx: PageContext, id: string): Page {
   ctx.setTitle("Editor");
@@ -60,7 +77,7 @@ export function editorPage(ctx: PageContext, id: string): Page {
     }
     const [calib, ai, raw] = await Promise.all([api.calibration(id), api.aiPath(id), api.getEdits(id)]);
     if (disposed) return;
-    const result = build(ctx, id, project, calib, ai, normalizeEdits(raw, calib.frameCount));
+    const result = build(ctx, id, project, calib, ai, normalizeEdits(raw, calib.frameCount, straightenOfMatch(calib.match)));
     store = result.store;
     cleanup = result.dispose;
   })().catch((e) => {
@@ -85,7 +102,14 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const fpsValue = fps.num / fps.den;
   const cov = calib.coverage;
   const maxFov = maxFovOf(cov);
-  const rig = buildRig(calib);
+  // The AI path holds world poses for match.json's rig tilt/roll (0 for
+  // iPhones); the view uses the editor's "Straighten picture" (rigtilt.ts).
+  const aiRig = buildRig(calib);
+  // match.json's own level: 0/0 for iPhones, a GoPro's from its accelerometer.
+  // The default straightening, and what Reset goes back to.
+  const matchStraighten = straightenOfMatch(calib.match);
+  const cameraLevel = matchStraighten.tiltDeg !== 0 || matchStraighten.rollDeg !== 0;
+  let rig: Rig = buildRig(calib, straightenRadians(initial.straighten));
   const store = new EditStore(ai, calib, initial, (e) => api.putEdits(id, e));
   const disposers: (() => void)[] = [];
   const listen = <K extends keyof WindowEventMap>(target: Window, type: K, fn: (e: WindowEventMap[K]) => void) => {
@@ -110,6 +134,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   let videoReady = false;
   let hintDone = false; // the user has moved the camera once
   let textShown = ""; // what the text canvas shows
+  let peek: LookSide | null = null; // "Look left / centre / right": preview only
 
   // ---------------------------------------------------------------------
   // Layout
@@ -123,7 +148,9 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const hint = h("div", { class: "viewer-hint" }, "Drag or scroll to fix the camera here · Whole video: Zoom slider");
   // Text boxes, drawn by the same function as the export (DESIGN.md 5.4).
   const textCanvas = h("canvas", { class: "text-canvas", "aria-hidden": "true", "data-testid": "text-canvas" });
-  const viewerBox = h("div", { class: "viewer-box", "data-testid": "camera-view" }, camCanvas, textCanvas, badge, hint, viewerMsg);
+  // Thin level lines over the picture while a Straighten slider moves.
+  const guides = h("div", { class: "level-guides", "aria-hidden": "true", "data-testid": "level-guides" }, [1, 2, 3, 4].map(() => h("span", null)));
+  const viewerBox = h("div", { class: "viewer-box", "data-testid": "camera-view" }, camCanvas, textCanvas, guides, badge, hint, viewerMsg);
   const video = h("video", { class: "proxy-video", preload: "auto", playsInline: true, crossOrigin: "anonymous", "aria-hidden": "true" });
 
   const ovCanvas = h("canvas", { class: "overview-canvas" });
@@ -247,6 +274,9 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     },
   });
   const sliders = h("div", { class: "sliders" });
+  const straightenBox = h("div", { class: "sliders" });
+  const lookRow = h("div", { class: "look-row", role: "group", "aria-label": "Point the preview across the pitch" });
+  const straightenHint = h("div", { class: "straighten-hint-host" });
   const fixList = h("div", { class: "fix-list" });
   const trimInfo = h("div", { class: "trim-info" });
   const notes = h("div", { class: "editor-notes" });
@@ -254,6 +284,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     "aside",
     { class: "editor-side", "aria-label": "Editing tools" },
     notes,
+    straightenHint,
     h(
       "section",
       { class: "side-section" },
@@ -262,7 +293,6 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       ovBox,
       h("div", { class: "overview-legend" }, h("span", { class: "ov-box" }, "Camera"), h("span", { class: "ov-ai" }, "Where the AI looks"), h("span", { class: "ov-fix" }, "Your fixes")),
     ),
-    calib.match.rig_tilt || calib.match.rig_roll ? notice("warning", "The phones were tilted, so the preview may differ slightly from the final video.") : null,
     h(
       "section",
       { class: "side-section" },
@@ -290,6 +320,22 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
           "Change phone or lens",
         ),
       ),
+    ),
+    h(
+      "section",
+      { class: "side-section straighten", id: "straighten-section", "data-testid": "straighten" },
+      h("h2", null, icon(I.level, 20), "Straighten picture"),
+      h(
+        "p",
+        { class: "muted small" },
+        "Phones pointed down make the picture lean when the camera turns. Move these until the far side of the pitch looks level when the camera looks left, centre and right. Goal posts and flag poles should stand straight up.",
+      ),
+      cameraLevel
+        ? h("p", { class: "small camera-level", "data-testid": "camera-level" }, `Your cameras measured their own level (tilt ${fmtTilt(matchStraighten.tiltDeg)}, level ${fmtLevel(matchStraighten.rollDeg)}); Reset goes back to it.`)
+        : null,
+      lookRow,
+      straightenBox,
+      h("p", { class: "muted small" }, "Tip for next time: keep the phones as level as possible: tilt them down only as much as the pitch needs, and not to one side."),
     ),
     h("section", { class: "side-section" }, h("h2", null, "Your fixes"), fixList),
     h("section", { class: "side-section" }, h("h2", null, "Trim"), trimInfo),
@@ -347,8 +393,8 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   let camR: CameraViewRenderer;
   let ovR: OverviewRenderer;
   try {
-    camR = new CameraViewRenderer(camCanvas, calib);
-    ovR = new OverviewRenderer(ovCanvas, calib);
+    camR = new CameraViewRenderer(camCanvas, calib, rig.tilt);
+    ovR = new OverviewRenderer(ovCanvas, calib, rig.tilt);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const friendly = msg.startsWith("This browser") ? msg : "The video preview could not start in this browser.";
@@ -358,8 +404,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     store.dispose();
     return { store, dispose: () => undefined };
   }
-  const ex = ovR.extent;
-  ovBox.style.aspectRatio = String(Math.min(4, Math.max(1.5, (ex.yawMax - ex.yawMin) / (ex.pitchMax - ex.pitchMin))));
+  const fitOverviewBox = () => {
+    const ex = ovR.extent;
+    ovBox.style.aspectRatio = String(Math.min(4, Math.max(1.5, (ex.yawMax - ex.yawMin) / (ex.pitchMax - ex.pitchMin))));
+  };
+  fitOverviewBox();
   const yawRange = globalYawRange(cov);
 
   const exportPanel = new ExportPanel(id, store, calib, () => watch.refresh());
@@ -447,6 +496,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
 
   function seek(f: number) {
     f = Math.min(Math.max(Math.round(f), 0), n - 1);
+    if (f !== frame) endPeek();
     frame = f;
     wantFrame = f;
     if (video.readyState >= 1) {
@@ -472,6 +522,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
 
   async function togglePlay() {
     if (!video.paused) return pause();
+    endPeek();
     if (frame >= n - 1 || (skipCuts && frame >= lastKept())) seek(store.edits.segments[0]?.start ?? 0);
     else if (skipCuts && !isKept(store.edits.segments, frame)) seek(nextKept(store.edits.segments, frame) ?? frame);
     try {
@@ -501,7 +552,9 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     });
   }
 
-  const currentPose = (): Pose => livePose ?? poseAt(store.finalPath, shownFrame);
+  /** The camera's pose at the frame shown (a world pose for the current straightening). */
+  const pathPose = (): Pose => poseAt(store.finalPath, shownFrame);
+  const currentPose = (): Pose => livePose ?? (peek ? lookAcross(peek, pathPose(), rig, cov, ASPECT) : pathPose());
 
   function draw() {
     if (disposedFlag) return;
@@ -559,6 +612,12 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   function drawPitchOverlay(pose: Pose) {
     const [g, w, hh] = sizeCanvas(ovOverlay);
     g.clearRect(0, 0, w, hh);
+    // The overview maps render yaw/pitch (level when straightened); aims and
+    // the view's edges go through overviewPointOf.
+    const toCanvas = (aim: { yaw: number; pitch: number }) => {
+      const o = overviewPointOf(yawPitchToDirection(aim.yaw, aim.pitch, rig), rig);
+      return ovR.yawPitchToCanvas(o.yaw, o.pitch);
+    };
     const pts = frustumOutline(pose, rig, ASPECT, 12).map((p) => ovR.yawPitchToCanvas(p.yaw, p.pitch));
     const path = new Path2D();
     pts.forEach((p, i) => (i ? path.lineTo(p.x, p.y) : path.moveTo(p.x, p.y)));
@@ -575,7 +634,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     // Where the AI wanted to look.
     const f = shownFrame;
     if (ai.length >= (f + 1) * 3) {
-      const a = ovR.yawPitchToCanvas(ai[f * 3], ai[f * 3 + 1]);
+      const a = toCanvas(aimOfWorld({ yaw: ai[f * 3], pitch: ai[f * 3 + 1] }, aiRig, aiRig.tilt));
       g.strokeStyle = "rgba(255,255,255,0.85)";
       g.lineWidth = 1.5;
       g.beginPath();
@@ -586,7 +645,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     const reach = (store.edits.holdSeconds + store.edits.fadeSeconds) * fpsValue;
     for (const k of store.edits.keyframes) {
       if (Math.abs(k.frame - f) > reach) continue;
-      const p = ovR.yawPitchToCanvas(k.yaw, k.pitch);
+      const p = toCanvas(k);
       const r = k.frame === selected ? 6 : 4.5;
       g.fillStyle = "#fbbf24";
       g.beginPath();
@@ -621,6 +680,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       badge.textContent = "Moving the camera…";
       return;
     }
+    if (peek) {
+      badge.className = "view-badge badge-live";
+      badge.textContent = `Looking ${peek === "centre" ? "at the centre" : peek} · preview only`;
+      return;
+    }
     const kind = influence(frame);
     badge.className = `view-badge badge-${kind}`;
     badge.textContent = kind === "ai" ? "AI camera" : kind === "fix" ? "Your fix" : "Easing back to the AI";
@@ -635,8 +699,9 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     if (!livePose) return;
     const pose = livePose;
     const f = frame;
+    const viewRig = rig;
     store.change((e) => {
-      e.keyframes = upsertKeyframe(e.keyframes, keyframeFromView(pose, f, e.zoom));
+      e.keyframes = upsertKeyframe(e.keyframes, keyframeFromView(pose, f, e.zoom, viewRig));
     });
     store.recompute.flush();
     livePose = null;
@@ -650,6 +715,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
 
   function addFixHere() {
     pause();
+    endPeek();
     if (livePose) return commitLive();
     livePose = poseAt(store.finalPath, frame);
     commitLive();
@@ -670,7 +736,9 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     if (e.button !== 0 || !videoReady || !viewerMsg.hidden) return;
     pause();
     commitWheel.flush();
-    drag = { x: e.clientX, y: e.clientY, pose: currentPose(), moved: false, id: e.pointerId };
+    const start = currentPose();
+    endPeek();
+    drag = { x: e.clientX, y: e.clientY, pose: start, moved: false, id: e.pointerId };
     viewerBox.setPointerCapture(e.pointerId);
     viewerBox.classList.add("grabbing");
   });
@@ -681,8 +749,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     if (!drag.moved && Math.hypot(dx, dy) < 3) return;
     drag.moved = true;
     // Grab-and-drag like a map: dragging right shows what is further left.
+    // Moves in render yaw/pitch, so a sideways drag pans level when straightened.
     const k = (drag.pose.fov * DEG) / Math.max(1, viewerBox.clientHeight);
-    livePose = clampView({ yaw: drag.pose.yaw + dx * k, pitch: drag.pose.pitch + dy * k, fov: drag.pose.fov });
+    const r0 = worldToRenderPose(drag.pose, rig, rig.tilt);
+    const w = renderToWorldPose({ yaw: r0.yaw + dx * k, pitch: r0.pitch + dy * k }, rig, rig.tilt);
+    livePose = clampView({ ...w, fov: drag.pose.fov });
     requestDraw();
   });
   const endDrag = (e: PointerEvent) => {
@@ -701,6 +772,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       e.preventDefault();
       pause();
       const base = currentPose();
+      endPeek();
       const delta = e.deltaMode === 1 ? e.deltaY * 30 : e.deltaY;
       livePose = clampView({ ...base, fov: base.fov * Math.exp(delta * 0.0012) });
       requestDraw();
@@ -712,8 +784,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   let aiming: number | null = null;
   const aim = (e: PointerEvent) => {
     const r = ovOverlay.getBoundingClientRect();
-    const yp = ovR.canvasToYawPitch(e.clientX - r.left, e.clientY - r.top);
-    livePose = clampView({ yaw: yp.yaw, pitch: yp.pitch, fov: (livePose ?? currentPose()).fov });
+    // An overview point is a render yaw/pitch: the view centred there.
+    const yp = renderToWorldPose(ovR.canvasToYawPitch(e.clientX - r.left, e.clientY - r.top), rig, rig.tilt);
+    const fov = (livePose ?? currentPose()).fov;
+    endPeek();
+    livePose = clampView({ yaw: yp.yaw, pitch: yp.pitch, fov });
     requestDraw();
   };
   ovOverlay.addEventListener("pointerdown", (e) => {
@@ -816,11 +891,184 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     return { d, input, out };
   });
 
+  // ---------------------------------------------------------------------
+  // Straighten picture (DESIGN.md 5.5)
+  // ---------------------------------------------------------------------
+  /** Point the renderers, picking and new fixes at the edits' straightening. */
+  function syncStraighten() {
+    const { tilt, roll } = straightenRadians(store.edits.straighten);
+    if (tilt === rig.tilt.tilt && roll === rig.tilt.roll) return;
+    rig = withRigTilt(rig, tilt, roll);
+    camR.setRigTilt(tilt, roll);
+    ovR.setRigTilt(tilt, roll);
+    ovDirty = true;
+    refitOverview();
+    renderStraightenHint();
+  }
+  // Fitting the overview to the turned picture samples it; not on every slider step.
+  const refitOverview = debounce(() => {
+    if (disposedFlag) return;
+    ovR.refit();
+    fitOverviewBox();
+    ovDirty = true;
+    requestDraw();
+  }, 200);
+
+  let guidesTimer = 0;
+  function showGuides() {
+    guides.classList.add("shown");
+    clearTimeout(guidesTimer);
+    guidesTimer = window.setTimeout(() => guides.classList.remove("shown"), 1500);
+  }
+
+  type StraightenDef = { key: keyof Straighten; label: string; ends: [string, string]; fmt: (v: number) => string; help: string };
+  const STRAIGHTEN: StraightenDef[] = [
+    {
+      key: "tiltDeg",
+      label: "Tilt",
+      ends: ["Phones pointed up", "Phones pointed down"],
+      fmt: fmtTilt,
+      help: "How much the phones pointed down. Look left or right and move this until the far side is level.",
+    },
+    {
+      key: "rollDeg",
+      label: "Level",
+      ends: ["Left side down", "Right side down"],
+      fmt: fmtLevel,
+      help: "Turns the picture if it leans left or right even when the camera looks at the centre.",
+    },
+  ];
+  const straightenEls = STRAIGHTEN.map((d) => {
+    const [min, max] = STRAIGHTEN_LIMITS[d.key];
+    const out = h("output", { class: "slider-value" });
+    const set = (v: number) => {
+      store.change((e) => (e.straighten = { ...e.straighten, [d.key]: v }), `straighten-${d.key}`);
+      dismissStraightenHint();
+    };
+    const input = h("input", {
+      type: "range",
+      min,
+      max,
+      step: 0.5,
+      "aria-label": d.label,
+      "data-testid": `straighten-${d.key}`,
+      onInput: () => {
+        const v = Number(input.value);
+        out.textContent = d.fmt(v);
+        pause();
+        showGuides();
+        set(v);
+      },
+      onPointerdown: () => showGuides(),
+      onChange: () => input.blur(),
+    });
+    const home = matchStraighten[d.key];
+    const reset = iconButton(
+      I.refresh,
+      cameraLevel ? `Reset ${d.label.toLowerCase()} to the camera's own level (${d.fmt(home)})` : `Reset ${d.label.toLowerCase()}`,
+      () => {
+        if (store.edits.straighten[d.key] === home) return;
+        showGuides();
+        set(home);
+      },
+      "btn-ghost btn-small",
+    );
+    reset.dataset.testid = `reset-${d.key}`;
+    straightenBox.append(
+      h(
+        "div",
+        { class: "slider" },
+        h("div", { class: "slider-top", title: d.help }, h("label", null, d.label), out, reset),
+        input,
+        h("div", { class: "slider-ends muted small" }, h("span", null, d.ends[0]), h("span", null, d.ends[1])),
+      ),
+    );
+    return { d, input, out, reset };
+  });
+
+  const LOOKS: [LookSide, string][] = [
+    ["left", "Look left"],
+    ["centre", "Look centre"],
+    ["right", "Look right"],
+  ];
+  const lookBtns = LOOKS.map(([side, label]) => {
+    const b = button(label, () => {
+      pause();
+      livePose = null;
+      peek = peek === side ? null : side;
+      renderLooks();
+      requestDraw();
+    }, { class: "btn-small", title: `Point the preview at the ${side === "centre" ? "middle" : `${side} edge`} of the pitch now. Not saved as a fix.` });
+    b.dataset.testid = `look-${side}`;
+    return { side, b };
+  });
+  lookRow.append(...lookBtns.map((x) => x.b));
+  function renderLooks() {
+    for (const { side, b } of lookBtns) {
+      b.setAttribute("aria-pressed", String(peek === side));
+      b.classList.toggle("btn-primary", peek === side);
+      b.classList.toggle("btn-secondary", peek !== side);
+    }
+  }
+  function endPeek() {
+    if (peek === null) return;
+    peek = null;
+    renderLooks();
+    requestDraw();
+  }
+  renderLooks();
+
+  // One-time hint for matches whose cameras recorded no level (iPhones) and
+  // that are not straightened yet (remembered in this browser).
+  const HINT_KEY = "veoclone.hint.straighten";
+  const hintDismissed = () => {
+    try {
+      return localStorage.getItem(HINT_KEY) === "dismissed";
+    } catch {
+      return false;
+    }
+  };
+  function dismissStraightenHint() {
+    try {
+      localStorage.setItem(HINT_KEY, "dismissed");
+    } catch {
+      // Private mode: hidden until the editor opens again.
+    }
+    setChildren(straightenHint);
+  }
+  function renderStraightenHint() {
+    const s = store.edits.straighten;
+    if (cameraLevel || s.tiltDeg !== 0 || s.rollDeg !== 0 || hintDismissed()) return setChildren(straightenHint);
+    if (straightenHint.firstChild) return;
+    const box = notice(
+      "info",
+      "Picture leaning when the camera turns? Use Straighten picture.",
+      button("Straighten picture", () => {
+        const section = document.getElementById("straighten-section");
+        section?.scrollIntoView({ behavior: "smooth", block: "start" });
+        straightenEls[0].input.focus({ preventScroll: true });
+        peek = "left";
+        renderLooks();
+        requestDraw();
+        dismissStraightenHint();
+      }, { variant: "secondary", class: "btn-small", icon: I.level }),
+    );
+    box.dataset.testid = "straighten-hint";
+    box.append(iconButton(I.x, "Hide this tip", () => dismissStraightenHint(), "btn-ghost btn-small"));
+    setChildren(straightenHint, box);
+  }
+
   function renderSide() {
     for (const { d, input, out } of sliderEls) {
       const v = store.edits[d.key];
       if (document.activeElement !== input) input.value = String(v);
       out.textContent = d.fmt(v);
+    }
+    for (const { d, input, out, reset } of straightenEls) {
+      const v = store.edits.straighten[d.key];
+      if (document.activeElement !== input) input.value = String(v);
+      out.textContent = d.fmt(v);
+      reset.disabled = v === matchStraighten[d.key];
     }
 
     const ks = store.edits.keyframes;
@@ -905,6 +1153,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   function undo() {
     if (store.undo()) {
       livePose = null;
+      endPeek();
       if (selected !== null && !store.edits.keyframes.some((k) => k.frame === selected)) selected = null;
       toast("Undone.", "info", 1500);
     }
@@ -930,6 +1179,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   );
   disposers.push(
     store.onChange(() => {
+      syncStraighten();
       renderSide();
       requestDraw();
     }),
@@ -1049,6 +1299,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
           cutStart = null;
           updateCutUi();
         }
+        endPeek();
         break;
     }
   });
@@ -1069,6 +1320,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   updateCutUi();
   updatePlayButton();
   renderSide();
+  renderStraightenHint();
   requestDraw();
 
   return {
@@ -1090,6 +1342,8 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       for (const c of [camCanvas, ovCanvas]) c.getContext("webgl2")?.getExtension("WEBGL_lose_context")?.loseContext();
       timeline.dispose();
       exportPanel.dispose();
+      refitOverview.cancel();
+      clearTimeout(guidesTimer);
     },
   };
 }

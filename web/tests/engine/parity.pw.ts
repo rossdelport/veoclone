@@ -2,7 +2,10 @@
 // can be compared with `reco stitch --trajectory` output of the same poses.
 // Skipped unless VEOCLONE_PARITY_DIR points at a folder with proxy.webm or
 // proxy.mp4 (stacked, synced, left on top), match.json and frames.json
-// ([{ frame, pose }]). Writes browser_<frame>.png into that folder.
+// ([{ frame, pose }] with the poses Reco rendered, or [{ frame, input }] with
+// the world poses given to Reco, which the page clamps like the export).
+// The view uses match.json's rig_tilt / rig_roll. Writes browser_<frame>.png
+// and browser_poses.json (the world and render poses used) into that folder.
 // (Playwright's Chromium has no H.264 decoder, so use a VP9 proxy here.)
 import fs from "node:fs";
 import path from "node:path";
@@ -32,7 +35,7 @@ test("render proxy frames for the Reco parity check", async ({ page }) => {
     coverage: { pitchMin: -1, pitchMax: 1, maxFovDeg: 60, slices: [] },
     render: { blendWidth: 0.15, lensCorrection: 1.0, outputAspect: 16 / 9 },
   };
-  const out: { frame: number; mediaTime: number; png: string }[] = await page.evaluate(
+  const out: { frame: number; mediaTime: number; png: string; pose: unknown; render: unknown }[] = await page.evaluate(
     ([c, f]) => (window as any).engineTest.renderProxyFrames(c, f, [1280, 720]),
     [calib, frames] as const,
   );
@@ -42,4 +45,5 @@ test("render proxy frames for the Reco parity check", async ({ page }) => {
     // the frame shown is the one asked for
     if (o.mediaTime >= 0) expect(Math.round(o.mediaTime * 30)).toBe(o.frame);
   }
+  fs.writeFileSync(path.join(folder, "browser_poses.json"), JSON.stringify(out.map(({ frame, pose, render }) => ({ frame, pose, render })), null, 1));
 });

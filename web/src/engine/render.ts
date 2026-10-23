@@ -2,7 +2,7 @@
 // Reco's two camera planes (the same maths as projection.ts / fisheye.wgsl)
 // and samples the stacked proxy video: left camera in the top half, right
 // camera in the bottom half.
-import { buildRig, cameraBasis, overviewExtent, type Extent, type Rig, type RigCamera } from "./projection";
+import { buildRig, overviewExtent, viewBasis, withRigTilt, type Extent, type Rig, type RigCamera } from "./projection";
 import type { CalibInfo, Pose } from "./types";
 
 const VERTEX_SHADER = `#version 300 es
@@ -21,7 +21,7 @@ uniform int uMode;            // 0 = camera view, 1 = whole-pitch overview
 uniform vec3 uEye;
 uniform vec3 uF, uR, uU;      // camera view: forward, right, up
 uniform vec2 uScale;          // camera view: tan(fov/2) * aspect, tan(fov/2)
-uniform vec3 uBaseF, uBaseR;  // overview: yaw/pitch basis
+uniform vec3 uTiltF, uTiltUp, uYawAxis; // overview: forward and up after the rig tilt, yaw axis (render yaw/pitch)
 uniform vec4 uMap;            // overview: yawMax, yawSpan, pitchMax, pitchSpan
 uniform float uPlaneAspect, uBlend, uCorrection;
 uniform vec3 uOrigin[2], uEx[2], uEy[2], uN[2];
@@ -73,9 +73,12 @@ void main() {
   if (uMode == 0) {
     ray = uF + ndc.x * uScale.x * uR + ndc.y * uScale.y * uU;
   } else {
+    // Render yaw/pitch: pitch the tilted forward up, then turn it about the
+    // (straightened) up axis, like renderer.rs view_matrix.
     float yaw = uMap.x - (ndc.x * 0.5 + 0.5) * uMap.y;
     float pitch = uMap.z - (0.5 - ndc.y * 0.5) * uMap.w;
-    ray = cos(pitch) * (cos(yaw) * uBaseF - sin(yaw) * uBaseR) + vec3(0.0, sin(pitch), 0.0);
+    vec3 v = cos(pitch) * uTiltF + sin(pitch) * uTiltUp;
+    ray = v * cos(yaw) + cross(uYawAxis, v) * sin(yaw) + uYawAxis * (dot(uYawAxis, v) * (1.0 - cos(yaw)));
   }
   // Composite over black: left camera first, right camera on top.
   vec3 col = vec3(0.0);
@@ -87,7 +90,7 @@ void main() {
 }`;
 
 const UNIFORMS = [
-  "uTex", "uTexSize", "uResolution", "uMode", "uEye", "uF", "uR", "uU", "uScale", "uBaseF", "uBaseR",
+  "uTex", "uTexSize", "uResolution", "uMode", "uEye", "uF", "uR", "uU", "uScale", "uTiltF", "uTiltUp", "uYawAxis",
   "uMap", "uPlaneAspect", "uBlend", "uCorrection", "uOrigin", "uEx", "uEy", "uN", "uIntr", "uDist",
 ] as const;
 type UniformName = (typeof UNIFORMS)[number];
@@ -113,7 +116,7 @@ function compile(gl: WebGL2RenderingContext, type: number, source: string): WebG
 /** Shared WebGL plumbing for both renderers. */
 abstract class ProxyRenderer {
   protected readonly canvas: HTMLCanvasElement;
-  protected readonly rig: Rig;
+  protected rig: Rig;
   private readonly gl: WebGL2RenderingContext;
   private program: WebGLProgram | null = null;
   private texture: WebGLTexture | null = null;
@@ -123,9 +126,13 @@ abstract class ProxyRenderer {
   private lost = false;
   private disposed = false;
 
-  constructor(canvas: HTMLCanvasElement, calib: CalibInfo) {
+  /**
+   * `rigTilt` (radians): the rig tilt/roll to render with; by default
+   * match.json's (see buildRig). The editor passes its straightening.
+   */
+  constructor(canvas: HTMLCanvasElement, calib: CalibInfo, rigTilt?: { tilt: number; roll: number }) {
     this.canvas = canvas;
-    this.rig = buildRig(calib);
+    this.rig = buildRig(calib, rigTilt);
     const gl = canvas.getContext("webgl2", {
       alpha: false,
       antialias: false,
@@ -162,6 +169,29 @@ abstract class ProxyRenderer {
   /** Draw again with the last inputs (after the GPU context comes back). */
   protected abstract redraw(): void;
 
+  /** Use another rig tilt/roll (radians), e.g. while the user straightens the picture. */
+  setRigTilt(tilt: number, roll: number): void {
+    const next = withRigTilt(this.rig, tilt, roll);
+    if (next === this.rig) return;
+    this.rig = next;
+    if (!this.lost && !this.disposed && this.program && !this.gl.isContextLost()) {
+      this.gl.useProgram(this.program);
+      this.setTiltUniforms();
+    }
+  }
+
+  /** The rig tilt/roll in use (radians). */
+  get rigTilt(): { tilt: number; roll: number } {
+    return { tilt: this.rig.tilt.tilt, roll: this.rig.tilt.roll };
+  }
+
+  private setTiltUniforms(): void {
+    const t = this.rig.tilt;
+    this.gl.uniform3fv(this.loc.uTiltF, t.forward);
+    this.gl.uniform3fv(this.loc.uTiltUp, t.tiltedUp);
+    this.gl.uniform3fv(this.loc.uYawAxis, t.up);
+  }
+
   private init(): void {
     const gl = this.gl;
     const program = gl.createProgram()!;
@@ -191,8 +221,7 @@ abstract class ProxyRenderer {
     gl.useProgram(program);
     gl.uniform1i(this.loc.uTex, 0);
     gl.uniform3fv(this.loc.uEye, rig.eye);
-    gl.uniform3fv(this.loc.uBaseF, rig.baseForward);
-    gl.uniform3fv(this.loc.uBaseR, rig.baseRight);
+    this.setTiltUniforms();
     gl.uniform1f(this.loc.uPlaneAspect, rig.planeAspect);
     gl.uniform1f(this.loc.uBlend, rig.blendWidth);
     gl.uniform1f(this.loc.uCorrection, rig.lensCorrection);
@@ -279,7 +308,7 @@ export class CameraViewRenderer extends ProxyRenderer {
   render(pose: Pose): void {
     this.lastPose = { ...pose };
     this.draw((gl, loc, w, h) => {
-      const { F, R, U } = cameraBasis(pose.yaw, pose.pitch, this.rig);
+      const { F, R, U } = viewBasis(pose, this.rig);
       const t = Math.tan((pose.fov * Math.PI) / 360);
       gl.uniform1i(loc.uMode, 0);
       gl.uniform3fv(loc.uF, F);
@@ -294,15 +323,26 @@ export class CameraViewRenderer extends ProxyRenderer {
   }
 }
 
-/** WebGL2 whole-pitch overview (equirectangular map of the coverage). */
+/**
+ * WebGL2 whole-pitch overview: an equirectangular map in render yaw/pitch
+ * (level when the picture is straightened).
+ */
 export class OverviewRenderer extends ProxyRenderer {
-  /** Angles shown by the map: yawMax at the left edge, pitchMax at the top. */
-  readonly extent: Extent;
+  /** Angles shown by the map: yawMax at the left edge, pitchMax at the top (render yaw/pitch). */
+  extent: Extent;
   private rendered = false;
+  private readonly coverage: CalibInfo["coverage"];
 
-  constructor(canvas: HTMLCanvasElement, calib: CalibInfo) {
-    super(canvas, calib);
+  constructor(canvas: HTMLCanvasElement, calib: CalibInfo, rigTilt?: { tilt: number; roll: number }) {
+    super(canvas, calib, rigTilt);
+    this.coverage = calib.coverage;
     this.extent = overviewExtent(this.rig, calib.coverage);
+  }
+
+  /** Fit the map to the picture again (after the rig tilt/roll changed). */
+  refit(): Extent {
+    this.extent = overviewExtent(this.rig, this.coverage);
+    return this.extent;
   }
 
   render(): void {

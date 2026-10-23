@@ -302,6 +302,8 @@ def run(args, helper):
                                  headers={"Range": "bytes=0-9"})
     check(status == 206 and part == video[:10], "export Range request")
 
+    straighten_checks(args, pid, poses, frame_count)
+
     # Cancel a running export, then delete it.
     status, ex2 = request("POST", f"/api/projects/{pid}/exports", body)
     wait_for(pid, lambda p: (p.get("job") or {}).get("framesDone", 0) > 5)
@@ -394,6 +396,80 @@ def run(args, helper):
     check(status == 200 and not os.path.exists(folder), "project deleted with its folder")
     status, _ = request("GET", f"/api/projects/{pid}")
     check(status == 404, "deleted project is gone")
+
+
+def framemd5(video):
+    out = subprocess.run(["ffmpeg", "-v", "error", "-i", video, "-map", "0:v", "-f", "framemd5", "-"],
+                         capture_output=True, text=True, check=True).stdout
+    return [line.split(",")[-1].strip() for line in out.splitlines() if not line.startswith("#")]
+
+
+def straighten_checks(args, pid, poses, frame_count):
+    """Straighten picture (DESIGN.md 4.3/5.5): rigTiltDeg / rigRollDeg go to
+    every part's calibration; 0/0 gives the same video as no setting; bad
+    values are refused in plain words; match.json is not changed. Saves the
+    straightened export, its path and match.json for the browser comparison
+    (straighten-out/ in the work folder)."""
+    folder = os.path.join(args.data, "projects", pid)
+    with open(os.path.join(folder, "match.json"), "rb") as f:
+        match_before = f.read()
+    # A short part: far left, then far right (world poses for Reco's Panner).
+    path = list(poses)
+    for f in range(20, 80):
+        path[f] = (1.0, 0.0, 30.0) if f < 50 else (-0.9, 0.05, 35.0)
+    base = {"segments": [{"startFrame": 20, "endFrame": 80}], "width": 1280, "height": 720,
+            "quality": "high", "pathBase64": base64.b64encode(data_path(path)).decode()}
+
+    _, before = request("GET", f"/api/projects/{pid}")
+    for extra, words in (({"rigTiltDeg": 40}, "tilt must be between -35 and 35 degrees"),
+                         ({"rigTiltDeg": 10, "rigRollDeg": -26}, "level must be between -25 and 25 degrees"),
+                         ({"rigRollDeg": None}, "level is not a number")):
+        status, res = request("POST", f"/api/projects/{pid}/exports", {**base, **extra})
+        check(status == 400 and words in res["error"], f"refused {extra}: {res.get('error')}")
+    status, res = request("POST", f"/api/projects/{pid}/exports", {**base, "rigTiltDeg": "5"})
+    check(status == 400, f"refused a tilt that is not a number: {res}")
+    _, after = request("GET", f"/api/projects/{pid}")
+    check(len(after["exports"]) == len(before["exports"]), "nothing queued by refused requests")
+
+    def export(extra, name):
+        status, ex = request("POST", f"/api/projects/{pid}/exports", {**base, **extra})
+        check(status == 201, f"export {name} queued")
+        p = wait_for(pid, lambda p: [e for e in p["exports"] if e["id"] == ex["id"]][0]["status"]
+                     in ("done", "failed", "cancelled"))
+        e = [e for e in p["exports"] if e["id"] == ex["id"]][0]
+        check(e["status"] == "done", f"export {name} done: {e.get('error')}")
+        status, _, video = request("GET", f"/api/projects/{pid}/exports/{e['id']}/file", raw=True)
+        out = os.path.join(args.work, f"export-{name}.mp4")
+        open(out, "wb").write(video)
+        v = ffprobe(out, "stream=nb_read_packets")["streams"][0]
+        check(int(v["nb_read_packets"]) == 60, f"export {name} has 60 frames")
+        request("DELETE", f"/api/projects/{pid}/exports/{e['id']}")
+        return out
+
+    plain = export({}, "plain")
+    zero = export({"rigTiltDeg": 0, "rigRollDeg": 0}, "zero")
+    check(framemd5(plain) == framemd5(zero), "0/0 straightening gives exactly the same frames as none")
+    tilt_deg, roll_deg = -14.3239, 2.8648  # about -0.25 and 0.05 rad
+    straight = export({"rigTiltDeg": tilt_deg, "rigRollDeg": roll_deg}, "straight")
+    check(framemd5(straight) != framemd5(plain), "the straightened export is different")
+    with open(os.path.join(folder, "match.json"), "rb") as f:
+        check(f.read() == match_before, "match.json on disk is unchanged")
+    with open(os.path.join(folder, "log.txt"), encoding="utf-8", errors="replace") as f:
+        log_text = f.read()
+    check("Straighten picture: rig tilt -14.32 deg, roll 2.86 deg" in log_text
+          and "rig tilt 0.00 deg, roll 0.00 deg (from match.json)" in log_text,
+          "the job log names the straightening used")
+
+    # For the browser comparison (web/tests/engine/parity.pw.ts).
+    out_dir = os.path.join(args.work, "straighten-out")
+    os.makedirs(out_dir, exist_ok=True)
+    shutil.copy(straight, os.path.join(out_dir, "export.mp4"))
+    shutil.copy(plain, os.path.join(out_dir, "export-plain.mp4"))
+    _, cal = request("GET", f"/api/projects/{pid}/calibration")
+    json.dump({"match": cal["match"], "coverage": cal["coverage"], "rigTiltDeg": tilt_deg,
+               "rigRollDeg": roll_deg, "segmentStart": 20,
+               "path": {str(f): path[f] for f in range(20, 80)}},
+              open(os.path.join(out_dir, "info.json"), "w"))
 
 
 def data_path(poses):

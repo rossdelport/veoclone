@@ -1,11 +1,23 @@
 // Port of Reco's render geometry: render/scene.rs (planes),
 // render/renderer.rs (view matrix, quads), shaders/fisheye.wgsl (lens and
-// blending) and projection/virtual_camera.rs (yaw/pitch basis).
-// Rig tilt/roll are assumed to be 0 (true for iPhone footage).
+// blending) and projection/virtual_camera.rs (yaw/pitch basis), with the rig
+// tilt/roll correction of rigtilt.ts ("Straighten picture").
 import { globalYawRange } from "./clamp";
+import {
+  directionToRenderPose,
+  renderBasis,
+  renderForward,
+  tiltFrame,
+  worldToRenderPose,
+  type TiltFrame,
+  type YawPitch,
+} from "./rigtilt";
 import type { CalibInfo, CameraUniforms, Coverage, Pose, Vec3 } from "./types";
+import { column, cross, dot, mul3 as mul, normalize, type Mat3 } from "./vec";
 
-/** Precomputed geometry of a calibration (planes, eye, basis). */
+export { directionToYawPitch, yawPitchToDirection } from "./rigtilt";
+
+/** Precomputed geometry of a calibration (planes, eye, basis, rig tilt/roll). */
 export interface Rig {
   eye: Vec3;
   baseForward: Vec3;
@@ -18,6 +30,8 @@ export interface Rig {
   planeAspect: number;
   blendWidth: number;
   lensCorrection: number;
+  /** Rig tilt/roll correction the view uses (Reco's rig_tilt / rig_roll). */
+  tilt: TiltFrame;
 }
 
 export interface RigCamera {
@@ -34,23 +48,6 @@ export type RaySample = { u: number; v: number; alpha: number };
 
 const DEG = Math.PI / 180;
 const UP: Vec3 = [0, 1, 0];
-
-const dot = (a: Vec3, b: Vec3): number => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-const cross = (a: Vec3, b: Vec3): Vec3 => [
-  a[1] * b[2] - a[2] * b[1],
-  a[2] * b[0] - a[0] * b[2],
-  a[0] * b[1] - a[1] * b[0],
-];
-const normalize = (a: Vec3): Vec3 => {
-  const l = Math.hypot(a[0], a[1], a[2]);
-  return [a[0] / l, a[1] / l, a[2] / l];
-};
-
-type Mat3 = [Vec3, Vec3, Vec3]; // rows
-
-const mul = (a: Mat3, b: Mat3): Mat3 =>
-  [0, 1, 2].map((i) => [0, 1, 2].map((j) => a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j])) as Mat3;
-const column = (m: Mat3, j: number): Vec3 => [m[0][j], m[1][j], m[2][j]];
 
 function rotX(a: number): Mat3 {
   const c = Math.cos(a), s = Math.sin(a);
@@ -76,7 +73,13 @@ function rigCamera(origin: Vec3, rot: Mat3, cam: CameraUniforms): RigCamera {
   };
 }
 
-export function buildRig(calib: CalibInfo): Rig {
+/**
+ * The geometry of a calibration. `rigTilt` (radians) is the rig tilt/roll
+ * the view uses; by default match.json's `rig_tilt` / `rig_roll`, which is
+ * what Reco renders with that file. The editor passes its "Straighten
+ * picture" values instead (the export sends the same values to the helper).
+ */
+export function buildRig(calib: CalibInfo, rigTilt?: { tilt: number; roll: number }): Rig {
   const { params, left_uniforms: left, right_uniforms: right } = calib.match;
   // SceneGeometry::from_layout_with_aspect: plane width 1, both planes use
   // the left camera's aspect.
@@ -101,28 +104,18 @@ export function buildRig(calib: CalibInfo): Rig {
     planeAspect: left.width / left.height,
     blendWidth: Number.isFinite(blend) ? blend : 0.15,
     lensCorrection: Number.isFinite(correction) ? correction : 1.0,
+    tilt: tiltFrame(
+      { baseForward, baseRight },
+      rigTilt ? rigTilt.tilt : Number(calib.match.rig_tilt) || 0,
+      rigTilt ? rigTilt.roll : Number(calib.match.rig_roll) || 0,
+    ),
   };
 }
 
-/** Direction for a yaw/pitch (Reco's yaw_pitch_to_direction). */
-export function yawPitchToDirection(yaw: number, pitch: number, rig: Rig): Vec3 {
-  const cp = Math.cos(pitch);
-  const a = cp * Math.cos(yaw);
-  const b = cp * Math.sin(yaw);
-  const bf = rig.baseForward, br = rig.baseRight;
-  return [bf[0] * a - br[0] * b, Math.sin(pitch), bf[2] * a - br[2] * b];
-}
-
-/** Yaw/pitch of a direction (Reco's direction_to_yaw_pitch). */
-export function directionToYawPitch(dir: Vec3, rig: Rig): { yaw: number; pitch: number } {
-  const len = Math.hypot(dir[0], dir[1], dir[2]);
-  const pitch = Math.asin(Math.min(Math.max(dir[1] / len, -1), 1));
-  const hLen = Math.hypot(dir[0], dir[2]);
-  if (!(hLen / len > 1e-6)) return { yaw: 0, pitch };
-  const h: Vec3 = [dir[0] / hLen, 0, dir[2] / hLen];
-  const cosYaw = Math.min(Math.max(dot(h, rig.baseForward), -1), 1);
-  const sinYaw = -dot(h, rig.baseRight);
-  return { yaw: Math.atan2(sinYaw, cosYaw), pitch };
+/** The same rig with another rig tilt/roll (radians). */
+export function withRigTilt(rig: Rig, tilt: number, roll: number): Rig {
+  if (tilt === rig.tilt.tilt && roll === rig.tilt.roll) return rig;
+  return { ...rig, tilt: tiltFrame(rig, tilt, roll) };
 }
 
 /**
@@ -141,9 +134,20 @@ export function cameraBasis(yaw: number, pitch: number, rig: Rig): { F: Vec3; R:
   };
 }
 
-/** World ray through a point of the virtual camera; ndc in [-1,1], y = +1 at the top. */
+/**
+ * The camera Reco renders for a world pose (what a Panner returns): the pose
+ * goes through world_to_render_pose, then view_matrix with the rig tilt/roll.
+ * Without rig tilt/roll this is cameraBasis.
+ */
+export function viewBasis(pose: YawPitch, rig: Rig): { F: Vec3; R: Vec3; U: Vec3 } {
+  if (rig.tilt.identity) return cameraBasis(pose.yaw, pose.pitch, rig);
+  const r = worldToRenderPose(pose, rig, rig.tilt);
+  return renderBasis(r.yaw, r.pitch, rig, rig.tilt);
+}
+
+/** World ray through a point of the virtual camera for a world pose; ndc in [-1,1], y = +1 at the top. */
 export function viewRay(pose: Pose, rig: Rig, ndcX: number, ndcY: number, aspect: number): Vec3 {
-  const { F, R, U } = cameraBasis(pose.yaw, pose.pitch, rig);
+  const { F, R, U } = viewBasis(pose, rig);
   const t = Math.tan(pose.fov * 0.5 * DEG);
   const x = ndcX * t * aspect;
   const y = ndcY * t;
@@ -208,6 +212,8 @@ export interface Extent {
 
 /**
  * The angles the whole-pitch overview shows: the picture plus a small margin.
+ * The overview is drawn in render yaw/pitch (see overviewRay), so with the
+ * picture straightened it is level too.
  * The coverage table's widest row is no good for this: its stray edge points
  * (and the lens maths at very wide angles) reach far past the picture, which
  * then shrinks to a small strip in a big black box. So this looks where the
@@ -218,13 +224,19 @@ export function overviewExtent(rig: Rig, cov: Coverage): Extent {
   let { pitchMin: p0, pitchMax: p1 } = cov;
   if (!(y1 > y0)) [y0, y1] = [-Math.PI, Math.PI];
   if (!(p1 > p0)) [p0, p1] = [-1.2, 1.2];
+  if (!rig.tilt.identity) {
+    // Straightening turns the picture: look a little further around it.
+    const pad = Math.abs(rig.tilt.tilt) + Math.abs(rig.tilt.roll);
+    [y0, y1] = [Math.max(-Math.PI, y0 - pad), Math.min(Math.PI, y1 + pad)];
+    [p0, p1] = [Math.max(-1.55, p0 - pad), Math.min(1.55, p1 + pad)];
+  }
   const W = 160, H = 80;
   const yawAt = (i: number) => y1 - ((i + 0.5) / W) * (y1 - y0);
   const pitchAt = (j: number) => p1 - ((j + 0.5) / H) * (p1 - p0);
   const lit = new Uint8Array(W * H);
   for (let j = 0; j < H; j++) {
     for (let i = 0; i < W; i++) {
-      const s = sampleRay(yawPitchToDirection(yawAt(i), pitchAt(j), rig), rig);
+      const s = sampleRay(overviewRay(yawAt(i), pitchAt(j), rig), rig);
       lit[j * W + i] = s.left || s.right ? 1 : 0;
     }
   }
@@ -257,7 +269,25 @@ export function overviewExtent(rig: Rig, cov: Coverage): Extent {
   return { yawMax: yawAt(best.i0 - mi), yawMin: yawAt(best.i1 + mi), pitchMax: pitchAt(best.j0 - mj), pitchMin: pitchAt(best.j1 + mj) };
 }
 
-/** Outline of the virtual camera's view as yaw/pitch points (for the overview rectangle). */
+/**
+ * The direction an overview point shows: the overview maps render yaw/pitch
+ * (yaw about the straightened up axis), so the centre of the camera view for
+ * render pose (yaw, pitch) is that overview point. Without rig tilt/roll this
+ * is yawPitchToDirection.
+ */
+export function overviewRay(yaw: number, pitch: number, rig: Rig): Vec3 {
+  return renderForward(yaw, pitch, rig, rig.tilt);
+}
+
+/** The overview point (render yaw/pitch) that shows a direction. */
+export function overviewPointOf(dir: Vec3, rig: Rig): YawPitch {
+  return directionToRenderPose(dir, rig, rig.tilt);
+}
+
+/**
+ * Outline of the virtual camera's view for a world pose, as overview points
+ * (render yaw/pitch, for the rectangle on the whole-pitch overview).
+ */
 export function frustumOutline(pose: Pose, rig: Rig, aspect: number, stepsPerEdge = 16): { yaw: number; pitch: number }[] {
   const steps = Math.max(1, Math.round(stepsPerEdge));
   // Clockwise from the top-left corner: top, right, bottom, left edges.
@@ -268,7 +298,7 @@ export function frustumOutline(pose: Pose, rig: Rig, aspect: number, stepsPerEdg
     const [x1, y1] = corners[(e + 1) % 4];
     for (let i = 0; i < steps; i++) {
       const s = i / steps;
-      out.push(directionToYawPitch(viewRay(pose, rig, x0 + (x1 - x0) * s, y0 + (y1 - y0) * s, aspect), rig));
+      out.push(overviewPointOf(viewRay(pose, rig, x0 + (x1 - x0) * s, y0 + (y1 - y0) * s, aspect), rig));
     }
   }
   return out;

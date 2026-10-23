@@ -225,6 +225,150 @@ test("editor: playback, frame steps and sliders", async ({ page }) => {
   expect((await savedEdits(id)).zoom).toBe(1.5);
 });
 
+test("editor: straighten the picture, look left / centre / right, undo, autosave and export with it", async ({ page }) => {
+  const id = await openExample(page);
+  const view = page.getByTestId("camera-view");
+  const badge = view.locator(".view-badge");
+  const section = page.getByTestId("straighten");
+  const tilt = page.getByTestId("straighten-tiltDeg");
+  const level = page.getByTestId("straighten-rollDeg");
+  const tiltValue = section.locator(".slider").nth(0).locator(".slider-value");
+  const levelValue = section.locator(".slider").nth(1).locator(".slider-value");
+  await expect(section).toContainText("Move these until the far side of the pitch looks level when the camera looks left, centre and right");
+  await expect(section).toContainText("keep the phones as level as possible");
+  await expect(tiltValue).toHaveText("0°");
+  await expect(page.getByTestId("reset-tiltDeg")).toBeDisabled();
+  await expect(page.getByTestId("reset-tiltDeg")).toHaveAttribute("aria-label", "Reset tilt");
+  await expect(page.getByTestId("camera-level")).toBeHidden();
+  // iPhones record no level and it is not straightened yet: a tip points to it.
+  const tip = page.getByTestId("straighten-hint");
+  await expect(tip).toContainText("Picture leaning when the camera turns? Use Straighten picture.");
+
+  // Look left: a preview of the left edge, not a fix.
+  await expect(badge).toHaveText("AI camera");
+  const ai = await view.screenshot();
+  await section.getByRole("button", { name: "Look left" }).click();
+  await expect(badge).toHaveText("Looking left · preview only");
+  await expect(section.getByRole("button", { name: "Look left" })).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(async () => (await view.screenshot()).equals(ai)).toBe(false);
+  const left = await view.screenshot();
+  await expect(page.locator(".fixes li")).toHaveCount(0);
+
+  // Tilt: the picture turns, thin level lines show while it moves, the tip goes.
+  await tilt.fill("12");
+  await expect(tiltValue).toHaveText("12.0° down");
+  await expect(page.getByTestId("level-guides")).toHaveClass(/shown/);
+  await expect.poll(async () => (await view.screenshot()).equals(left)).toBe(false);
+  await expect(tip).toBeHidden();
+  await shot(page, "15-editor-straighten");
+  await expect(page.getByTestId("level-guides")).not.toHaveClass(/shown/, { timeout: 5000 });
+  await level.fill("-3");
+  await expect(levelValue).toHaveText("↺ 3.0°");
+  await expect(badge).toHaveText("Looking left · preview only");
+
+  await section.getByRole("button", { name: "Look right" }).click();
+  await expect(badge).toHaveText("Looking right · preview only");
+  await expect(section.getByRole("button", { name: "Look left" })).toHaveAttribute("aria-pressed", "false");
+  await section.getByRole("button", { name: "Look centre" }).click();
+  await expect(badge).toHaveText("Looking at the centre · preview only");
+  // Pressing it again goes back to the camera; so does moving the playhead.
+  await section.getByRole("button", { name: "Look centre" }).click();
+  await expect(badge).toHaveText("AI camera");
+  await section.getByRole("button", { name: "Look right" }).click();
+  await page.keyboard.press("ArrowRight");
+  await expect(badge).toHaveText("AI camera");
+  await expect(page.locator(".fixes li")).toHaveCount(0);
+
+  // Undo / redo / reset.
+  await page.keyboard.press("Control+z");
+  await expect(levelValue).toHaveText("0°");
+  await expect(tiltValue).toHaveText("12.0° down");
+  await page.keyboard.press("Control+y");
+  await expect(levelValue).toHaveText("↺ 3.0°");
+  await page.getByTestId("reset-tiltDeg").click();
+  await expect(tiltValue).toHaveText("0°");
+  await page.keyboard.press("Control+z");
+  await expect(tiltValue).toHaveText("12.0° down");
+
+  // A fix made now keeps looking at the same place when the straightening changes.
+  await page.keyboard.press("k");
+  await expect(page.locator(".fixes li")).toHaveCount(1);
+
+  // Autosaved, and sent with the export.
+  await expect(page.getByTestId("save-state")).toHaveText("All changes saved", { timeout: 10_000 });
+  await expect.poll(async () => JSON.stringify((await savedEdits(id)).straighten)).toBe(JSON.stringify({ tiltDeg: 12, rollDeg: -3 }));
+  await page.getByRole("button", { name: "Export" }).click();
+  const drawer = page.getByRole("dialog", { name: "Export your video" });
+  await drawer.getByRole("button", { name: "Make video" }).click();
+  await expect(drawer.getByTestId("export-row")).toHaveCount(1);
+  const sent = (await mockState()).lastExport!;
+  expect(sent.rigTiltDeg).toBe(12);
+  expect(sent.rigRollDeg).toBe(-3);
+  expect(sent.path.finite).toBe(true);
+  await drawer.getByRole("button", { name: "Close" }).click();
+
+  // Opened again: the same straightening, and no tip.
+  await page.reload();
+  await expectPicture(page);
+  await expect(tiltValue).toHaveText("12.0° down");
+  await expect(levelValue).toHaveText("↺ 3.0°");
+  await expect(page.getByTestId("straighten-hint")).toBeHidden();
+});
+
+test("editor: the Straighten picture tip can be hidden for good, or opens the section", async ({ page }) => {
+  await openExample(page);
+  const tip = page.getByTestId("straighten-hint");
+  await expect(tip).toBeVisible();
+  await tip.getByRole("button", { name: "Straighten picture" }).click();
+  await expect(tip).toBeHidden();
+  await expect(page.getByTestId("straighten-tiltDeg")).toBeFocused();
+  await expect(page.getByTestId("camera-view").locator(".view-badge")).toHaveText("Looking left · preview only");
+  await page.reload();
+  await expectPicture(page);
+  await expect(page.getByTestId("straighten-hint")).toBeHidden();
+  // A fresh browser: the X hides it too.
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+  await expectPicture(page);
+  await page.getByTestId("straighten-hint").getByRole("button", { name: "Hide this tip" }).click();
+  await expect(page.getByTestId("straighten-hint")).toBeHidden();
+  await page.reload();
+  await expectPicture(page);
+  await expect(page.getByTestId("straighten-hint")).toBeHidden();
+});
+
+test("editor: a camera that measured its own level (GoPro) starts straightened, Reset goes back to it, no tip", async ({ page }) => {
+  await resetMock(true);
+  const id = (await mockState()).projects[0].id;
+  await patchProject(id, { name: "GoPro match" });
+  await open(page, `/edit/${id}`);
+  await expectPicture(page);
+  const section = page.getByTestId("straighten");
+  const tiltValue = section.locator(".slider").nth(0).locator(".slider-value");
+  const levelValue = section.locator(".slider").nth(1).locator(".slider-value");
+  // match.json: rig_tilt 0.12 rad = 6.9 degrees down, rig_roll -0.03 rad = 1.7 degrees
+  await expect(tiltValue).toHaveText("6.9° down");
+  await expect(levelValue).toHaveText("↺ 1.7°");
+  await expect(page.getByTestId("camera-level")).toContainText("Your cameras measured their own level");
+  await expect(page.getByTestId("straighten-hint")).toBeHidden();
+  const reset = page.getByTestId("reset-tiltDeg");
+  await expect(reset).toBeDisabled();
+  await expect(reset).toHaveAttribute("aria-label", "Reset tilt to the camera's own level (6.9° down)");
+  await page.getByTestId("straighten-tiltDeg").fill("15");
+  await expect(tiltValue).toHaveText("15.0° down");
+  await reset.click();
+  await expect(tiltValue).toHaveText("6.9° down");
+  await expect(reset).toBeDisabled();
+  // The export sends the camera's own values.
+  await page.getByRole("button", { name: "Export" }).click();
+  const drawer = page.getByRole("dialog", { name: "Export your video" });
+  await drawer.getByRole("button", { name: "Make video" }).click();
+  await expect(drawer.getByTestId("export-row")).toHaveCount(1);
+  const sent = (await mockState()).lastExport!;
+  expect(sent.rigTiltDeg).toBeCloseTo((0.12 * 180) / Math.PI, 9);
+  expect(sent.rigRollDeg).toBeCloseTo((-0.03 * 180) / Math.PI, 9);
+});
+
 test("export: make a video, download it, show it in the folder, delete it", async ({ page }) => {
   const id = await openExample(page);
   await clickTimeline(page, 0.25);

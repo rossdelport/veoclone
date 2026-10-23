@@ -299,6 +299,13 @@ function validateExport(body) {
   if (!["fast", "balanced", "high"].includes(body.quality)) return "Bad quality";
   const bytes = Buffer.from(String(body.pathBase64 ?? ""), "base64");
   if (bytes.length !== FRAME_COUNT * 12) return `Path has ${bytes.length} bytes, expected ${FRAME_COUNT * 12}`;
+  // Straighten picture: optional, degrees, like the real helper (export.rs).
+  for (const [key, what, max] of [["rigTiltDeg", "tilt", 35], ["rigRollDeg", "level", 25]]) {
+    if (!(key in body)) continue;
+    const v = body[key];
+    if (typeof v !== "number" || !Number.isFinite(v)) return `Straighten picture: the ${what} is not a number. Please set it again.`;
+    if (Math.abs(v) > max) return `Straighten picture: the ${what} must be between -${max} and ${max} degrees (it was ${v.toFixed(1)}). Please set it again.`;
+  }
   return validateOverlays(body);
 }
 
@@ -496,7 +503,13 @@ async function handle(req, res) {
       return send(res, 200, p);
     case "GET calibration":
       if (p.status !== "ready") return fail(res, 404, "This match has not been processed yet.");
-      return send(res, 200, { ...calibTemplate, proxy: { ...calibTemplate.proxy, url: `/api/projects/${p.id}/proxy.mp4` } });
+      return send(res, 200, {
+        ...calibTemplate,
+        proxy: { ...calibTemplate.proxy, url: `/api/projects/${p.id}/proxy.mp4` },
+        // Test hook: a "GoPro" match measured its own level (Reco fills
+        // rig_tilt / rig_roll from the accelerometer).
+        match: /gopro/i.test(p.name) ? { ...calibTemplate.match, rig_tilt: 0.12, rig_roll: -0.03 } : calibTemplate.match,
+      });
     case "GET proxy.mp4":
     case "HEAD proxy.mp4":
       if (p.status !== "ready") return fail(res, 404, "This match has not been processed yet.");
@@ -522,7 +535,7 @@ async function handle(req, res) {
       const e = { id: newId(), status: "queued", progress: 0, createdAt: now(), width: body.width, height: body.height, quality: body.quality };
       p.exports.push(e);
       const overlays = overlaySummary(body.overlays);
-      mock.lastExport = { segments: body.segments, width: body.width, height: body.height, quality: body.quality, path: pathSummary(body.pathBase64), overlays };
+      mock.lastExport = { segments: body.segments, width: body.width, height: body.height, quality: body.quality, path: pathSummary(body.pathBase64), overlays, rigTiltDeg: body.rigTiltDeg, rigRollDeg: body.rigRollDeg };
       setTimeout(() => e.status === "queued" && startExport(p, e, overlays.length > 0), 300 / SPEED);
       return send(res, 201, e);
     }

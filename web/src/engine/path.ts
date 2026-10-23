@@ -1,7 +1,9 @@
 // The final camera path (DESIGN.md section 5.3).
 import { clampInto, maxFovOf } from "./clamp";
 import { MAX_OVERLAY_TEXT, MAX_OVERLAYS, OVERLAY_KINDS, OVERLAY_POSITIONS, OVERLAY_SIZES } from "./overlay";
-import type { CalibInfo, Edits, ExportQuality, Keyframe, Overlay, Pose, Segment } from "./types";
+import { buildRig, type Rig } from "./projection";
+import { aimOfWorld, aimsToRenderPoses, renderOfAim, renderPosesToWorld, tiltFrame, worldPosesToRender } from "./rigtilt";
+import type { CalibInfo, Edits, ExportQuality, Keyframe, MatchCalibration, Overlay, Pose, Segment, Straighten } from "./types";
 
 const EXPORT_SIZES: [number, number][] = [
   [1920, 1080],
@@ -10,8 +12,31 @@ const EXPORT_SIZES: [number, number][] = [
 ];
 const QUALITIES: ExportQuality[] = ["fast", "balanced", "high"];
 
-/** Edits for a fresh project: keep everything, no fixes, zoom 1. */
-export function defaultEdits(frameCount: number): Edits {
+/** Slider ranges of "Straighten picture" (degrees). */
+export const STRAIGHTEN_LIMITS = { tiltDeg: [-35, 35], rollDeg: [-25, 25] } as const;
+
+const DEG = Math.PI / 180;
+
+/** Reco's rig_tilt / rig_roll (radians) for a straightening. */
+export function straightenRadians(s: Straighten | undefined): { tilt: number; roll: number } {
+  const t = s && finite(s.tiltDeg) ? s.tiltDeg : 0;
+  const r = s && finite(s.rollDeg) ? s.rollDeg : 0;
+  return { tilt: t * DEG, roll: r * DEG };
+}
+
+/**
+ * The straightening match.json holds (degrees, inside the slider ranges): the
+ * default, and what "Reset" goes back to. 0/0 for iPhones, which record no
+ * gravity; for GoPro and DJI footage Reco's calibration fills it in from the
+ * camera's accelerometer (up to 25 degrees), and the AI pass used it.
+ */
+export function straightenOfMatch(match: Pick<MatchCalibration, "rig_tilt" | "rig_roll"> | undefined): Straighten {
+  const deg = (v: unknown, [lo, hi]: readonly [number, number]) => (finite(v) ? Math.min(Math.max(v / DEG, lo), hi) : 0);
+  return { tiltDeg: deg(match?.rig_tilt, STRAIGHTEN_LIMITS.tiltDeg), rollDeg: deg(match?.rig_roll, STRAIGHTEN_LIMITS.rollDeg) };
+}
+
+/** Edits for a fresh project: keep everything, no fixes, zoom 1, straightened as given (default none). */
+export function defaultEdits(frameCount: number, straighten: Straighten = { tiltDeg: 0, rollDeg: 0 }): Edits {
   return {
     version: 1,
     segments: [{ start: 0, end: wholeFrames(frameCount) }],
@@ -22,6 +47,7 @@ export function defaultEdits(frameCount: number): Edits {
     fadeSeconds: 1.5,
     joinSeconds: 4.0,
     overlays: [],
+    straighten: { tiltDeg: straighten.tiltDeg, rollDeg: straighten.rollDeg },
     export: { width: 1920, height: 1080, quality: "balanced" },
   };
 }
@@ -43,10 +69,14 @@ function num(v: unknown, fallback: number, min: number, max: number): number {
   return finite(v) ? Math.min(Math.max(v, min), max) : fallback;
 }
 
-/** Fill missing/invalid fields of loaded edits with defaults (forward compatible). */
-export function normalizeEdits(raw: unknown, frameCount: number): Edits {
+/**
+ * Fill missing/invalid fields of loaded edits with defaults (forward
+ * compatible). `defaultStraighten` is used when the edits have none
+ * (straightenOfMatch of the match).
+ */
+export function normalizeEdits(raw: unknown, frameCount: number, defaultStraighten?: Straighten): Edits {
   const n = wholeFrames(frameCount);
-  const out = defaultEdits(n);
+  const out = defaultEdits(n, defaultStraighten);
   if (!isRecord(raw)) return out;
 
   // Keep-ranges: whole frames inside [0, n], sorted, overlaps merged.
@@ -86,6 +116,14 @@ export function normalizeEdits(raw: unknown, frameCount: number): Edits {
   out.fadeSeconds = num(raw.fadeSeconds, out.fadeSeconds, 0, 60);
   out.joinSeconds = num(raw.joinSeconds, out.joinSeconds, 0, 60);
   out.overlays = normalizeOverlays(raw.overlays, n);
+  if (isRecord(raw.straighten)) {
+    const [t0, t1] = STRAIGHTEN_LIMITS.tiltDeg;
+    const [r0, r1] = STRAIGHTEN_LIMITS.rollDeg;
+    out.straighten = {
+      tiltDeg: num(raw.straighten.tiltDeg, out.straighten.tiltDeg, t0, t1),
+      rollDeg: num(raw.straighten.rollDeg, out.straighten.rollDeg, r0, r1),
+    };
+  }
 
   if (isRecord(raw.export)) {
     const { width, height, quality } = raw.export;
@@ -190,7 +228,9 @@ function chainKeyframes(keyframes: Keyframe[], join: number): Keyframe[][] {
 
 /**
  * The final camera path (DESIGN.md section 5.3): AI path + smoothing +
- * keyframe fixes + zoom + clamp. Returns frameCount*3 floats [yaw,pitch,fov].
+ * keyframe fixes + zoom + clamp, straightened with `edits.straighten`.
+ * Returns frameCount*3 floats [yaw,pitch,fov] of world poses: what a Reco
+ * Panner returns for an export with that rig tilt/roll.
  */
 export function computeFinalPath(ai: Float32Array, calib: CalibInfo, edits: Edits): Float32Array {
   const n = wholeFrames(calib.frameCount);
@@ -203,8 +243,33 @@ export function computeFinalPath(ai: Float32Array, calib: CalibInfo, edits: Edit
   const fade = Math.max(0, finite(edits.fadeSeconds) ? edits.fadeSeconds : 1.5) * fps;
   const join = Math.max(0, finite(edits.joinSeconds) ? edits.joinSeconds : 4) * fps;
 
+  // Straightening (rigtilt.ts). The AI path holds world poses for match.json's
+  // rig tilt/roll (0 for iPhones; a GoPro's from its accelerometer);
+  // keyframes hold aims. Both become render poses for the editing (yaw turns
+  // about the straightened up axis, so moves between fixes pan level), and
+  // world poses again before the clamp. Without any rig tilt/roll all of this
+  // is skipped: the old results, exactly.
+  const basis = buildRig(calib);
+  const aiTilt = basis.tilt;
+  const { tilt, roll } = straightenRadians(edits.straighten);
+  // Straightened like the AI pass (the default): its poses are kept as they are.
+  const sameAsAi = Math.abs(tilt - aiTilt.tilt) < 1e-9 && Math.abs(roll - aiTilt.roll) < 1e-9;
+  const view = sameAsAi ? aiTilt : tiltFrame(basis, tilt, roll);
+
   // 1. Base = AI path, optionally smoothed.
   let [yaw, pitch, fov] = readAiPath(ai, n, maxFovOf(cov));
+  if (sameAsAi) {
+    worldPosesToRender(yaw, pitch, basis, view);
+  } else {
+    if (!aiTilt.identity) {
+      for (let f = 0; f < n; f++) {
+        const a = aimOfWorld({ yaw: yaw[f], pitch: pitch[f] }, basis, aiTilt);
+        yaw[f] = a.yaw;
+        pitch[f] = a.pitch;
+      }
+    }
+    aimsToRenderPoses(yaw, pitch, basis, view);
+  }
   const half = Math.round(((finite(edits.smoothSeconds) ? edits.smoothSeconds : 0) * fps) / 2);
   if (half > 0) {
     yaw = movingAverage(yaw, half);
@@ -213,7 +278,10 @@ export function computeFinalPath(ai: Float32Array, calib: CalibInfo, edits: Edit
   }
 
   // 2-3. Keyframe fixes, blended over the base by the nearest chain's weight.
-  const chains = chainKeyframes(edits.keyframes ?? [], join);
+  let chains = chainKeyframes(edits.keyframes ?? [], join);
+  if (!view.identity) {
+    chains = chains.map((c) => c.map((k) => ({ ...k, ...renderOfAim(k, basis, view) })));
+  }
   let next = 0; // first chain that starts after frame f
   let seg = 0; // segment of the current chain that frame f falls in
   for (let f = 0; f < n; f++) {
@@ -254,7 +322,8 @@ export function computeFinalPath(ai: Float32Array, calib: CalibInfo, edits: Edit
     fov[f] += (mf - fov[f]) * w;
   }
 
-  // 4-5. Zoom, then the export's FOV cap and coverage clamp.
+  // 4-5. Back to world poses, zoom, then the export's FOV cap and coverage clamp.
+  renderPosesToWorld(yaw, pitch, basis, view);
   const out = new Float32Array(n * 3);
   for (let f = 0; f < n; f++) {
     clampInto(yaw[f], pitch[f], fov[f] / zoom, cov, aspect, out, f * 3);
@@ -270,10 +339,15 @@ export function poseAt(path: Float32Array, frame: number): Pose {
   return { yaw: path[f * 3], pitch: path[f * 3 + 1], fov: path[f * 3 + 2] };
 }
 
-/** A keyframe that reproduces `view` (what the user sees now) at `frame`. */
-export function keyframeFromView(view: Pose, frame: number, zoom: number): Keyframe {
+/**
+ * A keyframe that reproduces `view` (the world pose the user sees now) at
+ * `frame`. `rig` holds the straightening the view was made with (none:
+ * no rig tilt/roll); the keyframe keeps where the picture's centre looks.
+ */
+export function keyframeFromView(view: Pose, frame: number, zoom: number, rig?: Rig): Keyframe {
   const z = finite(zoom) && zoom > 0 ? zoom : 1;
-  return { frame: Math.round(frame), yaw: view.yaw, pitch: view.pitch, fov: view.fov * z };
+  const aim = rig ? aimOfWorld(view, rig, rig.tilt) : view;
+  return { frame: Math.round(frame), yaw: aim.yaw, pitch: aim.pitch, fov: view.fov * z };
 }
 
 /** Float32 little-endian bytes of a path, base64 encoded (export request). */

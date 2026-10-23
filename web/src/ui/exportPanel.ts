@@ -289,6 +289,9 @@ export class ExportPanel {
         quality: edits.export.quality,
         pathBase64: encodePathBase64(path),
         overlays: await exportOverlays(edits, this.calib.fps),
+        // The path holds world poses for this straightening (computeFinalPath).
+        rigTiltDeg: edits.straighten.tiltDeg,
+        rigRollDeg: edits.straighten.rollDeg,
       });
       if (this.project) this.update({ ...this.project, exports: [...this.project.exports.filter((x) => x.id !== exp.id), exp] });
       this.list.scrollIntoView({ behavior: "smooth", block: "nearest" });

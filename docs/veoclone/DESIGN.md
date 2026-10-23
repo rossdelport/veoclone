@@ -51,6 +51,8 @@ browser to the helper on the same PC.
    - Controls: play/pause, ±1 frame, ±5 s, playback speed, "Set start here",
      "Set end here", "Cut out a section", overall **zoom** slider, **smoothness**
      slider, "Undo", fix-length ("how long a fix lasts") slider.
+   - **Straighten picture** (5.5): Tilt and Level sliders with "Look left /
+     centre / right", for phones that pointed down.
    - Keyboard: Space play/pause, ←/→ 1 frame (Shift = 5 s), K add keyframe
      at the current view, Delete remove selected keyframe, Ctrl+Z undo.
    - Edits autosave to the helper.
@@ -82,9 +84,12 @@ workflows stay but only run on manual dispatch (section 6).
   `time = f * den / num`.
 - **Pose**: `{ yaw, pitch, fov }` — yaw radians (**positive = pan LEFT**, 0 ≈
   the seam between the cameras), pitch radians (positive = up), fov =
-  **vertical** field of view in **degrees**. World space. Rig tilt/roll are
-  0 for iPhones (only set from IMU telemetry); the editor may assume 0 but
-  must show a warning if `match.rig_tilt`/`rig_roll` are non-zero.
+  **vertical** field of view in **degrees**. World space: what a Reco
+  `Panner` returns. Reco turns a world pose into the render pose its view
+  matrix uses with the rig tilt/roll (`match.rig_tilt` / `rig_roll`, 5.5):
+  0/0 for iPhones (no level sensor in the video), filled in from the
+  accelerometer for GoPro/DJI footage. The editor's "Straighten picture"
+  replaces them for the preview and the export.
 - **Output aspect**: always 16:9 (1920x1080, 2560x1440, 3840x2160). The
   editor's camera view canvas is also 16:9 so the coverage clamp matches.
 - **Render constants** used by both export and preview: `blendWidth = 0.15`
@@ -259,7 +264,8 @@ Body (JSON):
   "width": 1920, "height": 1080,
   "quality": "balanced",
   "pathBase64": "<Float32 LE array, frameCount*3, [yaw,pitch,fov] per synced frame>",
-  "overlays": [{ "pngBase64": "<PNG, export size>", "ranges": [[2.0, 7.0]] }]
+  "overlays": [{ "pngBase64": "<PNG, export size>", "ranges": [[2.0, 7.0]] }],
+  "rigTiltDeg": 12.5, "rigRollDeg": -1.5
 }
 ```
 
@@ -286,6 +292,17 @@ Body (JSON):
   `exports/<id>/<project name> <date>.mp4` with `-movflags +faststart`.
 - `overlays` (optional, default none): text boxes burned in after the
   concat, section 5.4.
+- `rigTiltDeg` / `rigRollDeg` (optional; the editor always sends both):
+  "Straighten picture" (5.5), Reco's rig tilt / roll in degrees, tilt
+  −35..35, roll −25..25; `null` or out of range is refused in plain words
+  ("Straighten picture: the tilt must be between -35 and 35 degrees …").
+  Each one given replaces match.json's value in a copy of the
+  `MatchCalibration` used for every part's `StitchJob` (match.json on disk
+  is not changed); `StitchJob` hands them to the viewport, which the
+  session's `director_position` (clamp in world space, then
+  `world_to_render_pose`) and the renderer's view matrix use. Missing:
+  match.json's values (older editors), so 0/0 is the same video as before.
+  The job log names the values used.
 - Export status is tracked in `project.json` (`exports[]`).
 
 ### 4.4 Editor data
@@ -312,8 +329,9 @@ Body (JSON):
 `max_fov_degrees()`.
 
 `GET /api/projects/:id/ai-path.bin` → `application/octet-stream`, Float32 LE,
-`frameCount*3` values `[yaw, pitch, fovDeg]`, world space, before the FOV
-cap/clamp (the editor applies them).
+`frameCount*3` values `[yaw, pitch, fovDeg]`, world space for match.json's
+rig tilt/roll (the AI pass renders with it), before the FOV cap/clamp (the
+editor applies them).
 
 ### 4.5 HTTP API (JSON unless noted; errors are `{ "error": "plain words", "detail": "technical" }` with 4xx/5xx)
 
@@ -428,9 +446,10 @@ the editor and on the home card, not only on the processing page.
 ### 5.1 Projection (must match Reco's export exactly)
 
 Ported from `crates/reco-core/src/render/{scene.rs,renderer.rs}`,
-`shaders/fisheye.wgsl`, `projection/virtual_camera.rs`. Rendering samples
-the stacked proxy (left tile on top) directly — there is no panorama image
-anywhere in Reco.
+`shaders/fisheye.wgsl`, `projection/virtual_camera.rs` and
+`lens/rig_correction.rs` (rig tilt/roll, `web/src/engine/rigtilt.ts`).
+Rendering samples the stacked proxy (left tile on top) directly — there is
+no panorama image anywhere in Reco.
 
 - Layout from `match.params`: `h = 0.5*(1 − intersect)`; left plane at
   `(0,0,h)` with `M_L = T·Rx(zRx)·Rz(zRz)·Ry(π/2)`; right plane at
@@ -442,6 +461,21 @@ anywhere in Reco.
   `R = cos(yaw)·br + sin(yaw)·bf`, `U = cos(p)·Y − sin(p)·hz`.
   Ray for ndc ∈ [−1,1]² (ndc.y = +1 top): `F + ndc.x·tan(v/2)·aspect·R +
   ndc.y·tan(v/2)·U`.
+- Rig tilt `t` / roll `r` (radians; each applied only when |x| > 1e-6, as in
+  Reco; with neither, everything below is the identity and the formulas
+  above hold exactly). `view_matrix`: `B = rot(br, t)·bf`, `Ut = rot(br,
+  t)·Y`, yaw axis `A = rot(B, −r)·Ut`; for a **render** pose (ry, rp):
+  `F = rot(A, ry)·(cos rp·B + sin rp·Ut)`, camera up `rot(A, ry)·rot(br,
+  rp)·A`, `R = normalize(F × up)`, `U = R × F` (look_at_rh). A **world**
+  pose (what the path holds) goes through Reco's `world_to_render_pose`
+  first: `C = rot(B, −r)·rot(br, t)`, render pose = yaw/pitch of
+  `Cᵀ·dir(world)`; `render_to_world` is its exact inverse. Note that with
+  roll Reco pitches about the un-rolled `br`, so the centre of a world pose's
+  view is not exactly `dir(world)`; `directionToRenderPose` inverts the
+  forward in closed form (`sin rp = d·A / (Ut·A)`, then the yaw about `A`),
+  so "the pose that looks at this spot" is exact. Positive tilt = the phones
+  point down (the IMU convention of `reco-calibrate` `telemetry::rig_tilt`);
+  positive roll = they lean right (the picture turns clockwise).
 - Per plane: intersect ray with the plane, local `(tu, tv)`, extended
   `uv = (tu,tv)·2 − 0.5`, KB4 fisheye distortion with normalised intrinsics
   (`fx/w, fy/h, cx/w, cy/h`, `d = [k1..k4]`, correction 1.0), reject outside
@@ -449,11 +483,16 @@ anywhere in Reco.
   over black: left first, right on top.
 - Sample the proxy: left tile = top half (v ∈ [0,0.5]), right = bottom half;
   clamp to half a texel inside each tile to avoid bleeding.
-- Overview: an equirectangular map of the coverage (x → yaw from yawMax on
-  the left to yawMin on the right; y → pitch from pitchMax at top to
-  pitchMin at bottom), same per-ray sampling; plus helpers to convert
-  canvas ↔ yaw/pitch and to draw the camera frustum outline (edge rays →
-  yaw/pitch).
+- Overview: an equirectangular map in **render** yaw/pitch (x → yaw from
+  yawMax on the left to yawMin on the right; y → pitch from pitchMax at top
+  to pitchMin at bottom; the ray of a point is the view centre of that
+  render pose, so a straightened overview is level too), fitted to where
+  the cameras show something (refitted when the straightening changes);
+  same per-ray sampling. Helpers convert canvas ↔ render yaw/pitch
+  (a click → `render_to_world` → clamp), directions → overview points (AI
+  marker, fixes), and draw the camera frustum outline (edge rays → render
+  yaw/pitch). Dragging the camera view moves the render pose, so a sideways
+  drag pans level.
 
 ### 5.2 Clamp
 
@@ -465,6 +504,15 @@ Port `CoverageBoundary::safe_clamp` / `safe_clamp_world`
 yaw range at that pitch shrunk by `half_hfov = atan(aspect·tan(v/2))`, using
 the 400-slice table with the same interpolation as `yaw_range_at`.
 
+With rig tilt/roll the clamp does not change: `director_position` clamps
+the Panner's **world** pose with `safe_clamp(…, rig_tilt = 0)` (the coverage
+table is world space and does not depend on the rig) and only then applies
+`world_to_render_pose`. The engine does the same, so a straightened path is
+still a fixed point of Reco's clamp (checked against `reco stitch` events,
+`fixtures/reco-rig-synth.json`). The clamp keeps the un-turned centre box
+inside the coverage; a straightened view near the edge of the coverage can
+show a little black in a corner, in the preview and the export alike.
+
 ### 5.3 Final path algorithm (`computeFinalPath`)
 
 Input: AI path (Float32Array, frameCount×3), fps, `Edits`, `CalibInfo`.
@@ -474,16 +522,26 @@ Output: Float32Array frameCount×3 of final clamped poses.
 interface Edits {
   version: 1;
   segments: { start: number; end: number }[]; // keep-ranges, frames, end exclusive; default [{0, frameCount}]
-  keyframes: { frame: number; yaw: number; pitch: number; fov: number }[]; // fov = pre-zoom (see below)
+  keyframes: { frame: number; yaw: number; pitch: number; fov: number }[]; // yaw/pitch = aim (5.5), fov = pre-zoom (see below)
   zoom: number;          // 0.5..2, default 1; final fov = fov / zoom
   smoothSeconds: number; // 0..5, default 0; extra smoothing of the AI path
   holdSeconds: number;   // default 1.0: a fix holds fully this long before/after its keyframe(s)
   fadeSeconds: number;   // default 1.5: then blends back to the AI over this long
   joinSeconds: number;   // default 4.0: keyframes closer than this are joined into one move
+  overlays: Overlay[];   // 5.4
+  straighten: { tiltDeg: number; rollDeg: number }; // 5.5; default match.json's rig tilt/roll
   export: { width: number; height: number; quality: "fast" | "balanced" | "high" };
 }
 ```
 
+0. Straightening (5.5): the AI poses (world poses for match.json's rig) and
+   the keyframes (aims) become **render** poses for `edits.straighten`;
+   steps 1–4 work on render poses (yaw about the straightened up axis, so a
+   move between fixes pans level), and step 5 turns them back into world
+   poses before the clamp. When the straightening equals match.json's (the
+   default) the AI poses only go through `world_to_render_pose` and back;
+   without any rig tilt/roll nothing is converted (bit-identical to the
+   rig-0 algorithm).
 1. `base = AI`; if `smoothSeconds > 0`, centred moving average of yaw,
    pitch and fov with window `2·round(smoothSeconds·fps/2)+1` (shrinking
    at the ends).
@@ -496,7 +554,9 @@ interface Edits {
    largest weight. `pose = lerp(base, M, w)`.
 4. Zoom: `fov = fov / zoom`. Keyframes store the pre-zoom fov (the fov the
    user saw × zoom at the time), so the zoom slider affects everything.
-5. Clamp (5.2) with aspect 16/9.
+5. Render → world pose (`render_to_world`), then clamp (5.2) with aspect
+   16/9. The output is exactly what the export's Panner returns (with
+   `rigTiltDeg`/`rigRollDeg` = `edits.straighten`).
 
 Frame ↔ time: `frame = round(t · num/den)` clamped to [0, frameCount−1];
 the editor reads the exact presented frame via
@@ -553,6 +613,52 @@ interface Overlay {
   when available, else libx264), copies audio, `+faststart`. A new job step
   "Adding text" with progress. With no overlays nothing changes.
 
+### 5.5 Straighten picture
+
+Phones on a pole pointed **down** at the pitch: the virtual camera turns
+about the phones' own up axis, which leans toward the pitch, so the picture
+leans more and more as the camera turns left or right and the far side
+slopes. Veo knows gravity; iPhone videos carry no level sensor data, so
+Reco's calibration leaves `rig_tilt = rig_roll = 0`. Reco already corrects
+a known rig tilt/roll (5.1); the editor lets the user set it.
+
+- `Edits.straighten = { tiltDeg, rollDeg }`: Reco's rig tilt and roll in
+  degrees (tilt −35..35, positive = the phones pointed down; roll −25..25,
+  positive = they lean right, the picture turns clockwise). Default:
+  match.json's values (0/0 for iPhones; a GoPro's or DJI's own level from
+  the accelerometer, which Reco caps at 25°). `normalizeEdits` clamps them.
+  Used for the preview (both views, picking, the frustum) and sent with
+  every export (4.3).
+- Aims: a keyframe stores where the centre of the picture looks, as the
+  un-tilted yaw/pitch of that direction (`aimOfWorld` of the view the user
+  saw). Changing the straightening never moves what a fix or the AI looks
+  at; only the picture turns about its centre. The AI path's aims come from
+  its world poses under match.json's rig. (Storing aims is simpler than
+  storing world poses and converting them whenever the straightening
+  changes, and undo/redo need nothing special.)
+- UI: a "Straighten picture" section in the side panel: help text ("Move
+  these until the far side of the pitch looks level when the camera looks
+  left, centre and right…"), **Look left / Look centre / Look right**
+  (preview only, not a fix: same fov and height above the straightened
+  horizon, turned to where the clamp starts to push back, `lookAcross`;
+  ends on play, seek, a camera move or pressing it again), **Tilt** and
+  **Level** sliders (0.5° steps) each with a Reset to match.json's values
+  ("Reset tilt to the camera's own level" when those are not 0). While a
+  slider moves, four thin horizontal lines are drawn over the camera view.
+  Undo/redo and autosave like other edits. A tip "Picture leaning when the
+  camera turns? Use Straighten picture." shows at the top of the side panel while a
+  match from cameras without level data (match.json 0/0) is not
+  straightened; dismissing it (or using the sliders) is remembered in
+  `localStorage` (`veoclone.hint.straighten`).
+- No automatic estimate: in a perspective view even a perfectly levelled
+  far touchline slopes toward its vanishing point when the camera turns,
+  so a line-based guess would be confidently wrong; only the user can judge
+  "level" from the horizon, buildings and posts.
+- Parity (`web/tests/engine/parity.pw.ts` with world poses, synthetic
+  footage, lossless proxy): `reco stitch` with rig tilt/roll in match.json
+  vs the WebGL view gives 48–53 dB PSNR, the same as without, and the same
+  render poses within 1e-6 rad.
+
 ## 6. Hosting, packaging, CI
 
 - `veoclone-ci.yml` (push/PR): web typecheck + unit tests + build; helper
@@ -604,3 +710,6 @@ VeoClone/
 - 60 fps works but the AI camera tuning assumes 30 fps.
 - No iPhone 16/17 lens profiles in Reco's database: those models use the
   closest older profile (4.6).
+- Straightening is set by eye (5.5); Reco's clamp keeps only the centre box
+  of the view inside the coverage, so a straightened wide view at the very
+  edge can show a black corner (the preview shows it too).

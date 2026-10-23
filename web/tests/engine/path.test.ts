@@ -8,8 +8,12 @@ import {
   keyframeFromView,
   normalizeEdits,
   poseAt,
+  straightenOfMatch,
+  straightenRadians,
 } from "../../src/engine/path";
 import type { CalibInfo, Coverage, Edits, Keyframe } from "../../src/engine/types";
+import { buildRig, viewBasis, withRigTilt } from "../../src/engine/projection";
+import { renderToWorldPose, worldToRenderPose } from "../../src/engine/rigtilt";
 import { calibInfoOf, coverageFromMatch, RECO_TEST_MATCH } from "./reco-port";
 
 const ASPECT = 16 / 9;
@@ -31,6 +35,11 @@ function edits(n: number, patch: Partial<Edits> = {}): Edits {
   return { ...defaultEdits(n), ...patch };
 }
 
+/** Bit-for-bit equal float arrays. */
+const sameBits = (a: Float32Array, b: Float32Array) => {
+  const x = new Uint32Array(a.buffer), y = new Uint32Array(b.buffer);
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+};
 const kf = (frame: number, yaw: number, pitch = 0, fov = 30): Keyframe => ({ frame, yaw, pitch, fov });
 const f32 = Math.fround;
 const smoothstep = (x: number) => {
@@ -50,6 +59,7 @@ describe("defaultEdits", () => {
       fadeSeconds: 1.5,
       joinSeconds: 4,
       overlays: [],
+      straighten: { tiltDeg: 0, rollDeg: 0 },
       export: { width: 1920, height: 1080, quality: "balanced" },
     });
   });
@@ -156,6 +166,27 @@ describe("normalizeEdits", () => {
       height: 1440,
       quality: "fast",
     });
+  });
+  it("keeps the straightening inside the slider ranges", () => {
+    expect(normalizeEdits({ straighten: { tiltDeg: 12.5, rollDeg: -3 } }, n).straighten).toEqual({ tiltDeg: 12.5, rollDeg: -3 });
+    expect(normalizeEdits({ straighten: { tiltDeg: 90, rollDeg: -45 } }, n).straighten).toEqual({ tiltDeg: 35, rollDeg: -25 });
+    expect(normalizeEdits({ straighten: { tiltDeg: "5", rollDeg: Number.NaN } }, n).straighten).toEqual({ tiltDeg: 0, rollDeg: 0 });
+    expect(normalizeEdits({ straighten: 7 }, n).straighten).toEqual({ tiltDeg: 0, rollDeg: 0 });
+    expect(normalizeEdits({}, n).straighten).toEqual({ tiltDeg: 0, rollDeg: 0 });
+    // edits without a straightening start from match.json's rig tilt/roll
+    // (a GoPro's accelerometer), exactly
+    const gopro = { rig_tilt: 0.2, rig_roll: -0.07 };
+    const fromMatch = straightenOfMatch(gopro);
+    expect(fromMatch.tiltDeg).toBeCloseTo(11.4591559, 6);
+    const back = straightenRadians(normalizeEdits({}, n, fromMatch).straighten);
+    expect(back.tilt).toBeCloseTo(0.2, 14);
+    expect(back.roll).toBeCloseTo(-0.07, 14);
+    expect(normalizeEdits({ straighten: { tiltDeg: 1 } }, n, fromMatch).straighten).toEqual({ tiltDeg: 1, rollDeg: fromMatch.rollDeg });
+    expect(straightenOfMatch({ rig_tilt: 1, rig_roll: -1 })).toEqual({ tiltDeg: 35, rollDeg: -25 });
+    expect(straightenOfMatch({ rig_tilt: Number.NaN, rig_roll: 0.1 }).tiltDeg).toBe(0);
+    expect(straightenOfMatch({ rig_tilt: 0, rig_roll: 0 })).toEqual({ tiltDeg: 0, rollDeg: 0 });
+    expect(straightenOfMatch(undefined)).toEqual({ tiltDeg: 0, rollDeg: 0 });
+    expect(straightenRadians({ tiltDeg: 18, rollDeg: -9 })).toEqual({ tilt: (18 * Math.PI) / 180, roll: (-9 * Math.PI) / 180 });
   });
   it("copes with a broken frame count", () => {
     expect(normalizeEdits({ keyframes: [kf(5, 0)] }, Number.NaN)).toEqual(defaultEdits(0));
@@ -373,6 +404,144 @@ describe("computeFinalPath", () => {
     times.sort((a, b) => a - b);
     console.log(`computeFinalPath 162k frames, ${keyframes.length} keyframes: median ${times[2].toFixed(1)} ms`);
     expect(times[2]).toBeLessThan(100);
+  });
+});
+
+describe("computeFinalPath with Straighten picture", () => {
+  const n = 900;
+  const ai = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) ai.set([Math.sin(i / 90) * 1.1, Math.sin(i / 37) * 0.25 - 0.05, 20 + 15 * Math.abs(Math.sin(i / 60))], i * 3);
+  const S = { tiltDeg: 14, rollDeg: 3 };
+  const rigFor = (calib: CalibInfo, s: { tiltDeg: number; rollDeg: number }) => {
+    const { tilt, roll } = straightenRadians(s);
+    return withRigTilt(buildRig(calib), tilt, roll);
+  };
+  const angle = (a: number[], b: number[]) => {
+    const c = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    return Math.atan2(Math.hypot(c[0], c[1], c[2]), a[0] * b[0] + a[1] * b[1] + a[2] * b[2]);
+  };
+
+  it("0/0 is exactly the path of edits saved before straightening existed", () => {
+    const calib = calibWith(n, coverageFromMatch(RECO_TEST_MATCH));
+    const e = edits(n, { keyframes: [kf(100, 0.3, 0.1, 25), kf(400, -0.6, -0.1, 40)], smoothSeconds: 1, zoom: 1.2 });
+    const old = { ...e } as Partial<Edits>;
+    delete old.straighten;
+    const a = computeFinalPath(ai, calib, e);
+    const b = computeFinalPath(ai, calib, old as Edits);
+    expect(sameBits(a, b)).toBe(true);
+    // and a tiny straightening below Reco's 1e-6 rad threshold changes nothing either
+    const c = computeFinalPath(ai, calib, { ...e, straighten: { tiltDeg: 5e-5, rollDeg: -5e-5 } });
+    expect(sameBits(a, c)).toBe(true);
+  });
+
+  it("the camera keeps looking where the AI looked: same centre ray as the AI pass (rig 0)", () => {
+    const calib = calibWith(n);
+    const out = computeFinalPath(ai, calib, edits(n, { straighten: S }));
+    const rig0 = buildRig(calib);
+    const rig = rigFor(calib, S);
+    let worst = 0, changed = 0;
+    for (let f = 0; f < n; f++) {
+      const p = poseAt(out, f);
+      const want = viewBasis({ yaw: ai[f * 3], pitch: ai[f * 3 + 1] }, rig0).F;
+      worst = Math.max(worst, angle(viewBasis(p, rig).F, want));
+      expect(p.fov).toBeCloseTo(ai[f * 3 + 2], 4);
+      if (Math.abs(p.yaw - ai[f * 3]) > 1e-4) changed++;
+    }
+    expect(worst).toBeLessThan(1e-6);
+    expect(changed).toBeGreaterThan(n / 2); // with roll the world poses do change
+  });
+
+  it("smoothing and fixes work on render poses: a move between two fixes pans level", () => {
+    const calib = calibWith(n);
+    const rig = rigFor(calib, { tiltDeg: 20, rollDeg: 0 });
+    // two fixes at the same render pitch, far apart in yaw, joined into one move
+    const r1 = { yaw: 0.9, pitch: -0.1 }, r2 = { yaw: -0.9, pitch: -0.1 };
+    const k1 = keyframeFromView({ ...renderToWorldPose(r1, rig, rig.tilt), fov: 30 }, 300, 1, rig);
+    const k2 = keyframeFromView({ ...renderToWorldPose(r2, rig, rig.tilt), fov: 30 }, 360, 1, rig);
+    const out = computeFinalPath(ai, calib, edits(n, { keyframes: [k1, k2], straighten: { tiltDeg: 20, rollDeg: 0 } }));
+    for (const f of [300, 315, 330, 345, 360]) {
+      const r = worldToRenderPose(poseAt(out, f), rig, rig.tilt);
+      expect(r.pitch).toBeCloseTo(-0.1, 5);
+    }
+    expect(worldToRenderPose(poseAt(out, 330), rig, rig.tilt).yaw).toBeCloseTo(0, 5);
+  });
+
+  it("keyframeFromView reproduces the straightened view, and a fix keeps its place when the straightening changes", () => {
+    const calib = calibWith(n);
+    for (const [a, b] of [[S, { tiltDeg: -10, rollDeg: -6 }], [{ tiltDeg: 0, rollDeg: 0 }, S], [S, { tiltDeg: 0, rollDeg: 0 }]]) {
+      const rigA = rigFor(calib, a);
+      const view = { yaw: -0.45, pitch: 0.12, fov: 22 };
+      const k = keyframeFromView(view, 500, 1.25, rigA);
+      const outA = computeFinalPath(ai, calib, edits(n, { keyframes: [k], zoom: 1.25, straighten: a }));
+      expect(poseAt(outA, 500).yaw).toBeCloseTo(view.yaw, 5);
+      expect(poseAt(outA, 500).pitch).toBeCloseTo(view.pitch, 5);
+      expect(poseAt(outA, 500).fov).toBeCloseTo(view.fov, 4);
+      const rigB = rigFor(calib, b);
+      const outB = computeFinalPath(ai, calib, edits(n, { keyframes: [k], zoom: 1.25, straighten: b }));
+      expect(angle(viewBasis(poseAt(outB, 500), rigB).F, viewBasis(view, rigA).F)).toBeLessThan(1e-6);
+    }
+  });
+
+  it("clamps every frame: the export's own clamp leaves the path as it is", () => {
+    const cov = coverageFromMatch(RECO_TEST_MATCH);
+    const calib = calibWith(n, cov);
+    const wild = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) wild.set([Math.sin(i / 10) * 3, Math.cos(i / 7), 10 + (i % 90)], i * 3);
+    for (const st of [S, { tiltDeg: -35, rollDeg: 25 }, { tiltDeg: 35, rollDeg: -25 }]) {
+      const out = computeFinalPath(wild, calib, edits(n, { keyframes: [kf(100, 5, -2, 120)], zoom: 0.7, straighten: st }));
+      for (let f = 0; f < n; f++) {
+        const p = poseAt(out, f);
+        expect(Number.isFinite(p.yaw) && Number.isFinite(p.pitch)).toBe(true);
+        const again = clampPose(p, cov, ASPECT);
+        expect(p.yaw).toBeCloseTo(again.yaw, 5);
+        expect(p.pitch).toBeCloseTo(again.pitch, 5);
+      }
+    }
+  });
+
+  it("converts an AI path made with match.json's own rig tilt/roll", () => {
+    // An action camera's match.json can carry IMU tilt/roll; its AI path holds
+    // world poses for that rig. Straightening differently keeps their aim.
+    const m = { ...RECO_TEST_MATCH, rig_tilt: 0.2, rig_roll: 0.05 };
+    const calib = { ...calibInfoOf(m, huge, n) };
+    const aiRig = buildRig(calib);
+    expect(aiRig.tilt.identity).toBe(false);
+    const out = computeFinalPath(ai, calib, edits(n, { straighten: S }));
+    const rig = rigFor(calib, S);
+    let worst = 0;
+    for (let f = 0; f < n; f += 7) {
+      const want = viewBasis({ yaw: ai[f * 3], pitch: ai[f * 3 + 1] }, aiRig).F;
+      worst = Math.max(worst, angle(viewBasis(poseAt(out, f), rig).F, want));
+    }
+    expect(worst).toBeLessThan(1e-6);
+    // The default straightening (match.json's) is what the AI pass used: its
+    // poses come back unchanged (no conversion, only float32 rounding).
+    const def = normalizeEdits({}, n, straightenOfMatch(m));
+    const same = computeFinalPath(ai, calib, def);
+    let diff = 0;
+    for (let i = 0; i < n * 3; i++) diff = Math.max(diff, Math.abs(same[i] - ai[i]));
+    expect(diff).toBeLessThan(1e-6);
+  });
+
+  it("handles 162,000 straightened frames (90 minutes) in well under 150 ms", () => {
+    const N = 162_000;
+    const cov = coverageFromMatch(RECO_TEST_MATCH);
+    const big = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) big.set([Math.sin(i / 300) * 0.8, Math.sin(i / 700) * 0.1 - 0.1, 25 + 10 * Math.sin(i / 500)], i * 3);
+    const keyframes: Keyframe[] = [];
+    for (let f = 100; f < N; f += 97 + (f % 400)) keyframes.push(kf(f, Math.sin(f) * 0.5, 0, 25));
+    const e = edits(N, { keyframes, smoothSeconds: 3, zoom: 1.2, straighten: S });
+    const calib = calibWith(N, cov);
+    computeFinalPath(big, calib, e);
+    const times: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const t0 = performance.now();
+      computeFinalPath(big, calib, e);
+      times.push(performance.now() - t0);
+    }
+    times.sort((a, b) => a - b);
+    console.log(`computeFinalPath 162k straightened frames: median ${times[2].toFixed(1)} ms`);
+    expect(times[2]).toBeLessThan(150);
   });
 });
 

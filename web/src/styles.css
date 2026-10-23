@@ -1473,6 +1473,74 @@ body.editor-mode #page {
 .style-line {
   margin-top: 14px;
 }
+/* Straighten picture */
+.side-section.straighten > h2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.straighten .slider-top {
+  align-items: center;
+  gap: 8px;
+}
+.straighten .slider-top label {
+  flex: 1;
+}
+.straighten .slider-top .btn-small {
+  padding: 2px;
+  min-height: 0;
+}
+.look-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.look-row .btn {
+  flex: 1;
+  justify-content: center;
+  padding-left: 6px;
+  padding-right: 6px;
+}
+.straighten .sliders + p.muted {
+  margin-top: 12px;
+}
+.straighten-hint-host .notice {
+  margin: 12px 18px;
+}
+.straighten-hint-host .notice .btn-small {
+  margin-top: 8px;
+}
+.level-guides {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.4s;
+}
+.level-guides.shown {
+  opacity: 1;
+  transition: opacity 0.1s;
+}
+.level-guides span {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.75);
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.45);
+}
+.level-guides span:nth-child(1) {
+  top: 20%;
+}
+.level-guides span:nth-child(2) {
+  top: 40%;
+}
+.level-guides span:nth-child(3) {
+  top: 60%;
+}
+.level-guides span:nth-child(4) {
+  top: 80%;
+}
 input[type="range"] {
   width: 100%;
   margin: 6px 0;

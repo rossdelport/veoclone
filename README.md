@@ -96,8 +96,11 @@ matching copy first, which takes longer.
 - **Angle them outwards**: the left phone films the left half of the pitch,
   the right phone the right half. The two pictures should **overlap a
   little in the middle** (about 15%, so the centre circle shows in both).
-- Tilt them down a little so the whole pitch fits, from the near touchline to
-  the far one.
+- Tilt them down only as much as you need for the whole pitch to fit, from
+  the near touchline to the far one, and keep them **level side to side**
+  (not leaning). The more level the phones are, the more natural the camera
+  looks when it turns; if the picture still leans, **Straighten picture** in
+  the editor fixes it.
 - Turn on **Airplane Mode** so calls don't interrupt the recording, and plug
   in the power banks.
 
@@ -172,6 +175,16 @@ matching copy first, which takes longer.
   quick camera moves.
 - A **Good to know** box at the top right lists anything VeoClone noticed
   while processing. Click **×** to hide it.
+- Picture **leans more and more when the camera turns** left or right (the
+  phones pointed down), or the far side slopes? Use **Straighten picture** on
+  the right: click **Look left**, **Look centre** and **Look right** to point
+  the preview across the pitch (this is not saved as a fix), then move
+  **Tilt** (how much the phones pointed down) and **Level** (lean left or
+  right) until the far side of the pitch looks level everywhere and goal
+  posts stand straight up. Thin lines over the picture help while you move
+  the sliders. Your fixes keep looking at the same place, and the export uses
+  the same setting. GoPro footage usually needs nothing: the camera measures
+  its own level and VeoClone starts from that (**Reset** goes back to it).
 - Picture bent, or the two halves don't join? Click **Change phone or lens**
   (under **Camera** on the right). See
   [If something goes wrong](#if-something-goes-wrong).
@@ -277,6 +290,14 @@ matching copy first, which takes longer.
 - Check that both phones used the same lens and the same settings, and did
   not move during the match. If the two phones are different iPhone models,
   tick **The two phones are different models** and pick each one.
+
+**The picture leans when the camera turns left or right**
+- The phones pointed down (or leaned a little). In the editor, use
+  **Straighten picture**: **Look left**, **Look centre**, **Look right**,
+  and move **Tilt** and **Level** until the far side looks level each time.
+  Next time keep the phones as level as you can.
+- If a corner of the picture goes black at the very edge of the pitch after
+  straightening, zoom in a little there (the export shows the same).
 
 **"We couldn't line up the two videos", or the two halves are in the wrong place**
 - The left and right videos may be the wrong way round. Click **Swap left

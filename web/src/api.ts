@@ -113,6 +113,12 @@ export interface ExportRequest {
   pathBase64: string;
   /** At most 50; each PNG at most 4 MB. */
   overlays: ExportOverlay[];
+  /**
+   * "Straighten picture" (Edits.straighten): Reco's rig tilt / roll in
+   * degrees for this export (-35..35 / -25..25), instead of match.json's.
+   */
+  rigTiltDeg: number;
+  rigRollDeg: number;
 }
 
 /** An error with a plain-English message; `detail` holds the technical part. */

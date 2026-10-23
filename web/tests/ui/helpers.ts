@@ -17,6 +17,12 @@ export async function resetMock(seed = false): Promise<void> {
   expect(res.ok).toBe(true);
 }
 
+export interface MockFile {
+  name: string;
+  sizeBytes: number;
+  parts?: ({ name: string; sizeBytes: number } | null)[];
+}
+
 export interface MockState {
   projects: {
     id: string;
@@ -29,7 +35,7 @@ export interface MockState {
     pitch?: { id: string; points: [number, number][]; left: [number, number][]; right: [number, number][] } | null;
     aiRun?: { style: string; aiAccuracy: string; pitchId: string | null } | null;
     warnings: string[];
-    files: { left?: { name: string }; right?: { name: string } };
+    files: { left?: MockFile; right?: MockFile };
     exports: { id: string; status: string }[];
   }[];
   edits: Record<
@@ -58,6 +64,8 @@ export interface MockState {
   };
   editsPuts: number;
   pitchPuts: number;
+  /** Every video file received, in order (part/parts: a video in several files). */
+  uploads: { side: string; name: string; part: number | null; parts: number | null }[];
   openFolder: { project: string; export: string | null }[];
   swaps: number;
 }

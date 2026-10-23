@@ -34,12 +34,14 @@ veoclone-helper [--port 47863] [--data-dir DIR] [--web-dir DIR] [--model FILE]
 
 ```bash
 cargo test -p veoclone-helper
-# Renders real video (needs ffmpeg on PATH and a GPU; llvmpipe works):
+# Renders real video (needs ffmpeg on PATH and a GPU; llvmpipe works), one
+# file per camera and GoPro-style chapter files:
 cargo test -p veoclone-helper -- --ignored export_frame_alignment
 # Whole HTTP flow against a release binary, including text burned into an
 # export and checked frame by frame (Python 3, ffmpeg + ffprobe on PATH):
 python3 crates/veoclone-helper/scripts/e2e.py --helper target/release/veoclone-helper \
   --left left.mp4 --right right.mp4 --model yolo26n_640.onnx --work /tmp/veoclone-e2e
+# (--only chapters: just the videos split into chapter files and sent as parts.)
 ```
 
 ## API notes beyond DESIGN.md
@@ -50,6 +52,9 @@ python3 crates/veoclone-helper/scripts/e2e.py --helper target/release/veoclone-h
 - `POST /process` and `POST /cancel` return the `ProjectMeta`.
 - `X-Filename` may be percent-encoded (`encodeURIComponent`) for non-ASCII
   names.
+- `PUT /files/:side?part=N&parts=M` (a video in several files, DESIGN.md
+  4.10): at most 99 parts; anything else in `part`/`parts` is refused with
+  400 "The upload was not understood."
 - `ExportMeta.error` is a plain string.
 - Export accepts any even 16:9 size from 320 to 3840 pixels wide.
 - Export `overlays` (text boxes, DESIGN.md 5.4) is optional; a text box with

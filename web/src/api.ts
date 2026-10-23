@@ -65,10 +65,27 @@ export interface ProbeInfo {
   hasAudio: boolean;
 }
 
+/** One camera's video: one file, or a recording the camera split into parts (GoPro chapters). */
 export interface FileInfo {
+  /** The file's name; for a recording in parts, the first part's. */
+  name: string;
+  /** All parts together. */
+  sizeBytes: number;
+  /** The whole recording (all parts as one video), once VeoClone has checked it. */
+  probe?: ProbeInfo;
+  /** The parts in order; null for a part not sent yet. Missing for one file. */
+  parts?: (PartInfo | null)[];
+}
+
+/** One file of a recording in parts. */
+export interface PartInfo {
   name: string;
   sizeBytes: number;
-  probe?: ProbeInfo;
+}
+
+/** VeoClone has this video, with all its parts. */
+export function hasVideo(f: FileInfo | undefined): boolean {
+  return !!f && (f.parts ?? []).every((p) => p !== null);
 }
 
 export interface JobInfo {
@@ -331,13 +348,24 @@ export interface Upload {
   abort: () => void;
 }
 
-export function uploadFile(id: string, side: Side, file: File, onProgress: (p: UploadProgress) => void): Upload {
+/**
+ * Send one video file. `part`: part `index` (from 1) of a recording the
+ * camera split into `count` files; without it the file is the whole video.
+ */
+export function uploadFile(
+  id: string,
+  side: Side,
+  file: File,
+  onProgress: (p: UploadProgress) => void,
+  part?: { index: number; count: number },
+): Upload {
   const xhr = new XMLHttpRequest();
   const promise = new Promise<ProjectMeta>((resolve, reject) => {
     let lastTime = performance.now();
     let lastLoaded = 0;
     let rate = 0;
-    xhr.open("PUT", helperUrl(`${project(id)}/files/${side}`));
+    const query = part ? `?part=${part.index}&parts=${part.count}` : "";
+    xhr.open("PUT", helperUrl(`${project(id)}/files/${side}${query}`));
     xhr.setRequestHeader("X-Filename", enc(file.name));
     xhr.upload.onprogress = (e) => {
       const now = performance.now();

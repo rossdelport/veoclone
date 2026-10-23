@@ -5,8 +5,10 @@ Starts the helper binary, uploads two videos, processes them, checks the
 editor data, exports two segments (also with text boxes burned in, checked
 frame by frame), and exercises cancel, delete, restart recovery, re-runs
 that keep the earlier result, lens choices, swapping left and right, the
-single-instance check, CORS and the Host check. Python 3 standard library
-only; needs ffmpeg and ffprobe on PATH.
+single-instance check, CORS and the Host check. Then the same videos split
+into GoPro-style chapter files, sent as parts, against the one-file match
+frame for frame. Python 3 standard library only; needs ffmpeg and ffprobe
+on PATH.
 
 Usage:
   e2e.py --helper target/release/veoclone-helper --left L.mp4 --right R.mp4 \
@@ -56,10 +58,12 @@ def request(method, path, body=None, headers=None, host=HOST, raw=False):
         return res.status, data
 
 
-def upload(pid, side, path):
+def upload(pid, side, path, part=None):
+    """Send a video file; part=(n, m): part n (from 1) of a video in m files."""
     conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=600)
     size = os.path.getsize(path)
-    conn.putrequest("PUT", f"/api/projects/{pid}/files/{side}", skip_host=True)
+    query = f"?part={part[0]}&parts={part[1]}" if part else ""
+    conn.putrequest("PUT", f"/api/projects/{pid}/files/{side}{query}", skip_host=True)
     conn.putheader("Host", HOST)
     conn.putheader("Content-Length", str(size))
     conn.putheader("X-Filename", os.path.basename(path))
@@ -147,9 +151,9 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--web-dir")
-    ap.add_argument("--only", choices=["quickwins"],
+    ap.add_argument("--only", choices=["quickwins", "chapters"],
                     help="run only these checks (quickwins: ball style, AI accuracy, pitch "
-                         "outline, fast re-runs)")
+                         "outline, fast re-runs; chapters: videos in several files)")
     args = ap.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.work)
@@ -158,9 +162,12 @@ def main():
     helper = Helper(args)
     helper.start()
     try:
-        if args.only != "quickwins":
+        if args.only is None:
             run(args, helper)
-        quickwins(args)
+        if args.only in (None, "quickwins"):
+            quickwins(args)
+        if args.only in (None, "chapters"):
+            chapters(args)
     finally:
         helper.stop()
     log("ALL CHECKS PASSED")
@@ -647,6 +654,177 @@ def framemd5(video):
     out = subprocess.run(["ffmpeg", "-v", "error", "-i", video, "-map", "0:v", "-f", "framemd5", "-"],
                          capture_output=True, text=True, check=True).stdout
     return [line.split(",")[-1].strip() for line in out.splitlines() if not line.startswith("#")]
+
+
+def frame_hashes(video):
+    """MD5 of every decoded video frame, each frame once (no constant-rate fill)."""
+    out = subprocess.run(["ffmpeg", "-v", "error", "-i", video, "-map", "0:v", "-fps_mode", "passthrough",
+                          "-f", "framemd5", "-"], capture_output=True, text=True, check=True).stdout
+    return [line.split(",")[-1].strip() for line in out.splitlines() if not line.startswith("#")]
+
+
+def split_gopro(src, out_dir, number):
+    """GoPro-style chapter files of a video: GX01<number>.MP4, GX02…, GX03…
+    of 256, 256 and the remaining frames, each with its own sound and with
+    picture and sound starting at time 0, like a camera's. For that the
+    video is first encoded once more, without B-frames, with keyframes where
+    the parts start and with ALAC sound (no AAC start-up delay, which would
+    make ffmpeg start the first part's picture a little after 0); that file
+    is the one-file video to compare with, and the parts are cut from it by
+    stream copy, so together they hold exactly its frames and sound packets.
+    Returns (parts, whole file)."""
+    os.makedirs(out_dir, exist_ok=True)
+    whole = os.path.join(out_dir, f"whole-{number}.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", src, "-map", "0:v", "-map", "0:a", "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "16", "-bf", "0", "-g", "1000",
+                    "-force_key_frames", "expr:eq(n,256)+eq(n,512)", "-pix_fmt", "yuv420p", "-c:a", "alac",
+                    whole], check=True)
+    pattern = os.path.join(out_dir, "part%d.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", whole, "-map", "0", "-c", "copy", "-f", "segment",
+                    "-segment_frames", "256,512", "-reset_timestamps", "1", pattern], check=True)
+    parts = []
+    for i in range(3):
+        path = os.path.join(out_dir, f"GX{i + 1:02d}{number}.MP4")
+        os.replace(pattern % i, path)
+        info = ffprobe(path, "stream=start_time,nb_read_packets")["streams"][0]
+        check(float(info["start_time"]) == 0.0,
+              f"{os.path.basename(path)}: {info['nb_read_packets']} frames, picture starts at "
+              f"{info['start_time']}")
+        parts.append(path)
+    check(sum((frame_hashes(p) for p in parts), []) == frame_hashes(whole)
+          and sum((audio_hashes(p) for p in parts), []) == audio_hashes(whole),
+          "the parts hold every frame and sound packet of the one-file video")
+    return parts, whole
+
+
+def audio_hashes(video):
+    """MD5 of every sound packet (copied, not decoded)."""
+    out = subprocess.run(["ffmpeg", "-v", "error", "-i", video, "-map", "0:a", "-c:a", "copy",
+                          "-f", "framemd5", "-"], capture_output=True, text=True, check=True).stdout
+    return [line.split(",")[-1].strip() for line in out.splitlines() if not line.startswith("#")]
+
+
+def export_video(args, pid, body, name):
+    """Export and download; returns the file."""
+    status, ex = request("POST", f"/api/projects/{pid}/exports", body)
+    check(status == 201, f"export {name} queued ({status}: {ex if status != 201 else 'ok'})")
+    p = wait_for(pid, lambda p: [e for e in p["exports"] if e["id"] == ex["id"]][0]["status"]
+                 in ("done", "failed", "cancelled"))
+    e = [e for e in p["exports"] if e["id"] == ex["id"]][0]
+    check(e["status"] == "done", f"export {name} done: {e.get('error')}")
+    _, _, video = request("GET", f"/api/projects/{pid}/exports/{e['id']}/file", raw=True)
+    out = os.path.join(args.work, f"export-{name}.mp4")
+    open(out, "wb").write(video)
+    return out
+
+
+def chapters(args):
+    """GoPro chapter files: the same two videos split into 3 files each and
+    sent as parts give exactly the one-file match: frame count, AI camera
+    path, preview, and exports across the joins."""
+    split = os.path.join(args.work, "chapters")
+    left_parts, left_whole = split_gopro(args.left, os.path.join(split, "left"), "0042")
+    right_parts, right_whole = split_gopro(args.right, os.path.join(split, "right"), "0077")
+    counts = [[int(ffprobe(p, "stream=nb_read_packets")["streams"][0]["nb_read_packets"])
+               for p in parts] for parts in (left_parts, right_parts)]
+    log(f"chapter files: left {counts[0]} frames, right {counts[1]} frames")
+
+    # The same match from one file per camera.
+    status, p = request("POST", "/api/projects", {"name": "One file per camera", "style": "broadcast"})
+    single = p["id"]
+    for side, path in (("left", left_whole), ("right", right_whole)):
+        status, p = upload(single, side, path)
+        check(status == 200, f"{side} video uploaded as one file")
+    p1, secs1, _ = process(single)
+    n = p1["frameCount"]
+
+    # Sent as parts, the right camera's in another order.
+    status, p = request("POST", "/api/projects", {"name": "GoPro chapters", "style": "broadcast"})
+    pid = p["id"]
+    for i, path in enumerate(left_parts):
+        status, p = upload(pid, "left", path, (i + 1, 3))
+        check(status == 200, f"left part {i + 1} of 3 uploaded")
+    check(p["status"] == "new" and [x["name"] for x in p["files"]["left"]["parts"]]
+          == [os.path.basename(x) for x in left_parts]
+          and p["files"]["left"]["sizeBytes"] == sum(os.path.getsize(x) for x in left_parts),
+          "the left video lists its 3 parts and their total size")
+    status, _ = request("POST", f"/api/projects/{pid}/process")
+    check(status == 400, "processing waits for the right video")
+    for i in (2, 0):
+        status, p = upload(pid, "right", right_parts[i], (i + 1, 3))
+    check(status == 200 and p["status"] == "new" and p["files"]["right"]["parts"][1] is None,
+          "right part 2 of 3 still missing: not ready yet")
+    status, _ = request("POST", f"/api/projects/{pid}/process")
+    check(status == 400, "processing refuses a video with a part missing")
+    status, p = upload(pid, "right", right_parts[1], (2, 3))
+    check(status == 200 and p["status"] == "uploaded", "all parts there")
+    folder = os.path.join(args.data, "projects", pid)
+    check(sorted(f for f in os.listdir(folder) if f.startswith(("left", "right")))
+          == ["left.001.mp4", "left.002.mp4", "left.003.mp4",
+              "right.001.mp4", "right.002.mp4", "right.003.mp4"], "stored as numbered parts")
+
+    p2, secs2, _ = process(pid)
+    log(f"processing: one file per camera {secs1:.0f} s, in parts {secs2:.0f} s")
+    check(p2["frameCount"] == n and p2["calibration"]["syncOffsetFrames"] == p1["calibration"]["syncOffsetFrames"],
+          f"frameCount {p2['frameCount']} = one-file match's {n}, same sync offset")
+    check(p2["files"]["left"]["probe"]["frameCount"] == sum(counts[0]),
+          f"the left video counts the frames of all its parts ({sum(counts[0])})")
+    text = job_log(args, pid)
+    check("The left video is 3 files, joined in this order:" in text, "the job log lists the parts")
+    # Calibration reads only the first part (the GoPro's motion data is
+    # there), so it takes its sample pictures at other moments than from the
+    # whole file: a slightly different calibration and camera path.
+    d = max_diff(ai_path(pid, n), ai_path(single, n))
+    log(f"AI path in parts (calibrated from the first part) vs one file: {d}; calibration "
+        f"{p2['calibration']} vs {p1['calibration']}")
+    check(p2["calibration"]["confidence"] >= 0.8 and max(d[:2]) < 0.1 and d[2] < 3,
+          "calibrated well from the first parts, a similar camera path")
+    # With the one-file match's calibration the AI must see exactly the same
+    # frames, paired the same way: the same path, bit for bit.
+    shutil.copy(os.path.join(args.data, "projects", single, "match.json"),
+                os.path.join(args.data, "projects", pid, "match.json"))
+    forget_seen(args, pid)
+    p2, _, _ = process(pid)
+    check("Using the earlier calibration" in job_log(args, pid).split("=== Processing started")[-1],
+          "AI run again with the one-file match's calibration")
+    d = max_diff(ai_path(pid, n), ai_path(single, n))
+    log(f"PARITY AI path in parts vs one file, same calibration: {d}")
+    check(max(d) == 0.0, "the AI camera path is the same, frame for frame")
+    proxies = []
+    for project in (single, pid):
+        _, _, data = request("GET", f"/api/projects/{project}/proxy.mp4", raw=True)
+        path = os.path.join(args.work, f"proxy-{project}.mp4")
+        open(path, "wb").write(data)
+        proxies.append(frame_hashes(path))
+    check(len(proxies[1]) == n and proxies[0] == proxies[1],
+          f"the preview has the same {len(proxies[1])} frames as the one-file match's")
+
+    # Exports across the joins (left frames 256 and 512 are synced 256 and
+    # 512, right ones synced 244 and 500 with the 12-frame offset), one
+    # starting inside the last part, along the same camera path.
+    _, _, path_data = request("GET", f"/api/projects/{single}/ai-path.bin", raw=True)
+    segments = [{"startFrame": 200, "endFrame": 300}, {"startFrame": 480, "endFrame": 525},
+                {"startFrame": 530, "endFrame": 580}]
+    kept = sum(x["endFrame"] - x["startFrame"] for x in segments)
+    body = {"segments": segments, "width": 1280, "height": 720, "quality": "fast",
+            "pathBase64": base64.b64encode(path_data).decode()}
+    one = export_video(args, single, body, "one-file")
+    parts = export_video(args, pid, body, "parts")
+    a, b = frame_hashes(one), frame_hashes(parts)
+    check(len(b) == kept and a == b,
+          f"the export from the parts has the same {len(b)} frames as from one file (kept {kept})")
+    text = job_log(args, pid)
+    check("Part 2: left files 2-3, right files 2-3" in text and "Part 3: left files 3-3, right files 3-3" in text,
+          "export parts start reading in the chapter file their first frame is in")
+    # The sound: the same packets as from one file, through the joins.
+    durations = [{k: float(ffprobe(v, "stream=duration", stream=k)["streams"][0]["duration"])
+                  for k in ("v:0", "a:0")} for v in (one, parts)]
+    check(all(abs(durations[0][k] - durations[1][k]) < 0.005 for k in ("v:0", "a:0")),
+          f"the same length of picture and sound as from one file ({durations[1]}, {durations[0]})")
+    a, b = audio_hashes(one), audio_hashes(parts)
+    check(a == b, f"the export from the parts has the same {len(b)} sound packets as from one file")
+    for project in (single, pid):
+        request("DELETE", f"/api/projects/{project}")
 
 
 def straighten_checks(args, pid, poses, frame_count):

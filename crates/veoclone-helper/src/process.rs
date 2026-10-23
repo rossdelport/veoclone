@@ -17,14 +17,14 @@ use crate::calib::{BLEND_WIDTH, LensChoice, calib_info, choose_lens};
 use crate::jobs::{Context, JobError, Progress, check_free_space};
 use crate::media::{
     Conversion, MatchJob, MatchPlan, ProxyPlan, RunError, WASHED_OUT, check_pair, has_filter,
-    make_matching_copy, make_proxy, matching_warning, plan_matching, probe, tile_size,
+    join_probes, make_matching_copy, make_proxy, matching_warning, plan_matching, probe, tile_size,
 };
 use crate::seen::{
     BALL_CONFIDENCE, Classes, RECORD_CONFIDENCE, RepanSettings, RepanStats, SeenMeta, SeenWriter,
 };
 use crate::store::{
     AiRun, CalibSummary, DERIVED_FILES, Fps, ProbeInfo, ProjectMeta, Status, Step, matched_file,
-    matched_record, new_id, original_file, remove_matched, working_file, write_atomic,
+    matched_record, new_id, remove_matched, uploaded_files, working_files, write_atomic,
 };
 
 const STEPS: u32 = 4;
@@ -40,7 +40,7 @@ const NOT_LINED_UP: &str = "We couldn't line up the two videos. Maybe the left a
 const NO_FFMPEG: &str =
     "VeoClone's video tools (ffmpeg) are missing. Please download VeoClone again.";
 
-const DAMAGED: &str = "One of the files may be damaged: copy the videos from the phones again, \
+pub const DAMAGED: &str = "One of the files may be damaged: copy the videos from the phones again, \
                        add them to this match and press Start.";
 
 /// Frames to drop from each camera so both start together. Positive
@@ -81,8 +81,8 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     // 1. Check the files, and make matching copies when the phones filmed
     // in different formats (DESIGN.md 4.2).
     progress.step(Step::Probe, 0, "Checking the video files");
-    let left = original_file(&dir, "left");
-    let right = original_file(&dir, "right");
+    let left = uploaded_files(&meta, &dir, "left");
+    let right = uploaded_files(&meta, &dir, "right");
     let (Some(left), Some(right)) = (left, right) else {
         return Err(JobError::failed(
             "Both videos are needed. Add the left and the right phone's video.",
@@ -95,9 +95,24 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
             "ffmpeg/ffprobe not found next to the helper or on PATH",
         ));
     }
-    let lp = probe(&ctx.tools, &left).map_err(|e| probe_error("left", e))?;
+    // A recording in parts (GoPro chapters) is checked part by part and
+    // then counts as one video: its frames and length add up.
+    let left_parts = probe_parts(ctx, &meta, "left", &left)?;
     progress.fraction(0.3, None);
-    let rp = probe(&ctx.tools, &right).map_err(|e| probe_error("right", e))?;
+    let right_parts = probe_parts(ctx, &meta, "right", &right)?;
+    let lp = join_probes("left", &left_parts).map_err(|msg| JobError::failed(msg, "parts"))?;
+    let rp = join_probes("right", &right_parts).map_err(|msg| JobError::failed(msg, "parts"))?;
+    for (side, files) in [("left", &left), ("right", &right)] {
+        if files.len() > 1 {
+            tracing::info!(
+                "The {side} video is {} files, joined in this order:",
+                files.len()
+            );
+            for f in files {
+                tracing::info!("  {}", f.display());
+            }
+        }
+    }
     store.update(id, |m| {
         if let Some(f) = m.files.left.as_mut() {
             f.probe = Some(lp.clone());
@@ -117,10 +132,17 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
         ctx,
         &dir,
         &plan,
-        [(&left, &lp), (&right, &rp)],
+        [(left.as_slice(), &lp), (right.as_slice(), &rp)],
         &mut progress,
         cancel,
     )?;
+    // Calibration reads only each video's first file (a GoPro's first part
+    // also carries its motion-sensor data, used to line up and level the
+    // cameras); where it starts taking pictures depends on the left one's
+    // length.
+    let first_secs = left_copy
+        .as_ref()
+        .map_or(left_parts[0].duration, |c| c.probe.duration);
     let copies = [&left_copy, &right_copy];
     warnings.extend(matching_warning(
         &lp,
@@ -136,20 +158,20 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     // From here on every step reads the working files.
     let lp = left_copy.map_or(lp, |c| c.probe);
     let rp = right_copy.map_or(rp, |c| c.probe);
-    let (Some(left), Some(right)) = (working_file(&dir, "left"), working_file(&dir, "right"))
-    else {
+    let (left, right) = (working_files(&dir, "left"), working_files(&dir, "right"));
+    if left.is_empty() || right.is_empty() {
         return Err(JobError::failed(
             "Both videos are needed. Add the left and the right phone's video.",
             "upload disappeared",
         ));
-    };
+    }
     for w in check_pair(&lp, &rp).map_err(|msg| JobError::failed(msg, "file check"))? {
         if !warnings.contains(&w) {
             warnings.push(w);
         }
     }
     // Reco's own frame-rate choice is what the stitcher will use.
-    let fps = reco_io::adapters::FfmpegFileSource::frame_rate(&left)
+    let fps = reco_io::adapters::FfmpegFileSource::frame_rate(&left[0])
         .ok()
         .filter(|(n, d)| *n > 0 && *d > 0)
         .map(|(n, d)| Fps {
@@ -164,10 +186,10 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     progress.step(Step::Calibrate, 1, "Lining up and calibrating the cameras");
     let match_path = dir.join("match.json");
     // One lens per phone, each scaled to its own video.
-    let left_lens = choose_lens(meta.lens_id.as_deref(), &left, lp.width, lp.height);
+    let left_lens = choose_lens(meta.lens_id.as_deref(), &left[0], lp.width, lp.height);
     let right_lens = choose_lens(
         meta.right_lens_id.as_deref().or(meta.lens_id.as_deref()),
-        &right,
+        &right[0],
         rp.width,
         rp.height,
     );
@@ -192,9 +214,9 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
                 );
             }
             calibrate(
-                &left,
-                &right,
-                &lp,
+                &left[0],
+                &right[0],
+                first_secs,
                 [&left_lens, &right_lens],
                 fps,
                 &match_path,
@@ -337,13 +359,48 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     Ok(())
 }
 
-fn probe_error(side: &str, detail: String) -> JobError {
-    let message = if detail == crate::media::NO_VIDEO {
-        format!("The {side} file has no video in it.")
-    } else {
-        format!("We couldn't read the {side} video. Is it a video from the phone?")
-    };
-    JobError::failed(message, detail)
+/// Probe every file of one side's video (one file, or the parts of a
+/// recording in order).
+fn probe_parts(
+    ctx: &Context,
+    meta: &ProjectMeta,
+    side: &str,
+    files: &[PathBuf],
+) -> Result<Vec<ProbeInfo>, JobError> {
+    let names: Vec<String> = meta
+        .files
+        .side(side)
+        .map(|f| f.parts.iter().flatten().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
+    let mut probes = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let probed = probe(&ctx.tools, f).map_err(|detail| {
+            let no_video = detail == crate::media::NO_VIDEO;
+            let message = match (files.len() > 1, no_video) {
+                (false, true) => format!("The {side} file has no video in it."),
+                (false, false) => {
+                    format!("We couldn't read the {side} video. Is it a video from the phone?")
+                }
+                (true, _) => {
+                    let name = names.get(i).map_or(String::new(), |n| format!(" ({n})"));
+                    let problem = if no_video {
+                        "has no video in it"
+                    } else {
+                        "could not be read"
+                    };
+                    format!(
+                        "Part {} of the {side} video{name} {problem}. Copy that file from the \
+                         camera again, add all the files of the {side} video again and press \
+                         Start.",
+                        i + 1
+                    )
+                }
+            };
+            JobError::failed(message, detail)
+        })?;
+        probes.push(probed);
+    }
+    Ok(probes)
 }
 
 fn set_warnings(ctx: &Context, id: &str, warnings: &[String]) {
@@ -371,11 +428,16 @@ struct MatchedRecord {
     tone_mapped: bool,
 }
 
-/// Size and last change of a file, to notice a different upload.
-fn file_stamp(path: &Path) -> Option<(u64, u64)> {
-    let m = std::fs::metadata(path).ok()?;
-    let modified = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
-    Some((m.len(), modified.as_millis() as u64))
+/// Size and last change of an upload (all its parts: their total size and
+/// the latest change), to notice a different upload.
+fn file_stamp(files: &[PathBuf]) -> Option<(u64, u64)> {
+    let mut stamp = (0, 0);
+    for path in files {
+        let m = std::fs::metadata(path).ok()?;
+        let modified = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        stamp = (stamp.0 + m.len(), stamp.1.max(modified.as_millis() as u64));
+    }
+    (!files.is_empty()).then_some(stamp)
 }
 
 /// The earlier matching copy of `side`, if it was made from this upload
@@ -385,7 +447,7 @@ fn reusable_copy(
     dir: &Path,
     side: &str,
     conversion: &Conversion,
-    source: &Path,
+    source: &[PathBuf],
 ) -> Option<MatchedCopy> {
     let (bytes, modified) = file_stamp(source)?;
     let record: MatchedRecord =
@@ -413,7 +475,7 @@ fn match_videos(
     ctx: &Context,
     dir: &Path,
     plan: &MatchPlan,
-    originals: [(&Path, &ProbeInfo); 2],
+    originals: [(&[PathBuf], &ProbeInfo); 2],
     progress: &mut Progress,
     cancel: &AtomicBool,
 ) -> Result<[Option<MatchedCopy>; 2], JobError> {
@@ -476,11 +538,13 @@ fn match_videos(
         tracing::info!("Making a matching copy of the {side} video: {conversion:?}");
         // A new name every time, like the preview.
         let tmp = dir.join(format!("matched-{side}.{}.tmp.mp4", new_id()));
+        // A recording in parts becomes one file.
         let job = MatchJob {
-            input: originals[i].0.to_path_buf(),
+            input: originals[i].0.to_vec(),
             output: tmp.clone(),
             conversion: conversion.clone(),
             fps,
+            source_fps: originals[i].1.fps,
         };
         let made = make_matching_copy(&ctx.tools, &job, tone_map, cancel, |n| {
             progress.frames(done_before + n.min(frames), total)
@@ -579,11 +643,13 @@ fn lens_summary(left: &LensChoice, right: &LensChoice) -> String {
     }
 }
 
+/// Line up and calibrate the cameras from the first file of each video
+/// (`left_secs` long on the left).
 #[allow(clippy::too_many_arguments)]
 fn calibrate(
     left: &Path,
     right: &Path,
-    probe: &ProbeInfo,
+    left_secs: f64,
     [left_lens, right_lens]: [&LensChoice; 2],
     fps: Fps,
     match_path: &Path,
@@ -592,7 +658,7 @@ fn calibrate(
 ) -> Result<CalibSummary, JobError> {
     let mut config = reco_calibrate::CalibrationConfig {
         num_frames: 4,
-        skip_start_secs: (probe.duration * 0.1).min(10.0),
+        skip_start_secs: (left_secs * 0.1).min(10.0),
         ..Default::default()
     };
     config.akaze.threshold = 0.0001;
@@ -657,6 +723,16 @@ fn calibrate(
         sync_offset_seconds: cal.sync_offset as f64 / fps.as_f64(),
         lens: lens_summary(left_lens, right_lens),
     })
+}
+
+/// One camera's video for Reco: the file, or the parts of a recording
+/// chained one after the other (Reco reads them as one video and pairs the
+/// frames by count across the joins).
+pub fn input_path(files: &[PathBuf]) -> reco_io::InputPath {
+    match files {
+        [one] => reco_io::InputPath::Single(one.clone()),
+        parts => reco_io::InputPath::Chained(parts.to_vec()),
+    }
 }
 
 /// Reco's lookahead (seconds), as reco-gui's default.
@@ -759,8 +835,8 @@ fn log_stats(settings: &RepanSettings, stats: &RepanStats) {
 fn track(
     ctx: &Context,
     dir: &Path,
-    left: &Path,
-    right: &Path,
+    left: &[PathBuf],
+    right: &[PathBuf],
     match_path: &Path,
     meta: &ProjectMeta,
     fps: Fps,
@@ -837,8 +913,8 @@ fn track(
     let hook_fps = source_fps.clone();
     let d = done.clone();
     let job = reco_io::StitchJob::with_calibration(
-        PathBuf::from(left),
-        PathBuf::from(right),
+        input_path(left),
+        input_path(right),
         cal.clone(),
         scratch.clone(),
     )
@@ -992,7 +1068,7 @@ fn track(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .unwrap_or(fps.as_f64() as f32),
-        lookahead_frames: lookahead_frames(left),
+        lookahead_frames: lookahead_frames(&left[0]),
         every: interval,
         frames: frames as u64,
         sync_offset: cal.sync_offset,

@@ -50,7 +50,7 @@ const PROXY = join(FIX, "proxy.mp4");
 let projects = new Map();
 /** @type {Map<string, any>} */
 let edits = new Map();
-let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0 };
+let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [] };
 const timers = new Map(); // project id -> interval
 const uploads = new Map(); // project id -> uploads in progress
 const previous = new Map(); // project id -> the ready result a re-run started from
@@ -380,7 +380,7 @@ async function handle(req, res) {
       timers.clear();
       projects = new Map();
       edits = new Map();
-      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0 };
+      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [] };
       uploads.clear();
       previous.clear();
       if (url.searchParams.has("seed")) seed();
@@ -470,6 +470,16 @@ async function handle(req, res) {
     case "PUT files": {
       const side = rest[1];
       if (side !== "left" && side !== "right") return fail(res, 404, "Unknown camera side.");
+      // ?part=N&parts=M: part N of a recording the camera split into M files.
+      const q = url.searchParams;
+      let part = null;
+      if (q.has("part") || q.has("parts")) {
+        const n = Number(q.get("part"));
+        const m = Number(q.get("parts"));
+        if (!Number.isInteger(n) || !Number.isInteger(m) || n < 1 || n > m) return fail(res, 400, "The upload was not understood.");
+        if (m > 99) return fail(res, 400, "A video can be made of at most 99 files.");
+        if (m > 1) part = { n, m };
+      }
       if (busy(p)) return fail(res, 409, BUSY);
       let size = 0;
       uploads.set(p.id, (uploads.get(p.id) ?? 0) + 1);
@@ -484,8 +494,19 @@ async function handle(req, res) {
       if (!req.complete) return res.destroy();
       if (size === 0) return fail(res, 400, "That file is empty.");
       const name = decodeURIComponent(req.headers["x-filename"] ?? `${side}.mp4`);
-      p.files[side] = { name, sizeBytes: size };
-      p.status = p.files.left && p.files.right ? "uploaded" : "new";
+      mock.uploads.push({ side, name, part: part?.n ?? null, parts: part?.m ?? null });
+      if (part) {
+        // Like the real helper: the other parts stay, extra ones go.
+        const parts = (p.files[side]?.parts ?? []).slice(0, part.m);
+        while (parts.length < part.m) parts.push(null);
+        parts[part.n - 1] = { name, sizeBytes: size };
+        const first = parts.find(Boolean);
+        p.files[side] = { name: first.name, sizeBytes: parts.reduce((a, x) => a + (x?.sizeBytes ?? 0), 0), parts };
+      } else {
+        p.files[side] = { name, sizeBytes: size };
+      }
+      const complete = (f) => !!f && (f.parts ?? []).every(Boolean);
+      p.status = complete(p.files.left) && complete(p.files.right) ? "uploaded" : "new";
       delete p.calibration;
       p.pitch = null; // marked on the old video
       p.aiRun = null;
@@ -498,7 +519,9 @@ async function handle(req, res) {
     }
     case "POST process":
       if (busy(p) || uploads.get(p.id)) return fail(res, 409, BUSY);
-      if (!p.files.left || !p.files.right) return fail(res, 400, "Both videos are needed. Add the left and the right phone's video first.");
+      if (![p.files.left, p.files.right].every((f) => f && (f.parts ?? []).every(Boolean))) {
+        return fail(res, 400, "Both videos are needed. Add the left and the right phone's video first (with all their files, when a camera split its video into several).");
+      }
       if (p.status === "ready" && p.calibration) {
         previous.set(p.id, { style: madeWith.get(p.id) ?? p.style, warnings: p.warnings, calibration: p.calibration, fps: p.fps, frameCount: p.frameCount });
       }

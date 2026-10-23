@@ -173,13 +173,68 @@ pub struct ProbeInfo {
     pub has_audio: bool,
 }
 
+/// One camera's video: one file, or a recording the camera split into
+/// several files (a GoPro saves a new "chapter" every 4 GB).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileInfo {
+    /// The file's name; for a recording in parts, the first part's.
     pub name: String,
+    /// All parts together.
     pub size_bytes: u64,
+    /// The whole recording (all parts as one video).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeInfo>,
+    /// The parts in order; `None` for a part not sent yet. Empty for one
+    /// file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<Option<PartInfo>>,
+}
+
+/// One file of a recording in parts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartInfo {
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+impl FileInfo {
+    /// One uploaded file.
+    pub fn single(name: String, size_bytes: u64) -> FileInfo {
+        FileInfo {
+            name,
+            size_bytes,
+            probe: None,
+            parts: Vec::new(),
+        }
+    }
+
+    /// A recording in parts (some may still be missing).
+    pub fn from_parts(parts: Vec<Option<PartInfo>>) -> FileInfo {
+        let name = parts
+            .iter()
+            .flatten()
+            .next()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        FileInfo {
+            name,
+            size_bytes: parts.iter().flatten().map(|p| p.size_bytes).sum(),
+            probe: None,
+            parts,
+        }
+    }
+
+    /// Every part has been sent.
+    pub fn complete(&self) -> bool {
+        self.parts.iter().all(Option::is_some)
+    }
+
+    /// How many files the video is made of.
+    pub fn file_count(&self) -> usize {
+        self.parts.len().max(1)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -188,6 +243,31 @@ pub struct Files {
     pub left: Option<FileInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right: Option<FileInfo>,
+}
+
+impl Files {
+    pub fn side(&self, side: &str) -> Option<&FileInfo> {
+        if side == "left" {
+            self.left.as_ref()
+        } else {
+            self.right.as_ref()
+        }
+    }
+
+    pub fn side_mut(&mut self, side: &str) -> &mut Option<FileInfo> {
+        if side == "left" {
+            &mut self.left
+        } else {
+            &mut self.right
+        }
+    }
+
+    /// Both videos are here, with all their parts.
+    pub fn both(&self) -> bool {
+        [&self.left, &self.right]
+            .iter()
+            .all(|f| f.as_ref().is_some_and(FileInfo::complete))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,12 +650,20 @@ const DELETING: &str = ".deleting";
 /// power cut), so it still shows up and can be deleted or fixed.
 fn recovered_meta(id: &str, dir: &Path) -> ProjectMeta {
     let file = |side| {
-        let path = original_file(dir, side)?;
-        Some(FileInfo {
-            name: path.file_name()?.to_string_lossy().into_owned(),
-            size_bytes: path.metadata().ok()?.len(),
-            probe: None,
-        })
+        let parts: Vec<PartInfo> = original_files(dir, side)
+            .iter()
+            .filter_map(|path| {
+                Some(PartInfo {
+                    name: path.file_name()?.to_string_lossy().into_owned(),
+                    size_bytes: path.metadata().ok()?.len(),
+                })
+            })
+            .collect();
+        match parts.len() {
+            0 => None,
+            1 => Some(FileInfo::single(parts[0].name.clone(), parts[0].size_bytes)),
+            _ => Some(FileInfo::from_parts(parts.into_iter().map(Some).collect())),
+        }
     };
     let files = Files {
         left: file("left"),
@@ -713,19 +801,65 @@ fn remove_part_files(dir: &Path) {
     }
 }
 
-/// The uploaded original for one side (`left.<ext>` / `right.<ext>`). Only
-/// the exact name counts, so the matching copy (`matched-left.mp4`) and
-/// unfinished files are never taken for it.
-pub fn original_file(dir: &Path, side: &str) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.is_file()
-                && p.file_stem().is_some_and(|s| s == side)
-                && p.extension().is_some_and(|x| x != "part" && x != "tmp")
+/// Most files one camera's video may be split into.
+pub const MAX_PARTS: usize = 99;
+
+/// Every uploaded file of one side, in no particular order: the one file
+/// `left.<ext>` (`None`) and the parts of a recording in several files,
+/// `left.001.<ext>`, `left.002.<ext>`… (`Some(1)`, `Some(2)`…). Only these
+/// exact names count, so the matching copy (`matched-left.mp4`) and
+/// unfinished files are never taken for them.
+pub fn side_files(dir: &Path, side: &str) -> Vec<(Option<usize>, PathBuf)> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let rest = name.strip_prefix(side)?.strip_prefix('.')?;
+            let (number, ext) = match rest.split_once('.') {
+                None => (None, rest),
+                Some((n, ext)) if n.len() == 3 && n.bytes().all(|b| b.is_ascii_digit()) => {
+                    (Some(n.parse::<usize>().ok()?), ext)
+                }
+                Some(_) => return None,
+            };
+            let ours = !ext.is_empty()
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+                && ext != "part"
+                && ext != "tmp"
+                && number != Some(0);
+            (ours && e.path().is_file()).then(|| (number, e.path()))
         })
+        .collect()
+}
+
+/// The uploaded original of one side in order: `left.<ext>`, or all the
+/// parts `left.001.<ext>`, `left.002.<ext>`… Empty when there is none, or
+/// when a part in between is missing.
+pub fn original_files(dir: &Path, side: &str) -> Vec<PathBuf> {
+    let mut files = side_files(dir, side);
+    files.sort();
+    let parts: Vec<(usize, PathBuf)> = files
+        .iter()
+        .filter_map(|(n, p)| Some((n.as_ref().copied()?, p.clone())))
+        .collect();
+    if parts.is_empty() {
+        return files.into_iter().map(|(_, p)| p).take(1).collect();
+    }
+    if parts.iter().enumerate().all(|(i, (n, _))| *n == i + 1) {
+        parts.into_iter().map(|(_, p)| p).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The uploaded original of one side when it is all there: as many files
+/// as `ProjectMeta.files` lists, every part sent.
+pub fn uploaded_files(meta: &ProjectMeta, dir: &Path, side: &str) -> Option<Vec<PathBuf>> {
+    let info = meta.files.side(side).filter(|f| f.complete())?;
+    let files = original_files(dir, side);
+    (!files.is_empty() && files.len() == info.file_count()).then_some(files)
 }
 
 /// The matching copy of one side's video (DESIGN.md 4.2), made when the
@@ -746,11 +880,17 @@ pub fn remove_matched(dir: &Path, side: &str) -> bool {
 }
 
 /// The video every processing step and export reads for one side: the
-/// matching copy when there is one, otherwise the uploaded original.
-pub fn working_file(dir: &Path, side: &str) -> Option<PathBuf> {
-    let original = original_file(dir, side)?;
+/// matching copy when there is one (one file, also when the upload came in
+/// parts), otherwise the uploaded original (all its parts, in order).
+/// Empty when there is no upload.
+pub fn working_files(dir: &Path, side: &str) -> Vec<PathBuf> {
+    let originals = original_files(dir, side);
     let matched = matched_file(dir, side);
-    Some(if matched.is_file() { matched } else { original })
+    if !originals.is_empty() && matched.is_file() {
+        vec![matched]
+    } else {
+        originals
+    }
 }
 
 #[cfg(test)]
@@ -969,6 +1109,8 @@ pub(crate) mod tests {
         let m = store.create(sample("abc123def456")).unwrap();
         let dir = store.project_dir(&m.id);
         std::fs::write(dir.join("left.mov"), b"12345").unwrap();
+        std::fs::write(dir.join("right.001.mp4"), b"12").unwrap();
+        std::fs::write(dir.join("right.002.mp4"), b"345").unwrap();
         drop(store);
         // A power cut left an empty project.json behind.
         std::fs::write(dir.join("project.json"), b"").unwrap();
@@ -982,7 +1124,13 @@ pub(crate) mod tests {
         assert_eq!(m.status, Status::Failed);
         assert_eq!(m.name, "Recovered match");
         assert_eq!(m.files.left.as_ref().unwrap().size_bytes, 5);
-        assert!(m.files.right.is_none());
+        assert!(m.files.left.as_ref().unwrap().parts.is_empty());
+        let right = m.files.right.as_ref().unwrap();
+        assert_eq!(right.parts.len(), 2, "both parts found again");
+        assert_eq!(
+            (right.name.as_str(), right.size_bytes),
+            ("right.001.mp4", 5)
+        );
         drop(store);
         // It was saved, so it stays the same.
         let store = Store::open(tmp.path()).unwrap();
@@ -1080,13 +1228,124 @@ pub(crate) mod tests {
     fn finds_original_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("left.part"), b"").unwrap();
-        assert!(original_file(tmp.path(), "left").is_none());
+        assert!(original_files(tmp.path(), "left").is_empty());
         std::fs::write(tmp.path().join("left.MOV"), b"").unwrap();
         assert_eq!(
-            original_file(tmp.path(), "left").unwrap(),
-            tmp.path().join("left.MOV")
+            original_files(tmp.path(), "left"),
+            vec![tmp.path().join("left.MOV")]
         );
-        assert!(original_file(tmp.path(), "right").is_none());
+        assert!(original_files(tmp.path(), "right").is_empty());
+    }
+
+    /// A recording the camera split into several files (GoPro chapters).
+    #[test]
+    fn finds_the_parts_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for name in [
+            "left.003.mp4",
+            "left.001.mp4",
+            "left.002.mp4",
+            "left.004.mp4.part",
+            "left.0123456789ab.part",
+            "left.mp4.0123456789ab.tmp",
+            "left.000.mp4",
+            "left.12.mp4",
+            "left.x.mp4",
+            "leftover.001.mp4",
+            "matched-left.mp4",
+            "right.001.mov",
+            "right.003.mov",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let names = |files: Vec<PathBuf>| -> Vec<String> {
+            files
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(original_files(dir, "left")),
+            ["left.001.mp4", "left.002.mp4", "left.003.mp4"]
+        );
+        let mut found = side_files(dir, "left");
+        found.sort();
+        assert_eq!(
+            found.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(3)]
+        );
+        // Part 2 is missing: not usable yet.
+        assert!(original_files(dir, "right").is_empty());
+        std::fs::write(dir.join("right.002.mov"), b"x").unwrap();
+        assert_eq!(original_files(dir, "right").len(), 3);
+        // The matching copy is one file made from all the parts.
+        std::fs::write(dir.join("matched-left.mp4"), b"x").unwrap();
+        assert_eq!(names(working_files(dir, "left")), ["matched-left.mp4"]);
+        assert_eq!(names(working_files(dir, "right")).len(), 3);
+
+        // Only as many parts as the match says, all of them sent.
+        let mut m = sample("a1");
+        assert!(uploaded_files(&m, dir, "left").is_none());
+        let part = |n: &str| {
+            Some(PartInfo {
+                name: n.into(),
+                size_bytes: 1,
+            })
+        };
+        m.files.left = Some(FileInfo::from_parts(vec![
+            part("GX010042.MP4"),
+            part("GX020042.MP4"),
+            None,
+        ]));
+        assert!(uploaded_files(&m, dir, "left").is_none(), "part 3 not sent");
+        m.files.left.as_mut().unwrap().parts[2] = part("GX030042.MP4");
+        assert_eq!(uploaded_files(&m, dir, "left").unwrap().len(), 3);
+        m.files.left.as_mut().unwrap().parts.pop();
+        assert!(
+            uploaded_files(&m, dir, "left").is_none(),
+            "2 listed, 3 on disk"
+        );
+    }
+
+    #[test]
+    fn file_info_of_parts() {
+        let part = |n: &str, size| PartInfo {
+            name: n.into(),
+            size_bytes: size,
+        };
+        let f = FileInfo::from_parts(vec![
+            Some(part("GX010042.MP4", 4_000)),
+            None,
+            Some(part("GX030042.MP4", 1_000)),
+        ]);
+        assert_eq!((f.name.as_str(), f.size_bytes), ("GX010042.MP4", 5_000));
+        assert!(!f.complete());
+        assert_eq!(f.file_count(), 3);
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"name": "GX010042.MP4", "sizeBytes": 5000, "parts": [
+                {"name": "GX010042.MP4", "sizeBytes": 4000}, null,
+                {"name": "GX030042.MP4", "sizeBytes": 1000}]})
+        );
+        // One file: no parts listed, like before.
+        let one = FileInfo::single("IMG_1.MOV".into(), 7);
+        assert!(one.complete());
+        assert_eq!(one.file_count(), 1);
+        assert_eq!(
+            serde_json::to_value(&one).unwrap(),
+            serde_json::json!({"name": "IMG_1.MOV", "sizeBytes": 7})
+        );
+        let old: FileInfo = serde_json::from_str(r#"{"name":"a.mov","sizeBytes":3}"#).unwrap();
+        assert!(old.parts.is_empty() && old.complete());
+        let mut files = Files::default();
+        assert!(!files.both());
+        files.left = Some(one);
+        files.right = Some(f);
+        assert!(!files.both());
+        files.right.as_mut().unwrap().parts[1] = Some(part("GX020042.MP4", 4_000));
+        assert!(files.both());
     }
 
     /// The matching copy is used for processing, but is never an original.
@@ -1101,23 +1360,23 @@ pub(crate) mod tests {
         ] {
             std::fs::write(dir.join(name), b"").unwrap();
         }
-        assert!(original_file(dir, "right").is_none());
+        assert!(original_files(dir, "right").is_empty());
         assert!(
-            working_file(dir, "right").is_none(),
+            working_files(dir, "right").is_empty(),
             "no copy without an original"
         );
         std::fs::write(dir.join("right.mov"), b"").unwrap();
         std::fs::write(dir.join("left.mp4"), b"").unwrap();
-        assert_eq!(original_file(dir, "right").unwrap(), dir.join("right.mov"));
+        assert_eq!(original_files(dir, "right"), vec![dir.join("right.mov")]);
         assert_eq!(
-            working_file(dir, "right").unwrap(),
-            dir.join("matched-right.mp4")
+            working_files(dir, "right"),
+            vec![dir.join("matched-right.mp4")]
         );
-        assert_eq!(working_file(dir, "left").unwrap(), dir.join("left.mp4"));
+        assert_eq!(working_files(dir, "left"), vec![dir.join("left.mp4")]);
         assert!(remove_matched(dir, "right"));
         assert!(!remove_matched(dir, "right"));
         assert!(!matched_record(dir, "right").exists());
-        assert_eq!(working_file(dir, "right").unwrap(), dir.join("right.mov"));
+        assert_eq!(working_files(dir, "right"), vec![dir.join("right.mov")]);
         // A copy left half-made is cleared away at the next start.
         remove_part_files(dir);
         assert!(!dir.join("matched-right.0123456789ab.tmp.mp4").exists());

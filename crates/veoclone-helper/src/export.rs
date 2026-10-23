@@ -16,8 +16,9 @@ use serde::Deserialize;
 
 use crate::calib::BLEND_WIDTH;
 use crate::jobs::{Context, JobError, Progress, check_free_space};
-use crate::media::{OverlayPlan, RunError, Tools, add_overlays, concat, concat_list};
-use crate::store::{ExportStatus, Fps, Quality, Step, working_file};
+use crate::media::{OverlayPlan, RunError, Tools, add_overlays, concat, concat_list, probe};
+use crate::process::{input_path, skips};
+use crate::store::{ExportStatus, Fps, Quality, Step, working_files};
 
 /// A keep-range in synced frames, end exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -283,10 +284,68 @@ fn reco_quality(q: Quality) -> reco_io::output::Quality {
     }
 }
 
+/// One camera's video for the export.
+#[derive(Debug, Clone)]
+pub struct Footage {
+    /// One file, or the parts of a recording in order.
+    pub files: Vec<PathBuf>,
+    /// The number of frames in each part (not needed for one file).
+    pub frames: Vec<u64>,
+}
+
+/// What one export part reads: which files of each camera's video, and
+/// where in them it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reads {
+    /// The files of the left and right video, in order.
+    pub left: std::ops::Range<usize>,
+    pub right: std::ops::Range<usize>,
+    /// Reco's start, in frames from the start of those files.
+    pub start: u64,
+    /// Reco's sync offset for those files.
+    pub sync_offset: i64,
+}
+
+/// Where to read synced frames `seg` from. One file per camera: the whole
+/// files, from `seg.start_frame` with the match's sync offset, as always.
+/// A recording in parts (GoPro chapters): from the part that holds the
+/// first frame, counting frames from the start of that part. Reco finds a
+/// start by its time, and the parts don't add up exactly in time (each
+/// part's sound runs a little longer than its picture), so a time from the
+/// start of the recording would land a frame or two off in later parts.
+pub fn reads(left_frames: &[u64], right_frames: &[u64], sync_offset: i64, seg: Segment) -> Reads {
+    let (left_skip, right_skip) = skips(sync_offset);
+    let last = seg.end_frame.max(seg.start_frame + 1) - 1;
+    let (l0, l_at) = locate(left_frames, seg.start_frame + left_skip);
+    let (l1, _) = locate(left_frames, last + left_skip);
+    let (r0, r_at) = locate(right_frames, seg.start_frame + right_skip);
+    let (r1, _) = locate(right_frames, last + right_skip);
+    Reads {
+        left: l0..l1 + 1,
+        right: r0..r1 + 1,
+        start: l_at.min(r_at),
+        sync_offset: r_at as i64 - l_at as i64,
+    }
+}
+
+/// The part holding frame `n` of a video whose parts have `frames` frames
+/// each, and the frame's number within that part. One file (no counts):
+/// that file.
+fn locate(frames: &[u64], n: u64) -> (usize, u64) {
+    let mut first = 0;
+    for (i, &count) in frames.iter().enumerate() {
+        if n < first + count || i + 1 == frames.len() {
+            return (i, n - first);
+        }
+        first += count;
+    }
+    (0, n)
+}
+
 /// Inputs for rendering the parts.
 pub struct RenderPlan<'a> {
-    pub left: &'a Path,
-    pub right: &'a Path,
+    pub left: &'a Footage,
+    pub right: &'a Footage,
     pub calibration: &'a MatchCalibration,
     pub fps: Fps,
     pub request: &'a ExportRequest,
@@ -309,9 +368,28 @@ pub fn render_parts(
         let c = counter.clone();
         let path = plan.request.path.clone();
         let start = seg.start_frame;
+        let expected = seg.end_frame - seg.start_frame;
+        let at = reads(
+            &plan.left.frames,
+            &plan.right.frames,
+            plan.calibration.sync_offset,
+            *seg,
+        );
+        if plan.left.files.len() > 1 || plan.right.files.len() > 1 {
+            tracing::info!(
+                "Part {}: left files {}-{}, right files {}-{}, from frame {} (sync offset {})",
+                i + 1,
+                at.left.start + 1,
+                at.left.end,
+                at.right.start + 1,
+                at.right.end,
+                at.start,
+                at.sync_offset
+            );
+        }
         let job = reco_io::StitchJob::with_calibration(
-            plan.left,
-            plan.right,
+            input_path(&plan.left.files[at.left.clone()]),
+            input_path(&plan.right.files[at.right.clone()]),
             plan.calibration.clone(),
             &out,
         )
@@ -321,8 +399,9 @@ pub fn render_parts(
         .resolution(plan.request.width, plan.request.height)
         .blend_width(BLEND_WIDTH)
         .force_cpu_decode()
-        .start_time(plan.fps.frame_to_secs(seg.start_frame))
-        .end_time(plan.fps.frame_to_secs(seg.end_frame))
+        .sync_offset(at.sync_offset)
+        .start_time(plan.fps.frame_to_secs(at.start))
+        .end_time(plan.fps.frame_to_secs(at.start + expected))
         .on_progress(move |p| c.store(p.frames_completed, Ordering::Relaxed))
         .on_session(move |session, _source| {
             session.set_panner(Box::new(PathPanner { path, start }));
@@ -332,7 +411,6 @@ pub fn render_parts(
             return Err(JobError::Cancelled);
         }
         let r = result.map_err(|e| JobError::failed("Making the video failed.", e))?;
-        let expected = seg.end_frame - seg.start_frame;
         tracing::info!(
             "Part {}: frames {}..{} -> {} frames ({}, {})",
             i + 1,
@@ -527,8 +605,32 @@ pub fn run(
     };
     let fps = meta.fps.ok_or_else(|| not_ready("no fps"))?;
     // The videos processing used: the matching copies, if there are any.
-    let left = working_file(&dir, "left").ok_or_else(|| not_ready("left file missing"))?;
-    let right = working_file(&dir, "right").ok_or_else(|| not_ready("right file missing"))?;
+    let footage = |side: &str| -> Result<Footage, JobError> {
+        let files = working_files(&dir, side);
+        if files.is_empty() {
+            return Err(not_ready(&format!("{side} file missing")));
+        }
+        // A recording in parts: how many frames each part has.
+        let frames = if files.len() > 1 {
+            files
+                .iter()
+                .map(|f| probe(&ctx.tools, f).map(|p| p.frame_count))
+                .collect::<Result<Vec<u64>, String>>()
+                .map_err(|e| {
+                    JobError::failed(
+                        format!(
+                            "We couldn't read the {side} video. {}",
+                            crate::process::DAMAGED
+                        ),
+                        e,
+                    )
+                })?
+        } else {
+            Vec::new()
+        };
+        Ok(Footage { files, frames })
+    };
+    let (left, right) = (footage("left")?, footage("right")?);
     let from_file = MatchCalibration::from_file(&dir.join("match.json"))
         .map_err(|e| not_ready(&e.to_string()))?;
     let calibration = req.calibration_for(&from_file);
@@ -858,6 +960,86 @@ mod tests {
         assert_eq!((used.rig_tilt, used.rig_roll), (0.2, -0.1));
     }
 
+    /// Where each export part starts reading (DESIGN.md 4.3).
+    #[test]
+    fn reads_start_in_the_right_part() {
+        let seg = |start_frame, end_frame| Segment {
+            start_frame,
+            end_frame,
+        };
+        // One file per camera: from the start frame with the match's sync
+        // offset, as always.
+        for (offset, start) in [(12, 40), (-7, 300), (0, 0)] {
+            assert_eq!(
+                reads(&[], &[], offset, seg(start, start + 100)),
+                Reads {
+                    left: 0..1,
+                    right: 0..1,
+                    start,
+                    sync_offset: offset,
+                }
+            );
+        }
+        // Parts: left 400 + 400 + 400 frames, right 380 + 420 + 400, the
+        // right camera started 12 frames earlier (synced frame f = left
+        // frame f = right frame f + 12).
+        let (l, r) = ([400, 400, 400], [380, 420, 400]);
+        // In the first parts: like one file.
+        assert_eq!(
+            reads(&l, &r, 12, seg(40, 120)),
+            Reads {
+                left: 0..1,
+                right: 0..1,
+                start: 40,
+                sync_offset: 12,
+            }
+        );
+        // Across the joins (left frame 400, right frame 380).
+        assert_eq!(
+            reads(&l, &r, 12, seg(360, 450)),
+            Reads {
+                left: 0..2,
+                right: 0..2,
+                start: 360,
+                sync_offset: 12,
+            }
+        );
+        // Starting in the second right part but the first left one.
+        assert_eq!(
+            reads(&l, &r, 12, seg(375, 390)),
+            Reads {
+                left: 0..1,
+                right: 1..2,
+                start: 7,
+                sync_offset: -368,
+            }
+        );
+        // Later parts: counted from the part the first frame is in.
+        assert_eq!(
+            reads(&l, &r, 12, seg(750, 830)),
+            Reads {
+                left: 1..3,
+                right: 1..3,
+                start: 350,
+                sync_offset: 32,
+            }
+        );
+        assert_eq!(
+            reads(&l, &r, -5, seg(1100, 1195)),
+            Reads {
+                left: 2..3,
+                right: 2..3,
+                start: 300,
+                sync_offset: -5,
+            }
+        );
+        // Past the end: the last part (Reco then stops early, which the
+        // export notices).
+        assert_eq!(locate(&l, 1300), (2, 500));
+        assert_eq!(locate(&l, 399), (0, 399));
+        assert_eq!(locate(&l, 400), (1, 0));
+    }
+
     #[test]
     fn panner_maps_segment_frames_to_path() {
         let path: Vec<[f32; 3]> = (0..10).map(|i| [i as f32, 0.0, 30.0]).collect();
@@ -902,6 +1084,13 @@ mod tests {
             file_name("Ünïcode ⚽", when),
             "Ünïcode ⚽ 2026-10-21 14.05.mp4"
         );
+    }
+
+    fn one_file(path: &Path) -> Footage {
+        Footage {
+            files: vec![path.to_path_buf()],
+            frames: Vec::new(),
+        }
     }
 
     /// Run a command and return stdout, panicking with stderr on failure.
@@ -968,7 +1157,9 @@ mod tests {
     }
 
     /// Mean luma of a 32x32 patch at (x, y) for every frame, as frame codes.
-    /// Reads the raw Y plane (no range conversion).
+    /// Reads the raw Y plane (no range conversion), every frame once (the
+    /// joined export has small gaps in its frame times where its parts'
+    /// sound ran on, which a constant-rate read would fill).
     fn codes(video: &Path, x: u32, y: u32) -> Vec<i32> {
         let filter = format!("crop=32:32:{x}:{y},scale=2:2:flags=area");
         sh(
@@ -978,6 +1169,8 @@ mod tests {
                 "error",
                 "-i",
                 video.to_str().unwrap(),
+                "-fps_mode",
+                "passthrough",
                 "-vf",
                 &filter,
                 "-f",
@@ -1047,8 +1240,8 @@ mod tests {
         let out_dir = tmp.path().join("export");
         std::fs::create_dir_all(&out_dir).unwrap();
         let plan = RenderPlan {
-            left: &left,
-            right: &right,
+            left: &one_file(&left),
+            right: &one_file(&right),
             calibration: &cal,
             fps,
             request: &request,
@@ -1111,8 +1304,157 @@ mod tests {
         // left camera, the bottom tile the same moment from the right one.
         let proxy = tmp.path().join("proxy.mp4");
         let plan = crate::media::ProxyPlan {
-            left: left.clone(),
-            right: right.clone(),
+            left: vec![left.clone()],
+            right: vec![right.clone()],
+            output: proxy.clone(),
+            fps,
+            left_skip: 0,
+            right_skip: 12,
+            frame_count,
+            tile_width: 1280,
+            tile_height: 720,
+            audio: true,
+        };
+        crate::media::make_proxy(&tools, &plan, &cancel, |_| {}).unwrap();
+        let top = codes(&proxy, 624, 344);
+        let bottom = codes(&proxy, 624, 720 + 344);
+        assert_eq!(top.len() as u64, frame_count);
+        for f in 0..frame_count {
+            assert_eq!(top[f as usize], (f % 16) as i32, "proxy left, frame {f}");
+            assert_eq!(
+                bottom[f as usize],
+                ((f + 12) % 16) as i32,
+                "proxy right, frame {f}"
+            );
+        }
+    }
+
+    /// Like `export_frame_alignment`, for GoPro-style recordings in parts
+    /// (each part with its own sound, the joins at different moments in
+    /// the two cameras): parts inside one file, across the joins, and
+    /// starting in a later part, short and long seeks. Also the preview.
+    /// `cargo test -p veoclone-helper -- --ignored export_frame_alignment_in_parts`
+    #[test]
+    #[ignore]
+    fn export_frame_alignment_in_parts() {
+        use crate::media::tests::coded_parts;
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Tools::find();
+        let footage = |name: &str, frames: &[u64]| {
+            let files = coded_parts(tmp.path(), name, frames, 30);
+            let counted: Vec<u64> = files
+                .iter()
+                .map(|f| crate::media::probe(&tools, f).unwrap().frame_count)
+                .collect();
+            assert_eq!(counted, frames);
+            Footage {
+                files,
+                frames: counted,
+            }
+        };
+        let left = footage("GX0", &[400, 400, 400]);
+        let right = footage("GH0", &[380, 420, 400]);
+        let mut cal: MatchCalibration =
+            serde_json::from_str(crate::calib::tests::SYNTH_MATCH).unwrap();
+        cal.sync_offset = 12;
+        let fps = Fps { num: 30, den: 1 };
+        let frame_count = crate::process::synced_frame_count(1200, 1200, 12);
+        let switch = 780;
+        let path: Vec<[f32; 3]> = (0..frame_count)
+            .map(|f| [if f < switch { 1.2 } else { -1.2 }, 0.0, 20.0])
+            .collect();
+        let expected = |f: u64| -> i32 {
+            if f < switch {
+                (f % 16) as i32
+            } else {
+                ((f + 12) % 16) as i32
+            }
+        };
+        let segments = [(40, 120), (360, 450), (375, 390), (750, 830), (1130, 1185)];
+        let request = ExportRequest {
+            segments: segments
+                .iter()
+                .map(|&(s, e)| Segment {
+                    start_frame: s,
+                    end_frame: e,
+                })
+                .collect(),
+            width: 640,
+            height: 360,
+            quality: Quality::Fast,
+            path: Arc::new(path),
+            overlays: Vec::new(),
+            rig_tilt: None,
+            rig_roll: None,
+        };
+        let out_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let plan = RenderPlan {
+            left: &left,
+            right: &right,
+            calibration: &cal,
+            fps,
+            request: &request,
+            out_dir: &out_dir,
+        };
+        let cancel = AtomicBool::new(false);
+        let parts = render_parts(&plan, &cancel, &|_| {}).unwrap_or_else(|e| panic!("{e:?}"));
+        let output = out_dir.join("out.mp4");
+        join_parts(&tools, &out_dir, &parts, &output, &cancel).unwrap_or_else(|e| panic!("{e:?}"));
+
+        let got = codes(&output, 304, 164);
+        let want: Vec<i32> = segments
+            .iter()
+            .flat_map(|&(s, e)| (s..e).map(expected))
+            .collect();
+        assert_eq!(got.len(), want.len(), "frame count");
+        let wrong: Vec<_> = (0..got.len()).filter(|&k| got[k] != want[k]).collect();
+        assert!(
+            wrong.is_empty(),
+            "{} wrong frames, first at output frame {:?}: got {:?} want {:?}",
+            wrong.len(),
+            wrong.first(),
+            &got[wrong[0]..(wrong[0] + 5).min(got.len())],
+            &want[wrong[0]..(wrong[0] + 5).min(want.len())]
+        );
+        // The sound runs on through the joins.
+        let duration = |stream: &str| -> f64 {
+            String::from_utf8(sh(
+                "ffprobe",
+                &[
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    stream,
+                    "-show_entries",
+                    "stream=duration",
+                    "-of",
+                    "csv=p=0",
+                    output.to_str().unwrap(),
+                ],
+            ))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+        };
+        let secs = want.len() as f64 / 30.0;
+        assert!(
+            (duration("v:0") - secs).abs() < 0.05,
+            "video {}",
+            duration("v:0")
+        );
+        assert!(
+            (duration("a:0") - secs).abs() < 0.15,
+            "sound {}",
+            duration("a:0")
+        );
+
+        // The preview from the parts: every synced frame from both cameras.
+        let proxy = tmp.path().join("proxy.mp4");
+        let plan = crate::media::ProxyPlan {
+            left: left.files.clone(),
+            right: right.files.clone(),
             output: proxy.clone(),
             fps,
             left_skip: 0,

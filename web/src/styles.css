@@ -1017,6 +1017,50 @@ dialog {
   gap: 6px;
   color: var(--accent);
 }
+/* A video in several files (GoPro chapters), in the order they are joined. */
+.dz-parts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.dz-part {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.dz-part-n {
+  width: 22px;
+  flex: none;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.dz-part-text {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+}
+.dz-part-state {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.dz-part.missing .dz-part-state {
+  color: var(--amber);
+}
+.dz-remove {
+  flex: none;
+}
 .space-info.text-bad {
   color: var(--red);
 }

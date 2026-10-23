@@ -1,5 +1,6 @@
 // End-to-end UI tests against the mock helper. See playwright.config.ts.
 import { expect, test, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { expectPicture, FIXTURES, MOCK, mockState, open, patchProject, resetMock, shot } from "./helpers";
 
@@ -619,6 +620,120 @@ test("Try again after a failed upload sends only the video that is missing", asy
   await expect(page).toHaveURL(/#\/project\/\w+/);
   expect(puts).toEqual(["left", "right", "right"]);
   expect((await mockState()).projects).toHaveLength(1);
+});
+
+// A GoPro saves a long recording as several files ("chapters"), all from one camera.
+const CLIP = readFileSync(path.join(FIXTURES, "left-small.mp4"));
+const gopro = (name: string) => ({ name, mimeType: "video/mp4", buffer: CLIP });
+/** The file names listed in a box, in the order they are joined. */
+const partNames = (side: "left" | "right") => `.dropzone[data-side=${side}] .dz-part .dz-name`;
+
+test("a GoPro video in several files: put in order, a part removed and added back, sent part by part", async ({ page }) => {
+  await resetMock();
+  await open(page, "/new");
+  await page.getByLabel("Name of the match").fill("GoPro chapters");
+  const left = page.locator(".dropzone[data-side=left]");
+  // Chosen in any order: joined in the order the camera recorded them.
+  await page.getByTestId("file-left").setInputFiles([gopro("GX030042.MP4"), gopro("GX010042.MP4"), gopro("GX020042.MP4")]);
+  await expect(page.locator(partNames("left"))).toHaveText(["GX010042.MP4", "GX020042.MP4", "GX030042.MP4"]);
+  // "3 parts · 0:06 · 60 KB": the length of all three together.
+  await expect(left.getByTestId("parts-summary")).toHaveText(/^3 parts · \d+:\d\d · \d+ KB$/);
+  await expect(left.locator(".dz-warn")).toHaveCount(0);
+  await page.getByTestId("file-right").setInputFiles(path.join(FIXTURES, "right-small.mp4"));
+  await expect(page.locator(".dropzone[data-side=right]")).toContainText("right-small.mp4"); // one file, as before
+  await shot(page, "gp-01-parts");
+
+  // Removing the middle part: VeoClone says one is missing.
+  await left.getByRole("button", { name: "Remove GX020042.MP4" }).click();
+  await expect(page.locator(partNames("left"))).toHaveText(["GX010042.MP4", "GX030042.MP4"]);
+  await expect(left.locator(".dz-warn")).toContainText("A part seems to be missing: GX020042.MP4.");
+  await page.getByTestId("file-left").setInputFiles([gopro("GX020042.MP4"), gopro("GX030042.MP4"), gopro("GX010042.MP4")]);
+  await expect(left.locator(".dz-warn")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Start" }).click();
+  await expect(page).toHaveURL(/#\/project\/\w+/);
+  const state = await mockState();
+  expect(state.uploads).toEqual([
+    { side: "left", name: "GX010042.MP4", part: 1, parts: 3 },
+    { side: "left", name: "GX020042.MP4", part: 2, parts: 3 },
+    { side: "left", name: "GX030042.MP4", part: 3, parts: 3 },
+    { side: "right", name: "right-small.mp4", part: null, parts: null },
+  ]);
+  expect(state.projects[0].files.left!.parts!.map((p) => p!.name)).toEqual(["GX010042.MP4", "GX020042.MP4", "GX030042.MP4"]);
+  expect(state.projects[0].files.right!.parts).toBeUndefined();
+  await expect(page.getByRole("heading", { name: "Your match is ready" })).toBeVisible({ timeout: 30_000 });
+});
+
+test("files from different recordings, and a missing first part, are pointed out", async ({ page }) => {
+  await resetMock();
+  await open(page, "/new");
+  const left = page.locator(".dropzone[data-side=left]");
+  const right = page.locator(".dropzone[data-side=right]");
+  await page.getByTestId("file-left").setInputFiles([gopro("GX010043.MP4"), gopro("GX020042.MP4"), gopro("GX010042.MP4")]);
+  await expect(page.locator(partNames("left"))).toHaveText(["GX010042.MP4", "GX020042.MP4", "GX010043.MP4"]);
+  await expect(left.locator(".dz-warn")).toContainText("These files seem to come from different recordings (recordings 0042 and 0043).");
+  await shot(page, "gp-02-mixed");
+  // HERO5 and older: GOPR0077.MP4 is the first part, then GP010077.MP4…
+  await page.getByTestId("file-right").setInputFiles([gopro("GP020077.MP4"), gopro("GP010077.MP4")]);
+  await expect(right.locator(".dz-warn")).toContainText("A part seems to be missing: GOPR0077.MP4.");
+  await expect(right.locator(".dz-warn")).toContainText("line up and level the cameras");
+  await page.getByTestId("file-right").setInputFiles([gopro("GP010077.MP4"), gopro("GOPR0077.MP4")]);
+  await expect(page.locator(partNames("right"))).toHaveText(["GOPR0077.MP4", "GP010077.MP4"]);
+  await expect(right.locator(".dz-warn")).toHaveCount(0);
+  // Other cameras: by name, with a word on joining.
+  await page.getByTestId("file-left").setInputFiles([gopro("clip10.mp4"), gopro("clip2.mp4")]);
+  await expect(page.locator(partNames("left"))).toHaveText(["clip2.mp4", "clip10.mp4"]);
+  await expect(left.locator(".dz-note")).toContainText("VeoClone joins these 2 files in this order into one video.");
+  // Back to one file: as before.
+  await page.getByTestId("file-left").setInputFiles(path.join(FIXTURES, "left-small.mp4"));
+  await expect(left.locator(".dz-parts")).toHaveCount(0);
+  await expect(left).toContainText("left-small.mp4");
+});
+
+test("Try again after a failed upload sends only the parts that are missing", async ({ page }) => {
+  await resetMock();
+  const puts: string[] = [];
+  await page.route(`${MOCK}/api/projects/*/files/**`, (route) => {
+    const url = new URL(route.request().url());
+    const what = `${url.pathname.split("/").pop()}${url.searchParams.get("part") ?? ""}`;
+    puts.push(what);
+    return what === "left2" && puts.filter((s) => s === "left2").length === 1 ? route.abort() : route.continue();
+  });
+  await open(page, "/new");
+  await page.getByTestId("file-left").setInputFiles([gopro("GX010042.MP4"), gopro("GX020042.MP4"), gopro("GX030042.MP4")]);
+  await page.getByTestId("file-right").setInputFiles(path.join(FIXTURES, "right-small.mp4"));
+  await page.getByRole("button", { name: "Start" }).click();
+  await expect(page.getByText("could not be reached")).toBeVisible();
+  const left = page.locator(".dropzone[data-side=left]");
+  await expect(left.locator(".dz-part").first()).toContainText("Sent");
+  await page.getByRole("button", { name: "Try again" }).click();
+  await expect(page).toHaveURL(/#\/project\/\w+/);
+  expect(puts).toEqual(["left1", "left2", "left2", "left3", "right"]);
+  expect((await mockState()).projects).toHaveLength(1);
+});
+
+test("a video with a part missing on VeoClone: add all its files again, only the missing part is sent", async ({ page }) => {
+  await resetMock();
+  const res = await fetch(`${MOCK}/api/projects`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Unfinished upload" }) });
+  const { id } = (await res.json()) as { id: string };
+  const put = (side: string, query: string, name: string) =>
+    fetch(`${MOCK}/api/projects/${id}/files/${side}${query}`, { method: "PUT", headers: { "X-Filename": name }, body: CLIP });
+  expect((await put("left", "?part=1&parts=2", "GX010042.MP4")).ok).toBe(true);
+  expect((await put("right", "", "right.mp4")).ok).toBe(true);
+  await open(page, `/project/${id}`);
+  await expect(page.getByText("Some files of a video are missing.")).toBeVisible();
+  const left = page.locator(".dropzone[data-side=left]");
+  await expect(left.locator(".dz-part")).toHaveCount(2);
+  await expect(left.locator(".dz-part").nth(1)).toContainText("not sent yet");
+  await expect(left.locator(".dz-warn")).toContainText("haven't been sent to VeoClone yet");
+  await expect(page.getByRole("button", { name: "Start" })).toBeDisabled();
+  await shot(page, "gp-03-missing-part");
+  await page.getByTestId("file-left").setInputFiles([gopro("GX020042.MP4"), gopro("GX010042.MP4")]);
+  await page.getByRole("button", { name: "Start" }).click();
+  await expect(page.getByRole("heading", { name: "Processing your match" })).toBeVisible();
+  const state = await mockState();
+  expect(state.uploads.slice(2)).toEqual([{ side: "left", name: "GX020042.MP4", part: 2, parts: 2 }]);
+  expect(state.projects[0].files.left!.parts!.every(Boolean)).toBe(true);
 });
 
 test("Stop during an upload leaves no half-made match behind", async ({ page }) => {

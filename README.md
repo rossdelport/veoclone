@@ -136,11 +136,12 @@ automatically**: VeoClone reads the model and the Lens setting from the
 video file. If that doesn't work (VeoClone then says so under **Good to
 know**), choose your GoPro model and **Wide** or **Linear** instead.
 
-A GoPro saves a long recording as several files (a new one every few
-minutes, for example GX010042.MP4, GX020042.MP4…). VeoClone needs **one file
-per camera**, so first join each GoPro's files into one video, in order,
-with a free tool such as LosslessCut (its "merge" joins them without
-re-encoding).
+A GoPro saves a long recording as several files: a new one about every 8
+to 12 minutes in 4K (every 4 GB), for example GX010042.MP4, GX020042.MP4,
+GX030042.MP4… (older GoPros: GOPR0042.MP4, GP010042.MP4, GP020042.MP4…). A
+full match is about 8 to 10 files per camera. You don't need to join them:
+**drop all the files from one camera into its box** (see below). Don't
+rename them: VeoClone reads the order from the names.
 
 **Getting the videos onto your PC:**
 
@@ -152,6 +153,12 @@ re-encoding).
   and copy the match video (the newest .MOV file) to a folder on your PC.
 - Rename the files straight away, for example **left.MOV** and
   **right.MOV**, so you don't mix them up.
+- **From a GoPro:** put its memory card in a card reader (or connect the
+  GoPro with its USB cable), open **DCIM › 100GOPRO** and copy all the
+  **.MP4** files of the match (their names end in the same four numbers)
+  into a folder of their own, one folder per GoPro, for example **Left
+  GoPro** and **Right GoPro**. Don't rename them. You can leave out the
+  .LRV and .THM files: VeoClone doesn't need them.
 
 ## Making a video, step by step
 
@@ -162,6 +169,14 @@ re-encoding).
    onto **Right phone** (or click a box to choose the file). Left and right
    are as seen from behind the phones, facing the pitch. Mixed them up?
    Click **Swap left and right**.
+
+   **GoPro:** drop all the files from one camera into its box (select them
+   all in the folder and drag them together, or click the box and choose
+   them all). VeoClone lists them in the order it joins them, for example
+   "9 parts · 1:32:10 · 35.2 GB", and warns you if a file seems to be
+   missing or comes from a different recording. Click **×** next to a file
+   to take it out. VeoClone joins the parts itself, without changing the
+   GoPro's files.
 4. **Which camera and lens filmed this?** Under **Which camera?** pick your
    iPhone model (for GoPros see [Filming with GoPros](#filming-with-gopros)). Under **Which lens?** pick **Ultra wide (0.5×)** if you
    tapped 0.5× when filming (as this guide says), otherwise **Normal (1×)**.
@@ -178,7 +193,9 @@ re-encoding).
    **Faster** (every 3rd frame: the AI step takes about a third of the time,
    but the camera reacts a little later).
 6. Click **Start**. Keep the page open until both videos have been sent to
-   VeoClone. Then VeoClone works through four steps: checking the videos
+   VeoClone (a GoPro video is sent file by file; if sending stops, click
+   **Try again**: files already sent are skipped). Then VeoClone works
+   through four steps: checking the videos
    (and making them match if the phones filmed in different formats),
    lining them up and joining them, making a preview, and AI ball tracking.
    This takes a while: for a full match, allow an hour or more. You can leave
@@ -273,8 +290,9 @@ re-encoding).
   uploaded to OneDrive. (If you already have a Videos\VeoClone folder,
   VeoClone keeps using it.)
 - Each match has its own folder inside the **projects** folder there, with
-  VeoClone's own copy of the two phone videos (plus a matching copy when the
-  phones filmed in different formats), the preview and your finished
+  VeoClone's own copy of the two phone videos (a GoPro video as its separate
+  files, left.001.mp4, left.002.mp4…, plus a matching copy when the phones
+  filmed in different formats), the preview and your finished
   videos (in the **exports** folder). The match folders have code names, so
   the easiest way to find a finished video is the **Show in folder** button
   in the editor.
@@ -366,6 +384,19 @@ re-encoding).
   away, against a crowd), the camera may stop when it loses the ball.
 - Use **AI accuracy: Best** so the AI looks at every frame.
 - For moments it still gets wrong, add a fix (drag the picture).
+
+**GoPro: "A part seems to be missing" or "These files seem to come from different recordings"**
+- All the files of one GoPro recording end in the same four numbers
+  (GX01**0042**.MP4, GX02**0042**.MP4…), and the two digits before them
+  count up (01, 02, 03…; older GoPros start with GOPR0042.MP4). Copy all of
+  them from the memory card and drop them all into the box together. Take
+  out files of other recordings with the **×** next to them.
+- If a part really is gone, VeoClone can still join the others, but the
+  video jumps where the part is missing, and the two cameras no longer
+  line up after it.
+- If a match says some files of a video haven't been sent yet (sending
+  stopped), drop all the files of that camera into its box again and press
+  **Start**: the files VeoClone already has are skipped.
 
 **"VeoClone couldn't recognise the camera from the video file"**
 - You chose **detect automatically** but the video file doesn't say which

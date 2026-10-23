@@ -251,6 +251,16 @@ fn container_duration_secs(path: &Path) -> Result<Option<f64>, DecodeError> {
     }
 }
 
+/// One `file` line of an ffconcat manifest. Inside single quotes nothing is
+/// special except the quote itself, which is closed, escaped and reopened
+/// (`'\''`), so paths with an apostrophe (`C:\Users\O'Brien\...`) work.
+fn concat_file_line(path: &Path) -> String {
+    format!(
+        "file '{}'",
+        path.display().to_string().replace('\'', "'\\''")
+    )
+}
+
 fn concat_seek_durations(paths: &[std::path::PathBuf]) -> Option<Vec<f64>> {
     let mut durations = Vec::with_capacity(paths.len());
     for path in paths {
@@ -520,7 +530,7 @@ impl VideoDecoder {
         writeln!(manifest, "ffconcat version 1.0")
             .map_err(|e| DecodeError::Ffmpeg(format!("write manifest: {e}")))?;
         for (idx, p) in paths.iter().enumerate() {
-            writeln!(manifest, "file '{}'", p.display())
+            writeln!(manifest, "{}", concat_file_line(p))
                 .map_err(|e| DecodeError::Ffmpeg(format!("write manifest: {e}")))?;
             if let Some(durations) = durations.as_ref() {
                 writeln!(manifest, "duration {:.6}", durations[idx])
@@ -1351,8 +1361,20 @@ fn pick_frame_rate(
 
 #[cfg(test)]
 mod tests {
-    use super::pick_frame_rate;
+    use super::{concat_file_line, pick_frame_rate};
     use ffmpeg_next as ffmpeg;
+
+    #[test]
+    fn concat_manifest_escapes_quotes() {
+        assert_eq!(
+            concat_file_line(std::path::Path::new("/videos/a b/GX010042.MP4")),
+            "file '/videos/a b/GX010042.MP4'"
+        );
+        assert_eq!(
+            concat_file_line(std::path::Path::new("/home/o'brien/left.001.mp4")),
+            "file '/home/o'\\''brien/left.001.mp4'"
+        );
+    }
 
     const R60: ffmpeg::Rational = ffmpeg::Rational(60, 1);
     const R30: ffmpeg::Rational = ffmpeg::Rational(30, 1);

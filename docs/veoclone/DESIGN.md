@@ -31,8 +31,10 @@ browser to the helper on the same PC.
    ticked; GoPros and "detect automatically" in the same list), camera style
    (Broadcast / Action / Wide / Follow the ball), AI accuracy (Best: every
    frame, default / Faster: every 3rd frame), and two drop boxes: **Left phone** and
-   **Right phone**. Filming tips shown alongside. "Start" uploads both files
-   to the helper (progress bar per file) and then starts processing.
+   **Right phone**, each taking one file or all the files of a recording the
+   camera split into parts (GoPro chapters, 4.10). Filming tips shown
+   alongside. "Start" uploads both videos to the helper (progress bar per
+   file) and then starts processing.
 3. Processing: steps with progress bars and time remaining:
    check files (and make matching copies, 4.2) → line up & calibrate →
    make preview → AI ball tracking.
@@ -130,6 +132,8 @@ workflows stay but only run on manual dispatch (section 6).
 project.json      ProjectMeta (below), written atomically (tmp + rename)
 left.<ext>        uploaded original (extension kept)
 right.<ext>
+left.001.<ext>    or: the parts of a recording in several files, in order
+left.002.<ext>…   (GoPro chapters, 4.10); right.001.<ext>… likewise
 matched-<side>.mp4   matching copy, only when the two phones filmed in
 matched-<side>.json  different formats (4.2), and what it was made from
 match.json        Reco MatchCalibration
@@ -166,7 +170,10 @@ log.txt           human-readable log of jobs for this project
 
 1. **Probe** both files (ffprobe JSON): width, height, fps, frame count
    (`nb_frames`, else duration×fps), duration, codec, pixel format,
-   `color_transfer`, rotation, audio presence. Fail with a clear message if
+   `color_transfer`, rotation, audio presence. A video in parts (4.10) is
+   probed part by part and joined (`media::join_probes`): frame count and
+   duration add up, the rest is the first part's; parts that differ in
+   size, fps, codec, pixel format or rotation are refused in plain words. Fail with a clear message if
    rotation is 90/270 (portrait) or a file has no video. Warn if HDR
    (`color_transfer` = `arib-std-b67` or `smpte2084`) and the colours were
    not changed (below): "Colours may look washed out — turn off HDR Video on
@@ -195,8 +202,12 @@ log.txt           human-readable log of jobs for this project
    keyframe every 2 s; sound copied; `-fps_mode passthrough` so no frame is
    dropped or doubled (Reco pairs by count). ffmpeg turns 180° videos
    upright and writes no rotation, so Reco does not turn them again.
+   A video in parts is read through the concat demuxer (4.10) with
+   `setpts=N/(<source fps>)/TB` first, so the joins leave no gap in the
+   frame times, and becomes one file.
    Written to a temp name, renamed to `matched-<side>.mp4`, with
-   `matched-<side>.json` (upload size + modified time + plan): reused while
+   `matched-<side>.json` (upload size + modified time + plan; for parts the
+   total size and the latest change): reused while
    those still match, otherwise made again (and everything derived from
    the old copy is deleted). Removed when that side is uploaded again, on
    swap, and when no longer needed. Runs inside step 1 with its own message
@@ -206,12 +217,16 @@ log.txt           human-readable log of jobs for this project
    made matching copies of both videos and changed the right video's HDR
    colours to normal colours. Next time set both phones the same: Settings
    › Camera › Record Video › 4K at 30 fps, and turn off HDR Video."
-   From here on every step and every export reads the **working file** per
-   side (`store::working_file`: the matching copy when there is one, else
-   the original) and its probe; `original_file` never returns a copy.
+   From here on every step and every export reads the **working files** per
+   side (`store::working_files`: the matching copy when there is one, else
+   the original, all its parts in order) and their probe;
+   `original_files` never returns a copy.
 2. **Calibrate** with `reco_calibrate::video::calibrate_videos`, GUI-like
    config: 4 frames, AKAZE detect y 0.05–0.95, skip_start = min(10 s, 10%
-   of duration). Lens: always the project's lens choice per phone (4.6):
+   of duration). It reads the first working file of each side (for parts,
+   the first part: it carries the GoPro's motion data used for the IMU sync
+   and the rig level; audio sync uses its first 60 s), and the 10 % are of
+   the left one's duration. Lens: always the project's lens choice per phone (4.6):
    `left_params` from `lensId` (`null` = `generic:ultra`), `right_params`
    from `rightLensId` (`null` = the same as `lensId`), each loaded from
    `LensDatabase::embedded()` and scaled to that side's working file the
@@ -235,6 +250,7 @@ log.txt           human-readable log of jobs for this project
    constant-frame-rate H.264 file, left camera on top:
    - each camera scaled to **1280x720** (keep 16:9; if the source aspect is
      not 16:9, scale to width 1280 and even height), stacked → 1280x1440;
+   - a video in parts is one input through the concat demuxer (4.10);
    - frame pairing by count, exactly like Reco: per input
      `trim=start_frame=<skip>,setpts=N/(<fps>)/TB,setparams=<bt709 tags>`
      (so ffmpeg 7 does not re-matrix HDR colours that Reco keeps), then
@@ -248,7 +264,8 @@ log.txt           human-readable log of jobs for this project
      `libx264 -preset veryfast -crf 26`;
    - progress from `-progress pipe:1` (`frame=` lines).
 4. **AI tracking** with `reco_io::StitchJob` + `reco_autocam::setup_autocam`
-   exactly like reco-gui's export (`crates/reco-gui/src/export.rs`): the
+   exactly like reco-gui's export (`crates/reco-gui/src/export.rs`), a video
+   in parts given as `InputPath::Chained` (4.10): the
    style's tracking mode and preset (`broadcast`/`action`/`frame_all`
    field mode; `ball` = `TrackingMode::Ball` with the broadcast preset,
    which Reco turns into `ball_weight` 1.0, `BallTracker` max jump 0.5 and
@@ -299,7 +316,8 @@ Body (JSON):
   re-implements the editing algorithm — the editor is the single source of
   truth, so preview == export.
 - For each segment: a `StitchJob::with_calibration` from the working files
-  (4.2), `start_time(startFrame/fps)`, `end_time(endFrame/fps)`,
+  (4.2), `start_time(startFrame/fps)`, `end_time(endFrame/fps)` (a video in
+  parts: from the part holding the first frame, see 4.10),
   `force_cpu_decode()`
   (exact frame accounting and fast seeking for trims; the D3D11 zero-copy
   immediate path drops the first frame), lookahead 0, no AI model,
@@ -368,7 +386,7 @@ editor applies them).
 | `GET /api/projects/:id` | `ProjectMeta` |
 | `PATCH /api/projects/:id` | `{ name?, lensId?, rightLensId?, style?, aiAccuracy? }` |
 | `DELETE /api/projects/:id` | deletes the folder (refuse while a job runs on it) |
-| `PUT /api/projects/:id/files/:side` | side = `left`/`right`; raw body streamed to disk (write `*.part`, rename at end); header `X-Filename` (original name, for the extension); deletes that side's matching copy; returns updated `ProjectMeta` |
+| `PUT /api/projects/:id/files/:side` | side = `left`/`right`; raw body streamed to disk (write `*.part`, rename at end); header `X-Filename` (original name, for the extension); `?part=N&parts=M`: part N (from 1) of a video in M files (4.10), else (or 1 of 1) the whole video; deletes that side's matching copy; returns updated `ProjectMeta` |
 | `POST /api/projects/:id/process` | start/queue the pipeline (also used for "Try again" and "Re-run AI with a different style") |
 | `POST /api/projects/:id/cancel` | cancel the running/queued job of this project |
 | `GET /api/projects/:id/calibration` | `CalibInfo` |
@@ -396,7 +414,7 @@ editor applies them).
   aiRun: null | { style; aiAccuracy; pitchId: string | null };  // what ai_path.bin was made with
   aiSeen: null | { every: number };  // a recording for quick re-runs exists (4.9); filled in when read
   status: "new" | "uploaded" | "queued" | "processing" | "ready" | "failed" | "cancelled";
-  files: { left?: FileInfo; right?: FileInfo };  // FileInfo = { name, sizeBytes, probe?: {...} }
+  files: { left?: FileInfo; right?: FileInfo };  // FileInfo = { name, sizeBytes, probe?: {...}, parts? } (4.10)
   job: null | { kind: "process" | "export"; exportId?: string;
                 step: "probe" | "calibrate" | "proxy" | "track" | "export" | "finalize" | "overlay";
                 stepIndex: number; stepCount: number; progress: number;
@@ -571,6 +589,88 @@ it runs the AI pass. Anything that recalibrates or changes the videos
 deletes the recording with the AI path. `ProjectMeta.aiSeen` tells the
 editor, which says "This takes a few seconds: VeoClone reuses what the AI
 saw last time." or "about as long as the first time".
+
+### 4.10 Recordings in parts (GoPro chapters)
+
+A GoPro splits one long recording into files of about 4 GB ("chapters",
+8–12 min each in 4K): GX010123.MP4, GX020123.MP4… on HERO6 and later (GX =
+H.265, GH = H.264), GOPR0123.MP4 then GP010123.MP4, GP020123.MP4… on HERO5
+and older. A 90-minute match is about 8–10 files per camera. They are never
+joined into a new file (and so never re-encoded: the first part keeps the
+GoPro's motion data untouched); every step reads the parts in order as one
+video.
+
+- **Editor** (`web/src/ui/parts.ts`, unit tested; `dropzone.ts`): a drop box
+  takes several files (drop or multi-select; a new choice replaces the old
+  one). They are ordered GoPro-aware (`sortParts`: recording number, then
+  part, GOPR before GP01; other names by name, numbers counted) and listed
+  under a summary ("4 parts · 1:32:10 · 15.2 GB", lengths read by the
+  browser), each with ×. `checkParts` warns in plain words about files from
+  different recordings (another recording number or camera letter, or a mix
+  with other names), a missing part (also the first one, which carries the
+  line-up data) or one there twice; other cameras' files get a note that
+  they are joined in this order. Non-video files (a GoPro's .LRV and .THM)
+  are left out. One file works as before. Parts are sent one after the other
+  with `?part=N&parts=M` (progress per part and overall); Try again skips
+  parts already sent, and parts the helper already has (same position, name
+  and size in `FileInfo.parts`, e.g. after a reload) are skipped too. The
+  old shortcut "two files in one box go left and right by name" is gone:
+  several files in one box are that camera's parts.
+- **Helper storage**: `left.001.<ext>`, `left.002.<ext>`… (one file stays
+  `left.<ext>`). `store::side_files` lists both kinds, `original_files`
+  gives the parts in order (empty when one in between is missing),
+  `uploaded_files` only when as many as `ProjectMeta.files` lists are there
+  and all were sent. A part upload replaces that part (any extension) and
+  removes the single file and parts beyond M; a whole-video upload removes
+  all parts; both drop the side's matching copy and everything derived, like
+  any upload. Swap renames every part (all or nothing). `FileInfo.parts`:
+  `(PartInfo | null)[]` with `PartInfo = { name, sizeBytes }`, null for a
+  part not sent yet; `name` is the first part's, `sizeBytes` the total,
+  `probe` the joined video's. The match is `uploaded` (and `process`
+  accepted) only when both sides are complete.
+- **Our ffmpeg steps** (preview, matching copy): one input
+  `-f concat -safe 0 -i <list>` with an ffconcat list (`media::join_list`:
+  absolute paths, `'` escaped as `'\''`) written next to the output with
+  `.tmp.` in its name and deleted afterwards. The concat demuxer passes on
+  every frame of every part in order; the preview counts frames
+  (`trim=start_frame`, `setpts=N/…`), so the joins' timing does not matter;
+  the matching copy renumbers the frame times first (4.2). Probe: per part,
+  summed (4.2).
+- **Reco** (AI pass, export): `InputPath::Chained`, decoded through Reco's
+  ffconcat manifest and paired by frame count across the chain. Patched in
+  `reco-io`: the manifest escapes `'` in paths (before, a data folder such
+  as `C:\Users\O'Brien\…` broke chained input).
+- **Export**: Reco finds a start by time, but the parts don't add up
+  exactly in time (each part's sound runs a little past its picture, and
+  Reco's manifest uses each file's container duration), so a time from the
+  start of the recording can land a frame off in later parts; and Reco's
+  chained sound passthrough only trims the first file. So each export
+  segment reads from the part holding its first frame (`export::reads`):
+  per side, the part and the frame within it of synced frame
+  `startFrame + skip` (part frame counts: ffprobe `nb_frames`), the chain
+  from there to the part holding the last frame, `start_time` = the smaller
+  of the two in-part frames, `sync_offset` = right − left. With one file per
+  side this is exactly `start_time(startFrame/fps)` and the match's sync
+  offset, as before. It assumes each part decodes on its own to `nb_frames`
+  frames (a GoPro chapter starts with a keyframe).
+- **Verified**: unit tests (`store`, `api::upload_in_parts`,
+  `media::joined_parts_keep_every_frame_once` with real ffmpeg: preview and
+  matching copies from parts keep every frame once, also 60→30 fps,
+  `export::reads_start_in_the_right_part`); the ignored GPU test
+  `export_frame_alignment_in_parts` (brightness-coded parts of 400/400/400
+  and 380/420/400 frames, each with its own sound: export segments inside a
+  part, across joins, starting in a later part with drained and time seeks,
+  and the preview, all frame-exact, sound continuous); and `e2e.py --only
+  chapters` with the release helper: each synthetic clip encoded once more
+  (no B-frames, keyframes at the cuts) is the one-file video, and cut by
+  stream copy into 3 GoPro-named parts (256/256/88 and 256/256/100 frames,
+  picture and sound from time 0) sent as parts: frameCount 600 like the
+  one-file match; calibrated from the first parts the camera path differs
+  from the one-file match's by at most 0.0004 rad and 0.02°; with the
+  one-file match's calibration the AI path is bit-identical, the preview
+  has the same 600 frames, and an export across the joins and into the
+  last part has the same 195 frames and the same sound packets as the
+  one-file export.
 
 ## 5. Editor engine (`web/src/engine/`) — pure TS, unit tested
 
@@ -835,14 +935,16 @@ VeoClone/
 - Phones filming in different formats cost an extra conversion in step 1
   (about as long as decoding and encoding the video once) and disk space
   for the copy; a 4:3 video loses a strip at the top and bottom.
-- One file per phone per project. If the phones were stopped at half-time,
-  make two projects.
+- One recording per camera per project (a recording in parts is fine,
+  4.10). If the phones were stopped at half-time, make two projects.
 - Audio sync needs the phones started within about 15 s of each other.
 - 60 fps works but the AI camera tuning assumes 30 fps.
 - No iPhone 16/17 lens profiles in Reco's database: those models use the
   closest older profile (4.6). GoPro HERO12/13 Black use the HERO11 Black's.
-- GoPros split long recordings into several files; VeoClone takes one file
-  per camera, so they must be joined first (README: LosslessCut).
+- A GoPro recording in parts (4.10): a missing part cannot be noticed at
+  the end of a recording (only gaps and the first part), and a part
+  missing in one camera puts the two cameras out of step from there on.
+  Not tried with real GoPro chapter files here (no sample files).
 - "Follow the ball" keeps a fixed zoom (Reco's ball mode has no player
   cluster to size it) and holds still when the ball is lost.
 - GoPro auto-detection could not be tried on real GoPro footage here (no

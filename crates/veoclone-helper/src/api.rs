@@ -30,9 +30,9 @@ use crate::export::{ExportBody, validate};
 use crate::jobs::{Job, Jobs};
 use crate::media::Tools;
 use crate::store::{
-    AiAccuracy, DERIVED_FILES, ExportMeta, ExportStatus, FileInfo, Files, PitchOutline,
-    ProjectMeta, Status, Store, Style, dir_size, end_unfinished_run, new_id, now_iso,
-    original_file, remove_matched, valid_id, write_atomic,
+    AiAccuracy, DERIVED_FILES, ExportMeta, ExportStatus, FileInfo, Files, MAX_PARTS, PartInfo,
+    PitchOutline, ProjectMeta, Status, Store, Style, dir_size, end_unfinished_run, new_id, now_iso,
+    remove_matched, side_files, uploaded_files, valid_id, write_atomic,
 };
 
 const EDITS_LIMIT: usize = 10 * 1024 * 1024;
@@ -547,9 +547,36 @@ impl Drop for UploadGuard {
     }
 }
 
+/// `?part=N&parts=M` on an upload: part N (from 1) of a recording the
+/// camera split into M files (GoPro chapters).
+#[derive(Deserialize)]
+struct PartQuery {
+    part: Option<String>,
+    parts: Option<String>,
+}
+
+impl PartQuery {
+    /// `None`: one file (no query, or part 1 of 1).
+    fn part(&self) -> ApiResult<Option<(usize, usize)>> {
+        let number = |v: &Option<String>| v.as_deref().and_then(|n| n.parse::<usize>().ok());
+        match (&self.part, &self.parts) {
+            (None, None) => Ok(None),
+            _ => match (number(&self.part), number(&self.parts)) {
+                (Some(1), Some(1)) => Ok(None),
+                (Some(n), Some(m)) if n >= 1 && n <= m && m <= MAX_PARTS => Ok(Some((n, m))),
+                (Some(_), Some(m)) if m > MAX_PARTS => Err(ApiError::bad_request(format!(
+                    "A video can be made of at most {MAX_PARTS} files."
+                ))),
+                _ => Err(ApiError::bad_request("The upload was not understood.")),
+            },
+        }
+    }
+}
+
 async fn upload(
     State(s): State<AppState>,
     UrlPath((id, side)): UrlPath<(String, String)>,
+    Query(query): Query<PartQuery>,
     headers: HeaderMap,
     body: Body,
 ) -> ApiResult<Response> {
@@ -557,6 +584,7 @@ async fn upload(
     if side != "left" && side != "right" {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "Unknown camera side."));
     }
+    let part = query.part()?;
     if s.jobs.busy(&id) {
         return Err(ApiError::conflict(BUSY));
     }
@@ -583,11 +611,11 @@ async fn upload(
         id: id.clone(),
     };
 
-    let part = dir.join(format!("{side}.{}.part", new_id()));
-    let size = match write_body(&part, body).await {
+    let upload = dir.join(format!("{side}.{}.part", new_id()));
+    let size = match write_body(&upload, body).await {
         Ok(n) => n,
         Err(e) => {
-            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(&upload).await;
             if e.kind() == std::io::ErrorKind::StorageFull {
                 return Err(ApiError::new(StatusCode::INSUFFICIENT_STORAGE, NO_SPACE).detail(e));
             }
@@ -597,43 +625,57 @@ async fn upload(
         }
     };
     if size == 0 {
-        let _ = tokio::fs::remove_file(&part).await;
+        let _ = tokio::fs::remove_file(&upload).await;
         return Err(ApiError::bad_request("That file is empty."));
     }
     if s.jobs.busy(&id) {
-        let _ = tokio::fs::remove_file(&part).await;
+        let _ = tokio::fs::remove_file(&upload).await;
         return Err(ApiError::conflict(BUSY));
     }
 
-    // Replace the old original and drop everything made from it.
-    while let Some(old) = original_file(&dir, &side) {
-        tokio::fs::remove_file(&old)
-            .await
-            .map_err(|e| ApiError::internal("The old video could not be replaced.", e))?;
+    // Replace the old original (one file: all of it; a part: that part,
+    // and parts beyond the new number of parts) and drop everything made
+    // from it.
+    let replaced = |n: Option<usize>| match (part, n) {
+        (None, _) | (Some(_), None) => true,
+        (Some((new, count)), Some(old)) => old == new || old > count,
+    };
+    for (n, old) in side_files(&dir, &side) {
+        if replaced(n) {
+            tokio::fs::remove_file(&old)
+                .await
+                .map_err(|e| ApiError::internal("The old video could not be replaced.", e))?;
+        }
     }
     remove_matched(&dir, &side);
     for f in DERIVED_FILES.into_iter().chain(crate::seen::SEEN_FILES) {
         let _ = tokio::fs::remove_file(dir.join(f)).await;
     }
-    let dest = dir.join(format!("{side}.{}", extension(&name)));
-    tokio::fs::rename(&part, &dest)
+    let dest = match part {
+        None => dir.join(format!("{side}.{}", extension(&name))),
+        Some((n, _)) => dir.join(format!("{side}.{n:03}.{}", extension(&name))),
+    };
+    tokio::fs::rename(&upload, &dest)
         .await
         .map_err(|e| ApiError::internal("The video could not be saved.", e))?;
 
-    let info = FileInfo {
-        name,
-        size_bytes: size,
-        probe: None,
-    };
     let (mut meta, _) = s
         .store
         .update(&id, |m| {
-            if side == "left" {
-                m.files.left = Some(info);
-            } else {
-                m.files.right = Some(info);
-            }
-            m.status = if m.files.left.is_some() && m.files.right.is_some() {
+            let file = m.files.side_mut(&side);
+            *file = Some(match part {
+                None => FileInfo::single(name, size),
+                Some((n, count)) => {
+                    let mut parts = file.take().map(|f| f.parts).unwrap_or_default();
+                    parts.resize(count, None);
+                    parts[n - 1] = Some(PartInfo {
+                        name,
+                        size_bytes: size,
+                    });
+                    FileInfo::from_parts(parts)
+                }
+            });
+            m.status = if m.files.both() {
                 Status::Uploaded
             } else {
                 Status::New
@@ -676,13 +718,12 @@ async fn process(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> Api
         return Err(ApiError::conflict(BUSY));
     }
     let dir = s.store.project_dir(&id);
-    if meta.files.left.is_none()
-        || meta.files.right.is_none()
-        || original_file(&dir, "left").is_none()
-        || original_file(&dir, "right").is_none()
+    if uploaded_files(&meta, &dir, "left").is_none()
+        || uploaded_files(&meta, &dir, "right").is_none()
     {
         return Err(ApiError::bad_request(
-            "Both videos are needed. Add the left and the right phone's video first.",
+            "Both videos are needed. Add the left and the right phone's video first \
+             (with all their files, when a camera split its video into several).",
         ));
     }
     let (meta, _) = s
@@ -746,7 +787,7 @@ async fn swap(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiRes
                 let left = m.lens_id.replace(right);
                 m.right_lens_id = Some(left.unwrap_or_else(|| DEFAULT_LENS.into()));
             }
-            m.status = if m.files.left.is_some() && m.files.right.is_some() {
+            m.status = if m.files.both() {
                 Status::Uploaded
             } else {
                 Status::New
@@ -764,32 +805,38 @@ async fn swap(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiRes
     Ok(json(&meta))
 }
 
-/// Rename `left.*` to `right.*` and back (each keeps its extension), then
-/// drop everything made from the old order (also the matching copies).
+/// Rename `left.*` to `right.*` and back (each file keeps its part number
+/// and extension, so `left.002.mp4` becomes `right.002.mp4`), then drop
+/// everything made from the old order (also the matching copies). All or
+/// nothing: when a rename fails, the ones already done are undone.
 fn swap_files(dir: &Path) -> std::io::Result<()> {
-    let ext = |p: &Path| {
-        p.extension()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
+    // "left.002.mp4" -> "002.mp4"
+    let rest = |side: &str, p: &Path| {
+        let name = p.file_name().unwrap_or_default().to_string_lossy();
+        name[side.len() + 1..].to_string()
     };
-    let left = original_file(dir, "left");
-    let right = original_file(dir, "right");
-    // Park the left video under another name so the two never clash.
-    let parked = dir.join("swapping");
-    if let Some(l) = &left {
-        std::fs::rename(l, &parked)?;
+    let mut renames = Vec::new();
+    // Park the left video under other names first so the two never clash.
+    for (_, l) in side_files(dir, "left") {
+        renames.push((
+            l.clone(),
+            dir.join(format!("swapping.{}", rest("left", &l))),
+        ));
     }
-    if let Some(r) = &right
-        && let Err(e) = std::fs::rename(r, dir.join(format!("left.{}", ext(r))))
-    {
-        if let Some(l) = &left {
-            let _ = std::fs::rename(&parked, l);
+    for (_, r) in side_files(dir, "right") {
+        renames.push((r.clone(), dir.join(format!("left.{}", rest("right", &r)))));
+    }
+    for (_, l) in side_files(dir, "left") {
+        let parked = dir.join(format!("swapping.{}", rest("left", &l)));
+        renames.push((parked, dir.join(format!("right.{}", rest("left", &l)))));
+    }
+    for (i, (from, to)) in renames.iter().enumerate() {
+        if let Err(e) = std::fs::rename(from, to) {
+            for (from, to) in renames[..i].iter().rev() {
+                let _ = std::fs::rename(to, from);
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
-    if let Some(l) = &left {
-        std::fs::rename(&parked, dir.join(format!("right.{}", ext(l))))?;
     }
     for side in ["left", "right"] {
         remove_matched(dir, side);
@@ -1685,6 +1732,135 @@ mod tests {
         });
     }
 
+    /// A GoPro splits a long recording into several files: each is sent as
+    /// a part, the match is ready when every part of both sides is there.
+    #[test]
+    fn upload_in_parts() {
+        rt().block_on(async {
+            let (_tmp, st) = state();
+            let app = app(&st);
+            let (_, _, b) = call(&app, "POST", "/api/projects", &[], r#"{"name":"x"}"#).await;
+            let id = v(&b)["id"].as_str().unwrap().to_string();
+            let dir = st.store.project_dir(&id);
+            let put = |side: &str, query: &str, name: &str, data: &'static str| {
+                let uri = format!("/api/projects/{id}/files/{side}{query}");
+                let app = app.clone();
+                let name = name.to_string();
+                async move {
+                    let (code, _, b) =
+                        call(&app, "PUT", &uri, &[("x-filename", &name)], data).await;
+                    (code, v(&b))
+                }
+            };
+            let on_disk = || {
+                let mut names: Vec<String> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n != "project.json")
+                    .collect();
+                names.sort();
+                names
+            };
+
+            // The right camera: one file, as always.
+            let (code, p) = put("right", "", "IMG_1.MOV", "right").await;
+            assert_eq!(code, StatusCode::OK);
+            assert!(p["files"]["right"].get("parts").is_none());
+
+            // The left camera: three parts, sent in any order.
+            let (code, p) = put("left", "?part=2&parts=3", "GX020042.MP4", "22").await;
+            assert_eq!(code, StatusCode::OK, "{p}");
+            assert_eq!(p["status"], "new");
+            assert_eq!(
+                p["files"]["left"],
+                json!({"name": "GX020042.MP4", "sizeBytes": 2, "parts": [
+                    null, {"name": "GX020042.MP4", "sizeBytes": 2}, null]})
+            );
+            let (_, p) = put("left", "?part=1&parts=3", "GX010042.MP4", "111").await;
+            assert_eq!(p["status"], "new", "part 3 is missing");
+            let (code, _, _) = call(
+                &app,
+                "POST",
+                &format!("/api/projects/{id}/process"),
+                &[],
+                "",
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "not all parts are there");
+            let (_, p) = put("left", "?part=3&parts=3", "GX030042.MP4", "3").await;
+            assert_eq!(p["status"], "uploaded");
+            assert_eq!(p["files"]["left"]["name"], "GX010042.MP4");
+            assert_eq!(p["files"]["left"]["sizeBytes"], 6);
+            assert_eq!(
+                on_disk(),
+                ["left.001.mp4", "left.002.mp4", "left.003.mp4", "right.mov"]
+            );
+            assert_eq!(std::fs::read(dir.join("left.001.mp4")).unwrap(), b"111");
+
+            // Sending one part again replaces only that part, and drops
+            // everything made from the old one.
+            for f in DERIVED_FILES
+                .into_iter()
+                .chain(["matched-left.mp4", "matched-right.mp4"])
+            {
+                std::fs::write(dir.join(f), b"old").unwrap();
+            }
+            let (_, p) = put("left", "?part=2&parts=3", "GX020042.MP4", "2222").await;
+            assert_eq!(p["status"], "uploaded");
+            assert_eq!(p["files"]["left"]["sizeBytes"], 8);
+            assert_eq!(std::fs::read(dir.join("left.002.mp4")).unwrap(), b"2222");
+            assert!(DERIVED_FILES.iter().all(|f| !dir.join(f).exists()));
+            assert!(!dir.join("matched-left.mp4").exists());
+            assert!(dir.join("matched-right.mp4").exists());
+            std::fs::remove_file(dir.join("matched-right.mp4")).unwrap();
+
+            // Fewer parts than before: the extra ones go.
+            let (_, p) = put("left", "?part=2&parts=2", "GX020042.MP4", "22").await;
+            assert_eq!(p["files"]["left"]["parts"].as_array().unwrap().len(), 2);
+            assert_eq!(on_disk(), ["left.001.mp4", "left.002.mp4", "right.mov"]);
+
+            // Swapping moves every part.
+            let (code, _, b) =
+                call(&app, "POST", &format!("/api/projects/{id}/swap"), &[], "").await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(
+                v(&b)["files"]["right"]["parts"].as_array().unwrap().len(),
+                2
+            );
+            assert_eq!(v(&b)["files"]["left"]["name"], "IMG_1.MOV");
+            assert_eq!(on_disk(), ["left.mov", "right.001.mp4", "right.002.mp4"]);
+            assert_eq!(std::fs::read(dir.join("right.001.mp4")).unwrap(), b"111");
+            call(&app, "POST", &format!("/api/projects/{id}/swap"), &[], "").await;
+            assert_eq!(on_disk(), ["left.001.mp4", "left.002.mp4", "right.mov"]);
+
+            // One file again replaces all the parts; parts replace one file.
+            let (_, p) = put("left", "?part=1&parts=1", "a.mp4", "one").await;
+            assert!(p["files"]["left"].get("parts").is_none());
+            assert_eq!(on_disk(), ["left.mp4", "right.mov"]);
+            let (_, p) = put("right", "?part=1&parts=2", "GH010007.MP4", "r1").await;
+            assert_eq!(p["status"], "new");
+            assert_eq!(on_disk(), ["left.mp4", "right.001.mp4"]);
+
+            // Nonsense is refused, and changes nothing.
+            for query in [
+                "?part=0&parts=2",
+                "?part=3&parts=2",
+                "?part=1",
+                "?parts=2",
+                "?part=x&parts=2",
+            ] {
+                let (code, p) = put("left", query, "a.mp4", "data").await;
+                assert_eq!(code, StatusCode::BAD_REQUEST, "{query}");
+                assert_eq!(p["error"], "The upload was not understood.", "{query}");
+            }
+            let (code, p) = put("left", "?part=1&parts=100", "a.mp4", "data").await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert!(p["error"].as_str().unwrap().contains("at most 99 files"));
+            assert_eq!(on_disk(), ["left.mp4", "right.001.mp4"]);
+        });
+    }
+
     /// A different iPhone on each side (DESIGN.md 4.6).
     #[test]
     fn a_lens_per_phone() {
@@ -1760,8 +1936,8 @@ mod tests {
                 dir.join("matched-right.mp4").exists() && dir.join("matched-right.json").exists()
             );
             assert_eq!(
-                crate::store::original_file(&dir, "left").unwrap(),
-                dir.join("left.mov")
+                crate::store::original_files(&dir, "left"),
+                vec![dir.join("left.mov")]
             );
         });
     }

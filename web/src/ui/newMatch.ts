@@ -1,5 +1,5 @@
 // New match: name, iPhone model, camera style, the two videos, filming tips.
-import { api, ApiError, uploadFile, type AiAccuracy, type ProjectMeta, type Side, type Style, type Upload } from "../api";
+import { api, ApiError, uploadFile, type AiAccuracy, type FileInfo, type ProjectMeta, type Side, type Style, type Upload } from "../api";
 import { button, describeError, errorBox, notice, toast } from "./common";
 import { formatBytes, h, icon, setChildren } from "./dom";
 import { assignFiles, dropZone, type DropZone } from "./dropzone";
@@ -71,10 +71,10 @@ export function filmingTips(): HTMLElement {
     ["Turn Auto FPS off", "In Settings › Camera › Record Video, switch off Auto FPS (called Auto Low Light FPS on older iPhones). Otherwise the phones slow down in dim light or under floodlights, and the two halves drift out of step."],
     ["Start both together", "Press record on both phones within a few seconds of each other. VeoClone lines them up using the sound."],
     ["Keep them still", "Don't touch or move the phones while recording. Plug in power banks for a full match."],
-    ["One video per phone", "If you stopped recording at half-time, make two matches: one for each half."],
+    ["One recording per phone", "If you stopped recording at half-time, make two matches: one for each half."],
     [
       "Filming with GoPros?",
-      "Use two identical GoPros, both set to 4K, 30 fps, 16:9, Lens: Wide, HyperSmooth: Off and Horizon Levelling: Off. Set Anti-Flicker to 50 Hz in the UK, Europe and Australia (60 Hz in North America). A GoPro saves a long recording as several files: join each camera's files into one video first (see the user guide).",
+      "Use two identical GoPros, both set to 4K, 30 fps, 16:9, Lens: Wide, HyperSmooth: Off and Horizon Levelling: Off. Set Anti-Flicker to 50 Hz in the UK, Europe and Australia (60 Hz in North America). A GoPro saves a long recording as several files (GX010123.MP4, GX020123.MP4…): drop all the files from one camera into its box.",
     ],
   ];
   return h(
@@ -89,29 +89,46 @@ export function filmingTips(): HTMLElement {
   );
 }
 
+/** VeoClone already has this file as part `index` (from 1) of a video in `count` parts. */
+function partOnHelper(info: FileInfo | undefined, index: number, count: number, file: File): boolean {
+  const part = info?.parts?.length === count ? info.parts[index - 1] : null;
+  return !!part && part.name === file.name && part.sizeBytes === file.size;
+}
+
 /**
- * Upload the zones that have a new file, one after the other. Returns the
- * last ProjectMeta, or throws ApiError. `onUpload` receives the abortable
- * upload so the page can stop it.
+ * Upload the zones' new files, one after the other (a video in several
+ * files part by part). Files already sent are skipped: on Try again after
+ * a failure, and parts VeoClone already has from an earlier try (`meta`,
+ * the match as VeoClone last reported it). Returns the last ProjectMeta,
+ * or throws ApiError. `onUpload` receives the abortable upload so the page
+ * can stop it.
  */
 export async function sendVideos(
   id: string,
   zones: Record<Side, DropZone>,
   onUpload: (u: Upload | null) => void,
+  meta: ProjectMeta | null = null,
 ): Promise<ProjectMeta | null> {
-  let meta: ProjectMeta | null = null;
   for (const side of ["left", "right"] as Side[]) {
-    const file = zones[side].file;
-    if (!file || zones[side].uploaded) continue; // already sent (Try again after the other one failed)
-    const up = uploadFile(id, side, file, (p) => zones[side].setUploading(p));
-    onUpload(up);
-    try {
-      meta = await up.promise;
-    } finally {
-      onUpload(null);
-      zones[side].setUploading(null);
+    const zone = zones[side];
+    const files = zone.files;
+    for (let i = 0; i < files.length; i++) {
+      if (zone.sent(i)) continue; // already sent (Try again after a failure)
+      const part = files.length > 1 ? { index: i + 1, count: files.length } : undefined;
+      if (part && partOnHelper(meta?.files[side], part.index, part.count, files[i])) {
+        zone.setSent(i);
+        continue;
+      }
+      const up = uploadFile(id, side, files[i], (p) => zone.setUploading(p, i), part);
+      onUpload(up);
+      try {
+        meta = await up.promise;
+      } finally {
+        onUpload(null);
+        zone.setUploading(null);
+      }
+      zone.setSent(i);
     }
-    zones[side].setUploaded();
   }
   return meta;
 }
@@ -153,9 +170,9 @@ export function newMatchPage(ctx: PageContext): Page {
   zones.right = dropZone({ side: "right", onFiles: onFiles("right"), onChange: update });
 
   const swap = button("Swap left and right", () => {
-    const l = zones.left.file;
-    zones.left.setFile(zones.right.file);
-    zones.right.setFile(l);
+    const l = zones.left.files;
+    zones.left.setFiles(zones.right.files);
+    zones.right.setFiles(l);
   }, { variant: "ghost", class: "btn-small swap" });
 
   const start = button("Start", () => void go(), { variant: "primary", big: true, icon: I.sparkle });
@@ -218,19 +235,21 @@ export function newMatchPage(ctx: PageContext): Page {
   );
 
   function update() {
-    const both = !!zones.left.file && !!zones.right.file;
+    const [left, right] = [zones.left.files, zones.right.files];
+    const both = left.length > 0 && right.length > 0;
     const health = currentHealth();
     start.disabled = busy || !both || !health;
-    swap.hidden = !zones.left.file && !zones.right.file;
+    swap.hidden = !left.length && !right.length;
     swap.disabled = busy;
-    const need = (zones.left.file?.size ?? 0) + (zones.right.file?.size ?? 0);
+    const need = [...left, ...right].reduce((a, f) => a + f.size, 0);
     if (need && health) {
       const needed = need * 1.15 + 500e6;
       space.textContent = `Space needed on your PC: about ${formatBytes(needed)} (you have ${formatBytes(health.freeDiskBytes)} free).`;
       space.classList.toggle("text-bad", health.freeDiskBytes > 0 && health.freeDiskBytes < needed);
     } else space.textContent = "";
     setChildren(aiNote, health?.ai.provider === "CPU" ? slowAiNotice() : null);
-    const same = both && zones.left.file!.name === zones.right.file!.name && zones.left.file!.size === zones.right.file!.size;
+    const key = (files: File[]) => files.map((f) => `${f.name}/${f.size}`).join("|");
+    const same = both && key(left) === key(right);
     if (!busy) {
       setChildren(
         status,

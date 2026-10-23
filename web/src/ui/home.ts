@@ -1,5 +1,5 @@
 // Home: the list of matches.
-import { api, isBusy, type ProjectMeta } from "../api";
+import { api, hasVideo, isBusy, type ProjectMeta } from "../api";
 import { button, confirmDialog, describeError, errorBox, progressBar, toast } from "./common";
 import { formatBytes, formatDate, formatTimeLeft, h, icon, plural, setChildren } from "./dom";
 import { onHelperState } from "./health";
@@ -100,7 +100,7 @@ export function homePage(ctx: PageContext): Page {
 
   function card(p: ProjectMeta): HTMLElement {
     const s = statusOf(p);
-    const files = [p.files.left, p.files.right].filter(Boolean).length;
+    const files = [p.files.left, p.files.right].filter(hasVideo).length;
     const done = p.exports.filter((e) => e.status === "done").length;
     const facts = [formatDate(p.createdAt), files === 2 ? "2 videos" : `${files} of 2 videos`, formatBytes(p.diskBytes)];
     if (done) facts.push(`${done} finished video${done === 1 ? "" : "s"}`);

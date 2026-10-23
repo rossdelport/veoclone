@@ -346,6 +346,124 @@ fn frames_missing(p: &ProbeInfo) -> bool {
     p.duration > 0.0 && (p.frame_count as f64 - expected).abs() > (0.002 * expected).max(15.0)
 }
 
+/// "1920x1080 at 30 fps (h264, yuv420p)".
+fn describe(p: &ProbeInfo) -> String {
+    format!(
+        "{}x{} at {:.0} fps ({}, {})",
+        p.width,
+        p.height,
+        p.fps.as_f64(),
+        p.codec,
+        p.pixel_format
+    )
+}
+
+/// The parts of a recording the camera split into several files (GoPro
+/// chapters) as one video: the frames and the length add up, everything
+/// else comes from the first part. Parts that differ in size, frame rate,
+/// format or rotation can't be from the same recording (plain words).
+pub fn join_probes(side: &str, parts: &[ProbeInfo]) -> Result<ProbeInfo, String> {
+    let Some(first) = parts.first() else {
+        return Err(format!("The {side} video is missing."));
+    };
+    for (i, p) in parts.iter().enumerate().skip(1) {
+        let same = (p.width, p.height, p.rotation) == (first.width, first.height, first.rotation)
+            && (p.fps.as_f64() - first.fps.as_f64()).abs() < 0.01
+            && p.codec == first.codec
+            && p.pixel_format == first.pixel_format;
+        if !same {
+            return Err(format!(
+                "Part {} of the {side} video is a different kind of video ({}) than part 1 \
+                 ({}), so they can't be from one recording. Put only the files of one \
+                 recording from the {side} camera in its box.",
+                i + 1,
+                describe(p),
+                describe(first)
+            ));
+        }
+    }
+    Ok(ProbeInfo {
+        frame_count: parts.iter().map(|p| p.frame_count).sum(),
+        duration: parts.iter().map(|p| p.duration).sum(),
+        has_audio: parts.iter().all(|p| p.has_audio),
+        ..first.clone()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Recordings in parts
+// ---------------------------------------------------------------------------
+
+/// The list ffmpeg's concat demuxer reads to play the parts of a recording
+/// one after the other as one video: absolute paths, quotes escaped.
+pub fn join_list(files: &[PathBuf]) -> String {
+    let paths: Vec<String> = files
+        .iter()
+        .map(|f| {
+            std::path::absolute(f)
+                .unwrap_or_else(|_| f.clone())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    concat_list(&paths)
+}
+
+/// Where the join list for input `label` of a job writing `output` goes:
+/// next to the output, with `.tmp.` in its name, so one left behind by a
+/// run that was cut short is cleared away at the next start.
+pub fn join_list_path(output: &Path, label: &str) -> PathBuf {
+    let name = output.file_name().unwrap_or_default().to_string_lossy();
+    output.with_file_name(format!("{name}.{label}.txt"))
+}
+
+/// ffmpeg's input arguments for one camera's video: the file itself, or
+/// for a recording in parts the concat demuxer reading `list` (see
+/// [`join_list`]), which passes on every frame of every part in order.
+fn input_args(files: &[PathBuf], list: &Path) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    if files.len() > 1 {
+        a.extend(["-f", "concat", "-safe", "0", "-i"].map(String::from));
+        a.push(list.to_string_lossy().into_owned());
+    } else {
+        a.push("-i".into());
+        a.push(
+            files
+                .first()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+    }
+    a
+}
+
+/// The join lists of a job's inputs in parts; deleted when dropped.
+struct JoinLists(Vec<PathBuf>);
+
+impl JoinLists {
+    /// Write a list for every input made of more than one file.
+    fn write(inputs: &[(&[PathBuf], PathBuf)]) -> Result<JoinLists, RunError> {
+        let mut lists = JoinLists(Vec::new());
+        for (files, list) in inputs {
+            if files.len() > 1 {
+                std::fs::write(list, join_list(files)).map_err(|e| {
+                    RunError::Failed(format!("could not write {}: {e}", list.display()))
+                })?;
+                lists.0.push(list.clone());
+            }
+        }
+        Ok(lists)
+    }
+}
+
+impl Drop for JoinLists {
+    fn drop(&mut self) {
+        for list in &self.0 {
+            let _ = std::fs::remove_file(list);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Running ffmpeg
 // ---------------------------------------------------------------------------
@@ -629,11 +747,17 @@ pub fn matching_warning(
 /// Everything needed to make one matching copy.
 #[derive(Debug, Clone)]
 pub struct MatchJob {
-    pub input: PathBuf,
+    /// The video: one file, or all the parts of a recording in order
+    /// (the copy is then one file).
+    pub input: Vec<PathBuf>,
     pub output: PathBuf,
     pub conversion: Conversion,
     /// Frame rate of the copy (for the keyframe distance).
     pub fps: Fps,
+    /// Frame rate of the input. For a recording in parts every frame gets
+    /// a fresh time on this grid first, so the joins leave no gap (the
+    /// parts' own clocks don't quite add up).
+    pub source_fps: Fps,
 }
 
 /// HDR (HLG or PQ) to normal BT.709 colours.
@@ -678,7 +802,11 @@ pub fn matching_args(
     tone_map: bool,
     aac: bool,
 ) -> Vec<String> {
-    let filter = matching_filter(&job.conversion, tone_map);
+    let mut filter = matching_filter(&job.conversion, tone_map);
+    if job.input.len() > 1 {
+        let fps = job.source_fps;
+        filter = format!("setpts=N/({}/{})/TB,{filter}", fps.num, fps.den);
+    }
     let gop = ((2.0 * job.fps.as_f64()).round() as u32).max(1).to_string();
     let mut a: Vec<String> = Vec::new();
     let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
@@ -687,7 +815,11 @@ pub fn matching_args(
     if hwaccel {
         push(&["-hwaccel", "auto"]);
     }
-    push(&["-i", &job.input.to_string_lossy()]);
+    a.extend(input_args(
+        &job.input,
+        &join_list_path(&job.output, "input"),
+    ));
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
     push(&["-map", "0:v:0", "-map", "0:a:0?", "-filter:v", &filter]);
     push(&["-fps_mode", "passthrough"]);
     match encoder {
@@ -730,6 +862,7 @@ pub fn make_matching_copy(
     mut on_frame: impl FnMut(u64),
 ) -> Result<(), RunError> {
     let ffmpeg = tools.ffmpeg().map_err(RunError::Failed)?;
+    let _lists = JoinLists::write(&[(&job.input, join_list_path(&job.output, "input"))])?;
     let first = if has_encoder(ffmpeg, "h264_amf") {
         Encoder::Amf
     } else {
@@ -762,8 +895,10 @@ pub fn make_matching_copy(
 /// Everything needed to build the stacked preview video.
 #[derive(Debug, Clone)]
 pub struct ProxyPlan {
-    pub left: PathBuf,
-    pub right: PathBuf,
+    /// Each camera's video: one file, or all the parts of a recording in
+    /// order.
+    pub left: Vec<PathBuf>,
+    pub right: Vec<PathBuf>,
     pub output: PathBuf,
     pub fps: Fps,
     pub left_skip: u64,
@@ -802,12 +937,13 @@ pub fn proxy_args(plan: &ProxyPlan, encoder: Encoder, hwaccel: bool) -> Vec<Stri
     let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
     push(&["-hide_banner", "-nostdin", "-y", "-loglevel", "error"]);
     push(&["-progress", "pipe:1", "-nostats"]);
-    for input in [&plan.left, &plan.right] {
+    for (files, label) in [(&plan.left, "left"), (&plan.right, "right")] {
         if hwaccel {
-            push(&["-hwaccel", "auto"]);
+            a.extend(["-hwaccel", "auto"].map(String::from));
         }
-        push(&["-i", &input.to_string_lossy()]);
+        a.extend(input_args(files, &join_list_path(&plan.output, label)));
     }
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
     // `setparams` labels the input BT.709 like Reco treats it, so ffmpeg
     // 7's `scale` does not convert HDR (BT.2020) colours that Reco's export
     // keeps as they are: the preview then shows the export's colours.
@@ -871,6 +1007,10 @@ pub fn make_proxy(
     mut on_frame: impl FnMut(u64),
 ) -> Result<(), RunError> {
     let ffmpeg = tools.ffmpeg().map_err(RunError::Failed)?;
+    let _lists = JoinLists::write(&[
+        (&plan.left, join_list_path(&plan.output, "left")),
+        (&plan.right, join_list_path(&plan.output, "right")),
+    ])?;
     let first = if has_encoder(ffmpeg, "h264_amf") {
         Encoder::Amf
     } else {
@@ -1129,7 +1269,7 @@ pub fn add_overlays(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const IPHONE: &str = r#"{
@@ -1487,10 +1627,11 @@ mod tests {
         );
 
         let job = MatchJob {
-            input: "right.mov".into(),
+            input: vec!["right.mov".into()],
             output: "matched-right.x.tmp.mp4".into(),
             conversion: tone,
             fps: Fps { num: 30, den: 1 },
+            source_fps: Fps { num: 60, den: 1 },
         };
         let a = matching_args(&job, Encoder::Amf, true, true, false).join(" ");
         assert!(a.contains("-progress pipe:1"));
@@ -1518,6 +1659,22 @@ mod tests {
                 .join(" ")
                 .contains("-g 120")
         );
+
+        // A recording in parts: read through the join list, with fresh
+        // frame times so the joins leave no gap.
+        let job = MatchJob {
+            input: vec!["right.001.mp4".into(), "right.002.mp4".into()],
+            output: "/m/matched-right.x.tmp.mp4".into(),
+            ..job
+        };
+        let a = matching_args(&job, Encoder::X264, true, true, false).join(" ");
+        assert!(
+            a.contains(
+                "-hwaccel auto -f concat -safe 0 -i /m/matched-right.x.tmp.mp4.input.txt -map 0:v:0 \
+                 -map 0:a:0? -filter:v setpts=N/(60/1)/TB,fps=30/1,"
+            ),
+            "{a}"
+        );
     }
 
     #[test]
@@ -1531,8 +1688,8 @@ mod tests {
     #[test]
     fn proxy_arguments() {
         let plan = ProxyPlan {
-            left: "L.mov".into(),
-            right: "R.mov".into(),
+            left: vec!["L.mov".into()],
+            right: vec!["R.mov".into()],
             output: "proxy.mp4".into(),
             fps: Fps { num: 30, den: 1 },
             left_skip: 0,
@@ -1572,6 +1729,84 @@ mod tests {
         assert!(!a.contains("[a]"));
         assert!(a.contains("trim=start_frame=30,setpts=N/(60000/1001)/TB"));
         assert!(a.contains("-c:v h264_amf -quality speed -rc cqp -qp_i 26 -qp_p 28 -g 60"));
+
+        // GoPro chapters: each camera's parts are read as one video.
+        let plan = ProxyPlan {
+            left: vec!["L1.mp4".into(), "L2.mp4".into()],
+            output: "/p/proxy.x.tmp.mp4".into(),
+            ..plan
+        };
+        let a = proxy_args(&plan, Encoder::X264, true).join(" ");
+        assert!(
+            a.contains(
+                "-hwaccel auto -f concat -safe 0 -i /p/proxy.x.tmp.mp4.left.txt \
+                 -hwaccel auto -i R.mov -filter_complex [0:v]trim=start_frame=30,"
+            ),
+            "{a}"
+        );
+    }
+
+    #[test]
+    fn parts_join_into_one_video() {
+        let part = |frames: u64, duration: f64| ProbeInfo {
+            frame_count: frames,
+            duration,
+            ..probe_info(3840, 2160, 30, 0)
+        };
+        let joined = join_probes(
+            "left",
+            &[part(14_400, 480.0), part(14_400, 480.0), part(300, 10.0)],
+        )
+        .unwrap();
+        assert_eq!((joined.frame_count, joined.duration), (29_100, 970.0));
+        assert_eq!((joined.width, joined.height), (3840, 2160));
+        assert!(joined.has_audio);
+        let one = join_probes("left", &[part(10, 1.0)]).unwrap();
+        assert_eq!(one, part(10, 1.0));
+        let mut quiet = part(300, 10.0);
+        quiet.has_audio = false;
+        assert!(
+            !join_probes("left", &[part(300, 10.0), quiet])
+                .unwrap()
+                .has_audio
+        );
+
+        // A file from another camera or recording setting doesn't belong.
+        let err = join_probes(
+            "right",
+            &[part(10, 1.0), part(10, 1.0), probe_info(1920, 1080, 30, 0)],
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with(
+                "Part 3 of the right video is a different kind of video (1920x1080 at 30 fps"
+            ),
+            "{err}"
+        );
+        assert!(join_probes("left", &[part(10, 1.0), probe_info(3840, 2160, 60, 0)]).is_err());
+        assert!(join_probes("left", &[]).is_err());
+
+        // The join list: absolute paths, quotes escaped.
+        let list = join_list(&[
+            PathBuf::from("/m/it's/left.001.mp4"),
+            "/m/left.002.mp4".into(),
+        ]);
+        assert_eq!(
+            list,
+            "ffconcat version 1.0\nfile '/m/it'\\''s/left.001.mp4'\nfile '/m/left.002.mp4'\n"
+        );
+        assert!(join_list(&["left.001.mp4".into()]).contains(&format!(
+            "{}",
+            std::env::current_dir().unwrap().join("left.001.mp4").display()
+        )));
+        assert_eq!(
+            join_list_path(Path::new("/p/proxy.ab.tmp.mp4"), "left"),
+            Path::new("/p/proxy.ab.tmp.mp4.left.txt")
+        );
+        assert_eq!(
+            input_args(&["a.mp4".into()], Path::new("x")),
+            ["-i", "a.mp4"]
+        );
     }
 
     #[test]
@@ -1928,10 +2163,11 @@ mod tests {
         ] {
             let output = dir.join(format!("copy-{}.mp4", copies.len()));
             let job = MatchJob {
-                input: input.clone(),
+                input: vec![input.clone()],
                 output: output.clone(),
                 conversion: c,
                 fps: source.fps,
+                source_fps: source.fps,
             };
             let mut last = 0;
             make_matching_copy(&tools, &job, tone_map, &AtomicBool::new(false), |n| {
@@ -1962,6 +2198,206 @@ mod tests {
         };
         assert!(patch(20).iter().all(|&v| v > 200), "{:?}", patch(20));
         assert!(patch(150).iter().all(|&v| v < 50), "{:?}", patch(150));
+    }
+
+    /// A recording split into parts like a GoPro's chapters: one file per
+    /// entry of `frames`, each with its own sound (so, like a camera's,
+    /// each part's sound runs a little longer than its picture). Frame n
+    /// of the whole recording has luma 30 + 13 * (n % 16) (see [`codes`]).
+    pub fn coded_parts(dir: &Path, name: &str, frames: &[u64], fps: u32) -> Vec<PathBuf> {
+        let mut first = 0;
+        let mut parts = Vec::new();
+        for (i, &n) in frames.iter().enumerate() {
+            let path = dir.join(format!("{name}{:02}.mp4", i + 1));
+            let secs = n as f64 / fps as f64;
+            let video = format!(
+                "color=c=black:s=64x36:r={fps}:d={secs},format=yuv420p,\
+                 geq=lum='30+13*mod(N+{first},16)':cb=128:cr=128,scale=1280:720:flags=neighbor"
+            );
+            let audio = format!("sine=f=440:sample_rate=48000:d={secs}");
+            let ffmpeg = Tools::find().ffmpeg.expect("ffmpeg");
+            run_tool(
+                &ffmpeg,
+                &[
+                    "-y",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &video,
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &audio,
+                    "-c:v",
+                    "libx264",
+                    "-g",
+                    "30",
+                    "-bf",
+                    "2",
+                    "-crf",
+                    "12",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    path.to_str().unwrap(),
+                ],
+            );
+            first += n;
+            parts.push(path);
+        }
+        parts
+    }
+
+    /// The frame codes of [`coded_parts`] footage: mean luma of a 32x32
+    /// patch at (x, y) in every frame. Reads the raw Y plane.
+    pub fn codes(video: &Path, x: u32, y: u32) -> Vec<i32> {
+        let filter = format!("crop=32:32:{x}:{y},scale=2:2:flags=area");
+        let ffmpeg = Tools::find().ffmpeg.expect("ffmpeg");
+        let args = ["-v", "error", "-i", video.to_str().unwrap(), "-vf", &filter];
+        run_tool(
+            &ffmpeg,
+            &[&args[..], &["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]].concat(),
+        )
+        .chunks_exact(6)
+        .map(|f| {
+            let luma = f[..4].iter().map(|&v| v as f32).sum::<f32>() / 4.0;
+            ((luma - 30.0) / 13.0).round() as i32
+        })
+        .collect()
+    }
+
+    /// The parts of a recording, read one after the other through the join
+    /// list, give every frame exactly once and in order: in the preview and
+    /// in a matching copy (also one that changes the frame rate). Skipped
+    /// when ffmpeg is not installed.
+    #[test]
+    fn joined_parts_keep_every_frame_once() {
+        let tools = Tools::find();
+        if tools.ffmpeg.is_none() || tools.ffprobe.is_none() {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let cancel = AtomicBool::new(false);
+        let parts = coded_parts(dir, "left", &[40, 35, 50], 30);
+        let whole = coded_parts(dir, "right", &[125], 30);
+        let probes: Vec<ProbeInfo> = parts.iter().map(|p| probe(&tools, p).unwrap()).collect();
+        let joined = join_probes("left", &probes).unwrap();
+        assert_eq!(joined.frame_count, 125);
+        let fps = Fps { num: 30, den: 1 };
+
+        // The preview: left (parts) on top, right (one file) below, 5 frames on.
+        let proxy = dir.join("proxy.x.tmp.mp4");
+        let plan = ProxyPlan {
+            left: parts.clone(),
+            right: whole.clone(),
+            output: proxy.clone(),
+            fps,
+            left_skip: 0,
+            right_skip: 5,
+            frame_count: 120,
+            tile_width: 640,
+            tile_height: 360,
+            audio: true,
+        };
+        make_proxy(&tools, &plan, &cancel, |_| {}).unwrap();
+        assert!(
+            !join_list_path(&proxy, "left").exists(),
+            "join list removed"
+        );
+        let top = codes(&proxy, 304, 164);
+        let bottom = codes(&proxy, 304, 360 + 164);
+        assert_eq!(top.len(), 120);
+        for f in 0..120 {
+            assert_eq!(top[f], (f % 16) as i32, "preview left, frame {f}");
+            assert_eq!(bottom[f], ((f + 5) % 16) as i32, "preview right, frame {f}");
+        }
+
+        // A matching copy of the parts is one file with every frame.
+        let copy = |input: &[PathBuf], source_fps: Fps, conversion: Conversion| {
+            let output = dir.join("matched-left.x.tmp.mp4");
+            let job = MatchJob {
+                input: input.to_vec(),
+                output: output.clone(),
+                fps: conversion.fps.unwrap_or(source_fps),
+                source_fps,
+                conversion,
+            };
+            make_matching_copy(&tools, &job, false, &cancel, |_| {}).unwrap();
+            assert!(
+                !join_list_path(&output, "input").exists(),
+                "join list removed"
+            );
+            output
+        };
+        let smaller = Conversion {
+            crop: None,
+            width: 320,
+            height: 180,
+            fps: None,
+            tone_map: false,
+        };
+        let out = copy(&parts, fps, smaller.clone());
+        let got = codes(&out, 152, 82);
+        assert_eq!(got, (0..125).map(|f| f % 16).collect::<Vec<i32>>());
+        let p = probe(&tools, &out).unwrap();
+        assert_eq!((p.frame_count, p.width), (125, 320));
+        // Frame times on the exact grid: no gap at the joins.
+        let times = run_tool(
+            tools.ffprobe.as_ref().unwrap(),
+            &[
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "csv=p=0",
+                out.to_str().unwrap(),
+            ],
+        );
+        let mut times: Vec<f64> = String::from_utf8_lossy(&times)
+            .lines()
+            .map(|l| l.trim().parse().unwrap())
+            .collect();
+        times.sort_by(f64::total_cmp);
+        for (k, t) in times.iter().enumerate() {
+            assert!((t - k as f64 / 30.0).abs() < 1e-3, "frame {k} at {t}");
+        }
+
+        // 60 fps parts made 30 fps: every other frame, also across the
+        // joins, exactly like the same recording in one file.
+        let half = Conversion {
+            fps: Some(fps),
+            ..smaller
+        };
+        let sixty = Fps { num: 60, den: 1 };
+        let whole = codes(
+            &copy(&coded_parts(dir, "one", &[124], 60), sixty, half.clone()),
+            152,
+            82,
+        );
+        let got = codes(
+            &copy(&coded_parts(dir, "fast", &[40, 34, 50], 60), sixty, half),
+            152,
+            82,
+        );
+        assert_eq!((got.len(), whole.len()), (62, 62));
+        // (At the very end ffmpeg's fps filter may keep the last frame
+        // rather than the one before it.)
+        assert_eq!(got[..61], whole[..61]);
+        for k in 1..got.len() - 1 {
+            assert_eq!(
+                (got[k] - got[k - 1]).rem_euclid(16),
+                2,
+                "frame {k}: {got:?}"
+            );
+        }
     }
 
     #[test]

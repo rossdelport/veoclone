@@ -1,6 +1,6 @@
 // Processing view (#/project/:id): steps with progress, warnings, errors,
 // cancel / try again, and adding missing videos.
-import { api, rerunTime, watchProject, type AiAccuracy, type ApiError, type JobInfo, type JobStep, type ProjectMeta, type Side, type Style, type Upload } from "../api";
+import { api, hasVideo, rerunTime, watchProject, type AiAccuracy, type ApiError, type JobInfo, type JobStep, type ProjectMeta, type Side, type Style, type Upload } from "../api";
 import { button, confirmDialog, describeError, errorBox, notice, progressBar, setProgress, toast } from "./common";
 import { formatBytes, formatTimeLeft, h, icon, setChildren } from "./dom";
 import { dropZone, assignFiles, type DropZone } from "./dropzone";
@@ -301,7 +301,7 @@ export function projectPage(ctx: PageContext, id: string): Page {
           "div",
           { class: "row" },
           button("Change phone or lens", () => void lensChange(p), { icon: I.pencil }),
-          p.files.left && p.files.right ? button("Swap left and right", () => void swapSides(true), { variant: "ghost" }) : null,
+          hasVideo(p.files.left) && hasVideo(p.files.right) ? button("Swap left and right", () => void swapSides(true), { variant: "ghost" }) : null,
         ),
       ),
       rerun,
@@ -322,7 +322,7 @@ export function projectPage(ctx: PageContext, id: string): Page {
             p.error?.message ?? "Processing did not finish.",
             p.error?.detail,
             button("Try again", () => void start(), { variant: "primary", icon: I.refresh }),
-            p.files.left && p.files.right ? button("Swap left and right and try again", () => void swapSides(true, false)) : null,
+            hasVideo(p.files.left) && hasVideo(p.files.right) ? button("Swap left and right and try again", () => void swapSides(true, false)) : null,
             change,
           )
         : notice("info", "Processing was stopped.", h("div", { class: "notice-actions" }, button("Start again", () => void start(), { variant: "primary", icon: I.refresh }), change)),
@@ -346,14 +346,23 @@ export function projectPage(ctx: PageContext, id: string): Page {
       (options) => setChildren(lensHost, phonesPicker(options, p, (lenses) => void api.updateProject(id, lenses).catch((e) => toast(describeError(e).message, "error")))),
       () => setChildren(lensHost, lensUnavailable()),
     );
-    const both = p.files.left && p.files.right;
+    const both = hasVideo(p.files.left) && hasVideo(p.files.right);
+    const unfinished = [p.files.left, p.files.right].some((f) => f && !hasVideo(f));
     setChildren(
       body,
       h(
         "section",
         { class: "card form-section" },
         h("h2", null, both ? "Ready to process" : "Add the videos"),
-        h("p", { class: "muted" }, both ? "Both videos are here. Press Start, or replace a video first." : "This match is missing a video. Add one video from each phone."),
+        h(
+          "p",
+          { class: "muted" },
+          both
+            ? "Both videos are here. Press Start, or replace a video first."
+            : unfinished
+              ? "Some files of a video are missing. Add all the files of that video again and press Start: the ones VeoClone already has are skipped."
+              : "This match is missing a video. Add one video from each phone.",
+        ),
         h("div", { class: "zones" }, zones.left.el, zones.right.el),
         h("div", { class: "zones-foot" }, both ? button("Swap left and right", () => void swapSides(false), { variant: "ghost", class: "btn-small swap" }) : null),
       ),
@@ -373,12 +382,12 @@ export function projectPage(ctx: PageContext, id: string): Page {
   function updateStart() {
     const btn = body.querySelector<HTMLButtonElement>(".start-btn");
     if (!btn || !zones || !project) return;
-    const left = zones.left.file || project.files.left;
-    const right = zones.right.file || project.files.right;
+    const left = zones.left.files.length > 0 || hasVideo(project.files.left);
+    const right = zones.right.files.length > 0 || hasVideo(project.files.right);
     btn.disabled = uploading || !left || !right;
     // Swapping moves the videos VeoClone already has; not with a new one picked.
     const swap = body.querySelector<HTMLButtonElement>(".swap");
-    if (swap) swap.hidden = !!(zones.left.file || zones.right.file);
+    if (swap) swap.hidden = zones.left.files.length > 0 || zones.right.files.length > 0;
   }
 
   async function start() {
@@ -386,13 +395,13 @@ export function projectPage(ctx: PageContext, id: string): Page {
     clearTimeout(openTimer);
     openTimer = 0;
     try {
-      if (zones && (zones.left.file || zones.right.file)) {
+      if (zones && (zones.left.files.length || zones.right.files.length)) {
         uploading = true;
         mode = "upload";
         updateStart();
         zones.left.setDisabled(true);
         zones.right.setDisabled(true);
-        await sendVideos(id, zones, (u) => (upload = u));
+        project = (await sendVideos(id, zones, (u) => (upload = u), project)) ?? project;
         uploading = false;
       }
       project = await api.process(id);

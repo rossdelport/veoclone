@@ -10,6 +10,7 @@ mod jobs;
 mod logging;
 mod media;
 mod process;
+mod seen;
 mod store;
 
 use std::ffi::OsString;

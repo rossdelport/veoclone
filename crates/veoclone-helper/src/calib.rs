@@ -1,6 +1,8 @@
 //! Lens profiles (iPhone list for the "Which iPhone filmed this?" question)
 //! and the `CalibInfo` the editor needs to draw exactly what Reco renders.
 
+use std::path::Path;
+
 use reco_calibrate::lens_database::LensDatabase;
 use reco_calibrate::types::LensProfileSummary;
 use reco_core::calibration::{CameraParams, MatchCalibration};
@@ -24,14 +26,50 @@ pub struct LensOption {
     pub id: String,
     /// "iPhone 15 Pro", or "Not sure".
     pub model: String,
-    /// "ultra" (0.5× ultra wide) or "main" (1×, normal).
+    /// iPhones: "ultra" (0.5× ultra wide) or "main" (1×, normal); GoPros:
+    /// "wide" or "linear"; "auto" for "detect automatically".
     pub lens: &'static str,
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// "iPhone" or "Action camera" (empty for "Not sure").
+    pub group: &'static str,
     #[serde(skip)]
-    profile: Profile,
+    source: LensSource,
 }
+
+/// Where an option's lens settings come from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LensSource {
+    /// A 4K iPhone profile.
+    Iphone(Profile),
+    /// A GoPro in Reco's lens database: model and lens mode (Reco's own
+    /// lookup, `LensDatabase::find`).
+    GoPro {
+        model: &'static str,
+        lens: &'static str,
+    },
+    /// Reco's detection from the video file's metadata (telemetry).
+    Auto,
+}
+
+/// "GoPro or other action camera – detect automatically".
+pub const AUTO_LENS: &str = "auto";
+const AUTO_LABEL: &str = "GoPro or other action camera – detect automatically";
+const IPHONE: &str = "iPhone";
+const ACTION_CAMERA: &str = "Action camera";
+
+/// GoPros with Wide and Linear 16:9 profiles in Reco's database, newest
+/// first, and the profile each uses. The HERO12 and HERO13 Black have the
+/// same lens and sensor as the HERO11 Black, whose profiles Reco has (the
+/// database has no 16:9 Wide or Linear profile for them).
+const GOPROS: [(&str, &str); 5] = [
+    ("GoPro HERO13 Black", "HERO11 Black"),
+    ("GoPro HERO12 Black", "HERO11 Black"),
+    ("GoPro HERO11 Black", "HERO11 Black"),
+    ("GoPro HERO10 Black", "HERO10 Black"),
+    ("GoPro HERO9 Black", "HERO9 Black"),
+];
 
 /// The lens of new matches.
 pub const DEFAULT_LENS: &str = "generic:ultra";
@@ -155,7 +193,8 @@ const NO_ULTRA_WIDE: [&str; 2] = ["iPhone Air", "iPhone 16e"];
 const NOT_SURE_PROFILES: (&str, Profile, Profile) = (NOT_SURE, UW_14_PRO_MAX, MAIN_14);
 
 /// All lens choices: "Not sure" first, then the iPhones newest first, each
-/// with an Ultra Wide and a Main option.
+/// with an Ultra Wide and a Main option, then "detect automatically" and
+/// the GoPros, each with a Wide and a Linear option.
 pub fn lens_options() -> &'static [LensOption] {
     static OPTIONS: std::sync::OnceLock<Vec<LensOption>> = std::sync::OnceLock::new();
     OPTIONS.get_or_init(|| {
@@ -191,12 +230,56 @@ pub fn lens_options() -> &'static [LensOption] {
                     lens,
                     label: format!("{model} · {name}"),
                     note,
-                    profile,
+                    group: if model == NOT_SURE { "" } else { IPHONE },
+                    source: LensSource::Iphone(profile),
+                });
+            }
+        }
+        out.push(LensOption {
+            id: AUTO_LENS.into(),
+            model: AUTO_LABEL.into(),
+            lens: "auto",
+            label: AUTO_LABEL.into(),
+            note: Some(
+                "VeoClone reads the camera model and its Lens setting from the video file.".into(),
+            ),
+            group: ACTION_CAMERA,
+            source: LensSource::Auto,
+        });
+        for (model, profile) in GOPROS {
+            for (lens, name) in [("wide", "Wide"), ("linear", "Linear")] {
+                let uses = format!("GoPro {profile}");
+                out.push(LensOption {
+                    id: format!("{}:{lens}", model.to_lowercase().replace(' ', "-")),
+                    model: model.into(),
+                    lens,
+                    label: format!("{model} · {name}"),
+                    note: (uses != model)
+                        .then(|| format!("Uses the {profile} settings (the same lens)")),
+                    group: ACTION_CAMERA,
+                    source: LensSource::GoPro {
+                        model: profile,
+                        lens: name,
+                    },
                 });
             }
         }
         out
     })
+}
+
+impl LensSource {
+    /// The settings scaled to the video size (`None` for "detect
+    /// automatically", which needs the video).
+    fn load(&self, width: u32, height: u32) -> Option<CameraParams> {
+        match *self {
+            LensSource::Iphone(p) => p.load(width, height),
+            LensSource::GoPro { model, lens } => LensDatabase::embedded()
+                .find("GoPro", model, width, height, Some(lens))
+                .and_then(|(p, _)| scaled(p, width, height)),
+            LensSource::Auto => None,
+        }
+    }
 }
 
 pub fn is_lens_option(id: &str) -> bool {
@@ -216,7 +299,8 @@ pub struct LensChoice {
 /// The lens for `lens_id`: one of [`lens_options`], else an id from an
 /// older VeoClone (a raw database profile) that still loads, else the
 /// default with a warning. No lens (older matches) means "Not sure".
-pub fn choose_lens(lens_id: Option<&str>, width: u32, height: u32) -> LensChoice {
+/// "Detect automatically" reads `video`'s metadata ([`auto_lens`]).
+pub fn choose_lens(lens_id: Option<&str>, video: &Path, width: u32, height: u32) -> LensChoice {
     let id = lens_id.unwrap_or(DEFAULT_LENS);
     if let Some((params, name)) = lens_params(id, width, height) {
         return LensChoice {
@@ -224,6 +308,9 @@ pub fn choose_lens(lens_id: Option<&str>, width: u32, height: u32) -> LensChoice
             name,
             warning: None,
         };
+    }
+    if id == AUTO_LENS {
+        return auto_lens(video, width, height);
     }
     let (option, warning) = match lens_options().iter().find(|o| o.id == id) {
         Some(o) if o.model == NOT_SURE => {
@@ -250,13 +337,100 @@ pub fn choose_lens(lens_id: Option<&str>, width: u32, height: u32) -> LensChoice
             ),
         ),
     };
-    LensChoice {
-        params: option
-            .profile
-            .load(width, height)
-            .expect("every lens option loads (tested)"),
-        name: option.label.clone(),
-        warning,
+    match option.source.load(width, height) {
+        Some(params) => LensChoice {
+            params,
+            name: option.label.clone(),
+            warning,
+        },
+        // A GoPro profile for another picture shape (4:3, 8:7): Reco's own
+        // detection is the best guess left.
+        None => {
+            let mut c = auto_lens(video, width, height);
+            c.warning = Some(format!(
+                "VeoClone has no {} settings for videos of {width}x{height}, so it looked for \
+                 the camera in the video file instead ({}). Film in 16:9 next time.",
+                option.label, c.name
+            ));
+            c
+        }
+    }
+}
+
+const NOT_RECOGNISED: &str = "VeoClone couldn't recognise the camera from the video file, so it \
+     used general settings for this picture size, which may not suit your camera. If the \
+     picture looks bent or the two halves don't join up, click “Change phone or lens” and \
+     choose your camera.";
+
+/// "Detect automatically": Reco's lens detection from the video's metadata
+/// (`lens_database::detect_profile`: a lens profile stored in the file, else
+/// the camera model and lens mode looked up in the database, else the first
+/// profile with this picture size). GoPro HERO12/HERO13 Black footage uses
+/// the HERO11 Black profile of the same lens mode, which Reco's database
+/// lacks for them.
+pub fn auto_lens(video: &Path, width: u32, height: u32) -> LensChoice {
+    use reco_calibrate::types::ProfileSource;
+    let db = LensDatabase::embedded();
+    let meta = reco_calibrate::telemetry::extract_metadata(video).ok();
+    if let Some(m) = &meta {
+        tracing::info!(
+            "Camera in the video file: {} {} (lens {})",
+            m.camera_type,
+            m.camera_model.as_deref().unwrap_or("?"),
+            m.lens_info.as_deref().unwrap_or("?")
+        );
+    }
+    let gopro_model = meta
+        .as_ref()
+        .filter(|m| m.camera_type.eq_ignore_ascii_case("gopro"))
+        .and_then(|m| m.camera_model.clone());
+    let lens_mode = meta.as_ref().and_then(|m| m.lens_info.clone());
+    if let (Some(model), Some(lens)) = (&gopro_model, &lens_mode)
+        && ["HERO12", "HERO13"]
+            .iter()
+            .any(|h| model.to_ascii_uppercase().contains(h))
+        && ["Wide", "Linear"].contains(&lens.as_str())
+        && let Some((params, _)) = db.find("GoPro", "HERO11 Black", width, height, Some(lens))
+        && let Some(params) = scaled(params, width, height)
+    {
+        return LensChoice {
+            params,
+            name: format!(
+                "GoPro {model} · {lens} (found in the video file; uses the HERO11 Black \
+                 settings, the same lens)"
+            ),
+            warning: None,
+        };
+    }
+    let stub = meta
+        .as_ref()
+        .map(|m| reco_calibrate::telemetry::TelemetryData {
+            camera_type: m.camera_type.clone(),
+            camera_model: m.camera_model.clone(),
+            lens_profile: m.lens_profile.clone(),
+            lens_info: m.lens_info.clone(),
+            gyro: Vec::new(),
+            accel: Vec::new(),
+            quaternions: Vec::new(),
+        });
+    let found =
+        reco_calibrate::lens_database::detect_profile(video, width, height, db, stub.as_ref())
+            .and_then(|(p, info)| Some((scaled(p, width, height)?, info)));
+    match found {
+        Some((params, info)) if !matches!(info.source, ProfileSource::Fallback) => LensChoice {
+            params,
+            name: format!("{} · {} (found in the video file)", info.camera, info.lens),
+            warning: None,
+        },
+        Some((params, _)) => LensChoice {
+            params,
+            name: "General action-camera settings (camera not recognised)".into(),
+            warning: Some(NOT_RECOGNISED.into()),
+        },
+        None => LensChoice {
+            warning: Some(NOT_RECOGNISED.into()),
+            ..choose_lens(Some(DEFAULT_LENS), video, width, height)
+        },
     }
 }
 
@@ -453,7 +627,7 @@ pub(crate) mod tests {
     #[test]
     fn lens_options_follow_design() {
         let options = lens_options();
-        assert_eq!(options.len(), 2 * (PHONES.len() + 1));
+        assert_eq!(options.len(), 2 * (PHONES.len() + 1) + 1 + 2 * GOPROS.len());
         assert_eq!(options[0].id, DEFAULT_LENS);
         assert_eq!(options[0].label, "Not sure · Ultra wide (0.5×)");
         assert_eq!(options[1].id, "generic:main");
@@ -487,42 +661,118 @@ pub(crate) mod tests {
         // Exactly one option per (model, lens), both lenses for every model.
         let ids: std::collections::HashSet<_> = options.iter().map(|o| &o.id).collect();
         assert_eq!(ids.len(), options.len());
-        for pair in options.chunks(2) {
+        let phones = 2 * (PHONES.len() + 1);
+        for pair in options[..phones].chunks(2) {
             assert_eq!(pair[0].model, pair[1].model);
             assert_eq!((pair[0].lens, pair[1].lens), ("ultra", "main"));
+            assert_eq!(
+                pair[0].group,
+                if pair[0].model == NOT_SURE {
+                    ""
+                } else {
+                    "iPhone"
+                }
+            );
         }
+        // Then the action cameras: detect automatically, then the GoPros
+        // newest first with Wide and Linear.
+        let auto = &options[phones];
+        assert_eq!(
+            (auto.id.as_str(), auto.lens, auto.label.as_str(), auto.group),
+            (
+                AUTO_LENS,
+                "auto",
+                "GoPro or other action camera – detect automatically",
+                "Action camera"
+            )
+        );
+        for pair in options[phones + 1..].chunks(2) {
+            assert_eq!(pair[0].model, pair[1].model);
+            assert_eq!((pair[0].lens, pair[1].lens), ("wide", "linear"));
+            assert_eq!(pair[0].group, "Action camera");
+        }
+        let o = options
+            .iter()
+            .find(|o| o.id == "gopro-hero13-black:wide")
+            .unwrap();
+        assert_eq!(o.label, "GoPro HERO13 Black · Wide");
+        assert_eq!(
+            o.note.as_deref(),
+            Some("Uses the HERO11 Black settings (the same lens)")
+        );
+        let o = options
+            .iter()
+            .find(|o| o.id == "gopro-hero9-black:linear")
+            .unwrap();
+        assert_eq!(o.note, None);
 
         let v = serde_json::to_value(&options[2]).unwrap();
         let keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys, ["id", "model", "lens", "label", "note"]);
+        assert_eq!(keys, ["id", "model", "lens", "label", "note", "group"]);
     }
 
     /// Every chosen profile loads and scales to 4K and 1080p, with the
     /// focal length of its lens type and a centred picture.
     #[test]
     fn every_lens_option_loads() {
-        for o in lens_options() {
+        let none = Path::new("");
+        for o in lens_options()
+            .iter()
+            .filter(|o| o.source != LensSource::Auto)
+        {
             for (w, h) in [(3840, 2160), (1920, 1080)] {
                 let p = o
-                    .profile
+                    .source
                     .load(w, h)
-                    .unwrap_or_else(|| panic!("{} does not load: {:?}", o.id, o.profile));
+                    .unwrap_or_else(|| panic!("{} does not load: {:?}", o.id, o.source));
                 assert_eq!((p.width, p.height), (w, h));
                 let f = p.fx / w as f64;
-                let range = if o.lens == "ultra" {
-                    0.42..0.46
-                } else {
-                    0.80..0.87
+                let range = match o.lens {
+                    "ultra" => 0.42..0.46,
+                    "main" => 0.80..0.87,
+                    // GoPro Wide (fisheye) and Linear (straight lines).
+                    "wide" => 0.46..0.48,
+                    _ => 0.47..0.49,
                 };
                 assert!(range.contains(&f), "{}: fx/width {f}", o.id);
                 assert!((p.fy / p.fx - 1.0).abs() < 0.01, "{}", o.id);
                 assert!((p.cx / w as f64 - 0.5).abs() < 0.03, "{}", o.id);
                 assert!((p.cy / h as f64 - 0.5).abs() < 0.03, "{}", o.id);
             }
-            let c = choose_lens(Some(&o.id), 1920, 1080);
+            let c = choose_lens(Some(&o.id), none, 1920, 1080);
             assert_eq!(c.name, o.label);
             assert_eq!(c.warning.is_some(), o.model == NOT_SURE, "{}", o.id);
         }
+        // A GoPro's Wide and Linear are different lenses; HERO12/13 use the
+        // HERO11's.
+        let gp = |id: &str| {
+            let p = choose_lens(Some(id), none, 3840, 2160).params;
+            (p.fx, p.fy, p.cx, p.cy, p.d)
+        };
+        assert_ne!(
+            gp("gopro-hero11-black:wide").4,
+            gp("gopro-hero11-black:linear").4
+        );
+        assert_eq!(gp("gopro-hero13-black:wide"), gp("gopro-hero11-black:wide"));
+        assert_eq!(
+            gp("gopro-hero12-black:linear"),
+            gp("gopro-hero11-black:linear")
+        );
+    }
+
+    /// "Detect automatically" on a video without camera metadata (a phone,
+    /// or here no file at all) ends in Reco's resolution-only fallback,
+    /// with a plain warning.
+    #[test]
+    fn detect_automatically_warns_when_not_recognised() {
+        let c = choose_lens(Some(AUTO_LENS), Path::new("/no/such/video.mp4"), 3840, 2160);
+        let (fallback, _) = LensDatabase::embedded()
+            .find_by_resolution(3840, 2160)
+            .unwrap();
+        assert_eq!(c.params.fx, fallback.fx);
+        assert!(c.name.contains("not recognised"));
+        assert!(c.warning.unwrap().contains("couldn't recognise the camera"));
+        assert!(is_lens_option(AUTO_LENS));
     }
 
     #[test]
@@ -533,22 +783,27 @@ pub(crate) mod tests {
             .find_by_resolution(3840, 2160)
             .unwrap();
         for id in [None, Some(DEFAULT_LENS)] {
-            let c = choose_lens(id, 3840, 2160);
+            let c = choose_lens(id, Path::new(""), 3840, 2160);
             assert_eq!(c.name, "Not sure · Ultra wide (0.5×)");
             assert!(c.warning.unwrap().contains("ultra wide (0.5×)"));
             assert_ne!(c.params.fx, fallback.fx);
         }
-        let c = choose_lens(Some("generic:main"), 3840, 2160);
+        let c = choose_lens(Some("generic:main"), Path::new(""), 3840, 2160);
         assert!(c.warning.unwrap().contains("normal (1×)"));
 
         // Ids from older versions keep working while they load.
-        let c = choose_lens(Some("Apple IPhone 15||3840x2160"), 1920, 1080);
+        let c = choose_lens(
+            Some("Apple IPhone 15||3840x2160"),
+            Path::new(""),
+            1920,
+            1080,
+        );
         assert_eq!(c.name, "iPhone 15 · 4K");
         assert!(c.warning.is_none());
         assert!((c.params.fx - 3312.6 / 2.0).abs() < 1.0, "{:?}", c.params);
         // ...otherwise "Not sure" with a warning, also for the broken one.
         for id in ["nonsense", "Apple IPhone 15| (cinematic wide)|3840x2160"] {
-            let c = choose_lens(Some(id), 1920, 1080);
+            let c = choose_lens(Some(id), Path::new(""), 1920, 1080);
             assert_eq!(c.name, "Not sure · Ultra wide (0.5×)");
             assert!(c.warning.unwrap().contains("no longer in the list"));
         }

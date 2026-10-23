@@ -1,4 +1,4 @@
-// "Which iPhone?" and "Which lens?": the two simple choices that pick the lens
+// "Which camera?" and "Which lens?": the two simple choices that pick the lens
 // profile (docs/veoclone/DESIGN.md 4.6), once for both phones or once for
 // each, and changing them after processing.
 import { api, type LensOption, type ProjectMeta } from "../api";
@@ -8,10 +8,13 @@ import { h, setChildren } from "./dom";
 export const DEFAULT_LENS = "generic:ultra";
 const NOT_SURE = "Not sure";
 
-const LENSES: { lens: LensOption["lens"]; name: string; text: string }[] = [
-  { lens: "ultra", name: "Ultra wide (0.5×)", text: "Recommended. Together the two phones see the whole pitch." },
-  { lens: "main", name: "Normal (1×)", text: "Only if the phones were not switched to 0.5×." },
-];
+const LENSES: Record<LensOption["lens"], { name: string; text: string }> = {
+  ultra: { name: "Ultra wide (0.5×)", text: "Recommended. Together the two phones see the whole pitch." },
+  main: { name: "Normal (1×)", text: "Only if the phones were not switched to 0.5×." },
+  wide: { name: "Wide", text: "Recommended: the GoPro's Lens setting on Wide." },
+  linear: { name: "Linear", text: "Only if the GoPro's Lens was set to Linear." },
+  auto: { name: "Detect automatically", text: "" },
+};
 
 let cached: Promise<LensOption[]> | null = null;
 
@@ -34,7 +37,7 @@ export function initialLens(options: LensOption[], value: string | null): LensOp
 
 /** Stand-in while the list can't be loaded; VeoClone then uses a typical iPhone lens. */
 export function lensUnavailable(text = "Not sure"): HTMLElement {
-  return h("select", { class: "input", id: "lens-model", disabled: true, "aria-label": "Which iPhone?" }, h("option", null, text));
+  return h("select", { class: "input", id: "lens-model", disabled: true, "aria-label": "Which camera?" }, h("option", null, text));
 }
 
 /** The two choices. `onChange` gets the chosen option's id. */
@@ -44,33 +47,49 @@ export function lensPicker(options: LensOption[], value: string | null, onChange
   const models = [...new Set(options.map((o) => o.model))].sort((a, b) => Number(b === NOT_SURE) - Number(a === NOT_SURE));
   const note = h("p", { class: "muted small lens-note", "aria-live": "polite" });
   const showNote = () => (note.textContent = current!.note ?? (current!.model === NOT_SURE ? "VeoClone uses a typical recent iPhone." : ""));
+  const lensLabel = h("p", { class: "field-label-small", id: `${name}-lens-label` }, "Which lens?");
+  const lensGroup = h("div", { class: "choice-grid", role: "radiogroup", "aria-labelledby": `${name}-lens-label` });
+  let radios: HTMLInputElement[] = [];
+  /** The lens choices of the chosen camera (none for "detect automatically"). */
+  const showLenses = () => {
+    const lenses = options.filter((o) => o.model === current!.model && o.lens !== "auto").map((o) => o.lens);
+    radios = lenses.map((lens) =>
+      h("input", { type: "radio", name: `${name}-lens`, value: lens, checked: lens === current!.lens, onChange: () => pick(current!.model, lens) }),
+    );
+    setChildren(
+      lensGroup,
+      lenses.map((lens, i) => h("label", { class: "choice" }, radios[i], h("span", { class: "choice-body" }, h("strong", null, LENSES[lens].name), h("span", { class: "muted small" }, LENSES[lens].text)))),
+    );
+    lensLabel.hidden = lensGroup.hidden = lenses.length === 0;
+  };
   const pick = (model: string, lens: LensOption["lens"]) => {
+    const changed = model !== current!.model;
     current = options.find((o) => o.model === model && o.lens === lens) ?? options.find((o) => o.model === model) ?? current!;
-    for (const r of radios) r.checked = r.value === current.lens;
+    if (changed) showLenses();
+    else for (const r of radios) r.checked = r.value === current.lens;
     showNote();
     onChange(current.id);
   };
+  // Grouped: Not sure, then the iPhones, then the action cameras.
+  const groups = [...new Set(models.map((m) => options.find((o) => o.model === m)?.group ?? ""))];
   const select = h(
     "select",
     { class: "input", id: `${name}-model`, onChange: () => pick(select.value, current!.lens) },
-    models.map((m) => h("option", { value: m }, m)),
+    groups.map((g) => {
+      const items = models.filter((m) => (options.find((o) => o.model === m)?.group ?? "") === g).map((m) => h("option", { value: m }, m));
+      return g ? h("optgroup", { label: g === "iPhone" ? "iPhones" : "GoPro and other action cameras" }, items) : items;
+    }),
   );
   select.value = current.model;
-  const radios = LENSES.map((l) =>
-    h("input", { type: "radio", name: `${name}-lens`, value: l.lens, checked: l.lens === current!.lens, onChange: () => pick(current!.model, l.lens) }),
-  );
+  showLenses();
   showNote();
   return h(
     "div",
     { class: "lens-picker" },
-    h("label", { class: "field-label-small", for: `${name}-model` }, "Which iPhone?"),
+    h("label", { class: "field-label-small", for: `${name}-model` }, "Which camera?"),
     select,
-    h("p", { class: "field-label-small", id: `${name}-lens-label` }, "Which lens?"),
-    h(
-      "div",
-      { class: "choice-grid", role: "radiogroup", "aria-labelledby": `${name}-lens-label` },
-      LENSES.map((l, i) => h("label", { class: "choice" }, radios[i], h("span", { class: "choice-body" }, h("strong", null, l.name), h("span", { class: "muted small" }, l.text)))),
-    ),
+    lensLabel,
+    lensGroup,
     note,
   );
 }
@@ -168,7 +187,7 @@ export async function changeLens(p: ProjectMeta): Promise<boolean> {
   const ok = await confirmDialog({
     title: "Change phone or lens",
     text: [
-      h("p", null, "If the picture looks bent, or the two halves don't join up, tell VeoClone which iPhone and which lens filmed this match."),
+      h("p", null, "If the picture looks bent, or the two halves don't join up, tell VeoClone which camera (iPhone or GoPro) and which lens filmed this match."),
       phonesPicker(options, p, (lenses) => (chosen = lenses), "change-lens"),
       h(
         "p",

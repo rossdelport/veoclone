@@ -1,6 +1,6 @@
 # VeoClone design
 
-VeoClone turns two iPhone recordings of a football match into a Veo-style
+VeoClone turns two iPhone (or GoPro) recordings of a football match into a Veo-style
 "follow the ball" video, with a browser editor to fix the camera, zoom and
 trim before exporting. It is built on top of the Reco Video Stitcher crates
 in this repository (AGPL-3.0, see `README.reco.md`).
@@ -28,8 +28,9 @@ browser to the helper on the same PC.
    whether the helper is running; if not, explain how to start/download it.
 2. New match: name, "Which iPhone?" + "Which lens?" (4.6; once for both
    phones, or once per phone with "The two phones are different models"
-   ticked), camera style
-   (Broadcast / Action / Wide), and two drop boxes: **Left phone** and
+   ticked; GoPros and "detect automatically" in the same list), camera style
+   (Broadcast / Action / Wide / Follow the ball), AI accuracy (Best: every
+   frame, default / Faster: every 3rd frame), and two drop boxes: **Left phone** and
    **Right phone**. Filming tips shown alongside. "Start" uploads both files
    to the helper (progress bar per file) and then starts processing.
 3. Processing: steps with progress bars and time remaining:
@@ -53,6 +54,8 @@ browser to the helper on the same PC.
      slider, "Undo", fix-length ("how long a fix lasts") slider.
    - **Straighten picture** (5.5): Tilt and Level sliders with "Look left /
      centre / right", for phones that pointed down.
+   - **Mark the pitch** (4.8): click round the pitch on a big overview so the
+     AI ignores people outside it; offered the first time a match opens.
    - Keyboard: Space play/pause, ←/→ 1 frame (Shift = 5 s), K add keyframe
      at the current view, Delete remove selected keyframe, Ctrl+Z undo.
    - Edits autosave to the helper.
@@ -133,6 +136,8 @@ match.json        Reco MatchCalibration
 calib.json        CalibInfo for the editor (section 4.4)
 proxy.mp4         stacked preview video (section 4.3)
 ai_path.bin       AI camera path (section 4.4)
+ai_seen.bin.gz    what the AI saw (every detection), for quick re-runs (4.9)
+ai_seen.json      how it was recorded (4.9)
 edits.json        editor state, opaque to the helper
 exports/<id>/     export parts + final .mp4
 log.txt           human-readable log of jobs for this project
@@ -210,7 +215,12 @@ log.txt           human-readable log of jobs for this project
    `left_params` from `lensId` (`null` = `generic:ultra`), `right_params`
    from `rightLensId` (`null` = the same as `lensId`), each loaded from
    `LensDatabase::embedded()` and scaled to that side's working file the
-   way reco-gui does (`fx *= w/p.width` …); never Reco's auto-detect. Warn
+   way reco-gui does (`fx *= w/p.width` …); Reco's auto-detection only for
+   the `auto` choice (4.6), per side. Explicit lens params no longer skip
+   the IMU: `calibrate_videos` now calls the new
+   `CalibrationPipeline::probe_native_gyro` (patched in `reco-calibrate`;
+   before, a chosen lens silently dropped a GoPro's IMU sync and its rig
+   tilt/roll), so GoPro footage keeps the camera's own level. Warn
    when a lens is a "Not sure" guess (once, also when both are). The
    summary's `lens` names both phones when they differ ("Left phone: …;
    right phone: …"). Audio sync is automatic (needs ffmpeg). Save
@@ -238,15 +248,29 @@ log.txt           human-readable log of jobs for this project
      `libx264 -preset veryfast -crf 26`;
    - progress from `-progress pipe:1` (`frame=` lines).
 4. **AI tracking** with `reco_io::StitchJob` + `reco_autocam::setup_autocam`
-   exactly like reco-gui's export (`crates/reco-gui/src/export.rs`): field
-   mode, the project's style preset (`broadcast`/`action`/`frame_all`),
-   detection interval 3, lookahead 1.5 s, output to a throwaway 640x360 MKV
-   with audio disabled (deleted afterwards). Instead of `.events()`, install
-   a custom `PipelineEventSink` that records only `PanDecision` poses
-   (world space, smoothed) into memory → `ai_path.bin`. Missing frames hold
-   the previous pose. Fail early (before the long run) if the ONNX runtime
-   or model cannot load; detect whether DirectML really registered and
-   report the AI provider in `/api/health` and the job log.
+   exactly like reco-gui's export (`crates/reco-gui/src/export.rs`): the
+   style's tracking mode and preset (`broadcast`/`action`/`frame_all`
+   field mode; `ball` = `TrackingMode::Ball` with the broadcast preset,
+   which Reco turns into `ball_weight` 1.0, `BallTracker` max jump 0.5 and
+   no player tracker), detection interval from `aiAccuracy` (1 or 3),
+   lookahead 1.5 s, the pitch outline as `field_roi` (4.8), output to a
+   throwaway 640x360 MKV with audio disabled (deleted afterwards). Instead
+   of `.events()`, install a custom `PipelineEventSink` that records only
+   `PanDecision` poses (world space, smoothed) into memory → `ai_path.bin`.
+   Missing frames hold the previous pose. Fail early (before the long run)
+   if the ONNX runtime or model cannot load; detect whether DirectML really
+   registered and report the AI provider in `/api/health` and the job log.
+   Reco is given the session through a `DetectionTarget` wrapper
+   (`seen::Wiring`) that puts a chain around the detector it picks:
+   record (4.9) → ball-mode confidence floor 0.25 → `RoiFilteredDetector`
+   with the person class anchored at the feet (what `setup_autocam` does for
+   a `field_roi`). The detector itself always runs at 0.10 (the field-mode
+   floor) so the recording suits every style; Reco keeps a detection when
+   `confidence >= threshold` and both filters keep the order, so the
+   trackers get exactly the detections of Reco's own setup (verified: the
+   ball path is bit-identical to `confidence_threshold = 0.25`).
+   When a usable recording exists (4.9), this step instead rebuilds the
+   path from it in about a second ("Using what the AI saw last time").
 5. Write `calib.json`, status `ready`.
 
 Progress: each step reports `progress` 0..1 and, where known,
@@ -340,9 +364,9 @@ editor applies them).
 | `GET /api/health` | `{ app:"veoclone-helper", version, gpu:{name,backend}, ai:{available, provider, model}, ffmpeg:bool, dataDir, freeDiskBytes }` |
 | `GET /api/lenses` | Curated lens choices, see 4.6 |
 | `GET /api/projects` | `ProjectMeta[]` newest first |
-| `POST /api/projects` | body `{ name, lensId?, rightLensId?, style }` → `ProjectMeta` |
+| `POST /api/projects` | body `{ name, lensId?, rightLensId?, style, aiAccuracy? }` → `ProjectMeta` |
 | `GET /api/projects/:id` | `ProjectMeta` |
-| `PATCH /api/projects/:id` | `{ name?, lensId?, rightLensId?, style? }` |
+| `PATCH /api/projects/:id` | `{ name?, lensId?, rightLensId?, style?, aiAccuracy? }` |
 | `DELETE /api/projects/:id` | deletes the folder (refuse while a job runs on it) |
 | `PUT /api/projects/:id/files/:side` | side = `left`/`right`; raw body streamed to disk (write `*.part`, rename at end); header `X-Filename` (original name, for the extension); deletes that side's matching copy; returns updated `ProjectMeta` |
 | `POST /api/projects/:id/process` | start/queue the pipeline (also used for "Try again" and "Re-run AI with a different style") |
@@ -351,6 +375,8 @@ editor applies them).
 | `GET /api/projects/:id/proxy.mp4` | video with HTTP Range support |
 | `GET /api/projects/:id/ai-path.bin` | binary path |
 | `GET/PUT /api/projects/:id/edits` | editor state JSON (≤ 10 MB), `{}` if none |
+| `PUT /api/projects/:id/pitch` | `{ points, left, right }` (4.8) → `ProjectMeta` |
+| `DELETE /api/projects/:id/pitch` | remove the pitch outline → `ProjectMeta` |
 | `POST /api/projects/:id/exports` | start export (section 4.3) → `ExportMeta` |
 | `GET /api/projects/:id/exports/:eid/file` | download (`Content-Disposition: attachment`, Range) |
 | `DELETE /api/projects/:id/exports/:eid` | delete an export |
@@ -364,7 +390,11 @@ editor applies them).
   id: string; name: string; createdAt: string; updatedAt: string;
   lensId: string | null;       // the left phone (and the right one unless rightLensId)
   rightLensId: string | null;  // the right phone when it is another model; null = same as left
-  style: "broadcast" | "action" | "frame_all";
+  style: "broadcast" | "action" | "frame_all" | "ball";
+  aiAccuracy: "best" | "faster";   // detection interval 1 / 3; missing in older files: best
+  pitch: null | { id: string; points: [number, number][]; left: [number, number][]; right: [number, number][] }; // 4.8
+  aiRun: null | { style; aiAccuracy; pitchId: string | null };  // what ai_path.bin was made with
+  aiSeen: null | { every: number };  // a recording for quick re-runs exists (4.9); filled in when read
   status: "new" | "uploaded" | "queued" | "processing" | "ready" | "failed" | "cancelled";
   files: { left?: FileInfo; right?: FileInfo };  // FileInfo = { name, sizeBytes, probe?: {...} }
   job: null | { kind: "process" | "export"; exportId?: string;
@@ -433,6 +463,32 @@ different iPhones are fine".
   re-calibrates and rebuilds everything; the editor offers this when the
   picture looks bent or the halves don't join.
 
+- **Action cameras.** After the iPhones: `auto` ("GoPro or other action
+  camera – detect automatically", lens `auto`) and GoPro HERO13/12/11/10/9
+  Black, each `wide` and `linear` (`gopro-hero12-black:linear`, …), group
+  "Action camera" (`LensOption.group`; iPhones "iPhone", "Not sure" empty).
+  A GoPro option is Reco's own `LensDatabase::find("GoPro", model, w, h,
+  Some("Wide"|"Linear"))` (the 16:9 profiles of HERO9/10/11 Black). The
+  database has no 16:9 Wide or Linear profile for the HERO12/13 Black
+  (only 8:7 Wide), so they use the HERO11 Black profile of the same lens
+  mode (same lens and sensor), with a note. `auto` resolves each side from
+  its working file: the fast telemetry probe
+  (`telemetry::extract_metadata`); GoPro HERO12/13 Black with lens info
+  Wide or Linear → the HERO11 Black profile; otherwise Reco's
+  `lens_database::detect_profile` (a profile embedded in the file, then
+  camera model + lens mode in the database, then the first profile with
+  that picture size). That last one (`ProfileSource::Fallback`) is named
+  "General action-camera settings (camera not recognised)" and warns:
+  "VeoClone couldn't recognise the camera from the video file, so it used
+  general settings for this picture size, which may not suit your camera.
+  If the picture looks bent or the two halves don't join up, click “Change
+  phone or lens” and choose your camera." The summary names the camera
+  found ("GoPro HERO11 Black · Wide (found in the video file)").
+- GoPro footage gives Reco the rig tilt/roll from the accelerometer
+  (`imu_sync`, capped at 25°); nothing in VeoClone overrides it: the AI
+  pass renders with match.json's values and the editor's Straighten picture
+  starts from them (5.5).
+
 ### 4.7 Re-runs never lock the user out
 
 If a re-run of a match that was `ready` (new style, Try again) is cancelled
@@ -440,6 +496,81 @@ or fails, or the helper closes during it, and the previous calibration,
 preview and AI path are still valid, the match goes back to `ready` (old
 outputs kept) with the problem added to `warnings`. Warnings are shown in
 the editor and on the home card, not only on the processing page.
+
+### 4.8 Pitch outline ("Mark the pitch")
+
+People outside the pitch (substitutes, parents, a neighbouring game) pull
+the player cluster, and so the camera, away from the play. Reco can drop
+detections outside a per-camera polygon (match.json `field_roi`,
+`AutocamConfig::with_field_roi` → `RoiFilteredDetector`): normalised
+`[x, y]` image coordinates of each camera (y = 0 at the top, the
+detector's own coordinates), a ball counts by its box centre, a person by
+its feet and the point a quarter of its height above them (both must be
+inside, `RoiAnchor::Bottom`). A camera with fewer than 3 corners is not
+filtered at all.
+
+- Editor: "Mark the pitch" (side panel under Whole pitch, and a one-time
+  tip "Mark the pitch so the camera ignores people outside it", hidden for
+  good with ×, `veoclone.hint.pitch.<id>`). A dialog shows a large
+  whole-pitch overview with the editor's straightening (so it is level);
+  the user clicks round the pitch (at least 4 points; more along curved
+  edges), with Undo last point / Start again / Remove the outline.
+- Engine (`engine/pitch.ts`, unit tested against Reco's
+  `camera_to_panorama`): the clicked overview points (render yaw/pitch)
+  are sampled on a 121×121 grid inside the outline (even-odd rule) plus 200
+  points per edge; each direction goes through `sampleRay` (the renderer's
+  own lens maths) to each camera's normalised image coordinates; each
+  camera's points → convex hull (5 decimals). A camera that sees none of it
+  gets `[]`. The outline itself is stored as aims (`points`, [yaw, pitch]),
+  so it stays put when the straightening changes. For a real pitch (a
+  ground rectangle clicked along its edges) the hulls miss nothing and add
+  under 1 % (the fisheye bends the lines outwards).
+- Helper: `PUT /pitch` checks the numbers (3–100 aims; polygons empty or
+  3–500 corners in [−0.01, 1.01]; at least one camera) and stores it in
+  `ProjectMeta.pitch` with a new `id`; `DELETE` removes it. New uploads and
+  swaps drop it (it was marked on other videos). The AI pass uses
+  `PitchOutline::field_roi()`; a camera with `[]` gets a polygon outside
+  its picture (it sees nothing of the pitch, so everything it sees is
+  ignored). `aiRun.pitchId` says which outline the AI path used; the editor
+  shows "Pitch marked, but the AI camera doesn't use it yet: run the AI
+  again" with a button, and asks right after saving ("Run the AI again" /
+  "Later"). Running it from the editor returns to the editor afterwards.
+
+### 4.9 Quick re-runs: what the AI saw
+
+The AI pass records every detection of the person and ball classes before
+any filtering (`seen::Recorder`, one block per `detect()` call: camera,
+count, then class `u16` and confidence, centre, size as `f32`, gzip via
+`flate2`) to `ai_seen.bin.gz`, and `ai_seen.json` (`SeenMeta`: model file
+name + size, class ids resolved like `setup_autocam`, the fps given to
+`setup_autocam`, lookahead frames, detection interval, frames, sync
+offset). Size: about 11 bytes per detection; on the synthetic footage
+(35 detections per frame) 399 bytes per frame, about 65 MB for 90 minutes
+at 30 fps.
+
+`seen::repan` rebuilds the path without the video, mirroring the session:
+detection frame k ↔ frame k·interval, left then right detections; ball
+floor and `RoiFilteredDetector` (Reco's code, on a replaying detector);
+`camera_to_panorama` with the pipeline's scene; the last detections
+re-used between detection frames; the trackers of `setup_autocam` (players
+then ball, `dispatch_detect_only`); `FieldPanner::decide_with_lookahead`
+with the next n = round(1.5 s × fps) world states (`run_buffered`'s
+buffer); `centered_smooth` over half = max(n/2, 1) poses each side in the
+same summation order. Every AI pass replays its own recording with its own
+settings and keeps it only if the path is the same (yaw/pitch within 1e-4
+rad, fov 1e-3°; measured: exactly 0); the job log names the difference.
+Measured on the synthetic footage with the release helper: replay = live
+pass bit for bit for every style, for every 3rd frame emulated from a
+recording of every frame, and with a pitch outline; a re-run takes 0.5 s
+against 70 s for the AI pass.
+
+`process` uses the recording when the model is the same, the sync offset
+matches and the new detection interval is a multiple of the recorded one
+(every frame → every frame or every 3rd; every 3rd → only every 3rd), else
+it runs the AI pass. Anything that recalibrates or changes the videos
+deletes the recording with the AI path. `ProjectMeta.aiSeen` tells the
+editor, which says "This takes a few seconds: VeoClone reuses what the AI
+saw last time." or "about as long as the first time".
 
 ## 5. Editor engine (`web/src/engine/`) — pure TS, unit tested
 
@@ -709,7 +840,13 @@ VeoClone/
 - Audio sync needs the phones started within about 15 s of each other.
 - 60 fps works but the AI camera tuning assumes 30 fps.
 - No iPhone 16/17 lens profiles in Reco's database: those models use the
-  closest older profile (4.6).
+  closest older profile (4.6). GoPro HERO12/13 Black use the HERO11 Black's.
+- GoPros split long recordings into several files; VeoClone takes one file
+  per camera, so they must be joined first (README: LosslessCut).
+- "Follow the ball" keeps a fixed zoom (Reco's ball mode has no player
+  cluster to size it) and holds still when the ball is lost.
+- GoPro auto-detection could not be tried on real GoPro footage here (no
+  sample files); the unrecognised-camera path is tested.
 - Straightening is set by eye (5.5); Reco's clamp keeps only the centre box
   of the view inside the coverage, so a straightened wide view at the very
   edge can show a black corner (the preview shows it too).

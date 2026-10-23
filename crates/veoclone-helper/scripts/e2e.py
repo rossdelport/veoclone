@@ -147,6 +147,9 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--web-dir")
+    ap.add_argument("--only", choices=["quickwins"],
+                    help="run only these checks (quickwins: ball style, AI accuracy, pitch "
+                         "outline, fast re-runs)")
     args = ap.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.work)
@@ -155,7 +158,9 @@ def main():
     helper = Helper(args)
     helper.start()
     try:
-        run(args, helper)
+        if args.only != "quickwins":
+            run(args, helper)
+        quickwins(args)
     finally:
         helper.stop()
     log("ALL CHECKS PASSED")
@@ -332,6 +337,7 @@ def run(args, helper):
     # Re-run AI with another style and cancel it during tracking: the match
     # keeps its earlier result (DESIGN.md 4.7).
     request("PATCH", f"/api/projects/{pid}", {"style": "action"})
+    forget_seen(args, pid)  # a full AI pass, long enough to stop half-way
     request("POST", f"/api/projects/{pid}/process")
     wait_for(pid, lambda p: (p.get("job") or {}).get("step") == "track"
              and (p["job"].get("framesDone") or 0) > 10)
@@ -344,6 +350,7 @@ def run(args, helper):
     check(status == 200, "editor data still there")
 
     # Restart while re-processing: back to ready with the earlier result.
+    forget_seen(args, pid)
     request("POST", f"/api/projects/{pid}/process")
     wait_for(pid, lambda p: p["status"] == "processing")
     helper.kill()
@@ -396,6 +403,244 @@ def run(args, helper):
     check(status == 200 and not os.path.exists(folder), "project deleted with its folder")
     status, _ = request("GET", f"/api/projects/{pid}")
     check(status == 404, "deleted project is gone")
+
+
+def new_match(args, name, style, **extra):
+    status, p = request("POST", "/api/projects", {"name": name, "style": style, **extra})
+    check(status == 201 and p["style"] == style, f"match '{name}' created with style {style}")
+    pid = p["id"]
+    for side, path in (("left", args.left), ("right", args.right)):
+        status, p = upload(pid, side, path)
+        check(status == 200, f"{side} uploaded")
+    return pid
+
+
+def process(pid):
+    """Process a match and wait for the end. Returns (meta, seconds, steps seen)."""
+    status, p = request("POST", f"/api/projects/{pid}/process")
+    check(status == 200, "processing started")
+    seen = set()
+    t0 = time.time()
+    p = wait_for(pid, lambda p: p["status"] in ("ready", "failed", "cancelled"), seen=seen)
+    secs = time.time() - t0
+    check(p["status"] == "ready", f"processed in {secs:.1f} s: {p.get('error')}")
+    return p, secs, seen
+
+
+def ai_path(pid, frame_count):
+    status, _, data = request("GET", f"/api/projects/{pid}/ai-path.bin", raw=True)
+    check(status == 200 and len(data) == frame_count * 12, "AI path downloaded")
+    return list(struct.iter_unpack("<3f", data))
+
+
+def job_log(args, pid):
+    with open(os.path.join(args.data, "projects", pid, "log.txt"), encoding="utf-8",
+              errors="replace") as f:
+        return f.read()
+
+
+def ai_pass_seconds(text):
+    """The "AI pass: N frames in S s" times in a job log."""
+    import re
+    return [float(m) for m in re.findall(r"AI pass: \d+ frames in ([\d.]+) s", text)]
+
+
+def quickwins(args):
+    """Ball tracking quick wins: the "Follow the ball" style, the AI
+    accuracy option, the pitch outline and fast re-runs."""
+    # 1. "Follow the ball": Reco's ball tracking mode.
+    pid = new_match(args, "Follow the ball", "ball")
+    p, secs, _ = process(pid)
+    n = p["frameCount"]
+    ball = ai_path(pid, n)
+    text = job_log(args, pid)
+    check("Reco Ball tracking" in text and "Tracking mode: ball-only" in text,
+          "the AI ran in Reco's ball mode")
+    yaws = [y for y, _, _ in ball]
+    fovs = {round(f, 3) for _, _, f in ball}
+    log(f"ball style: yaw {min(yaws):.3f}..{max(yaws):.3f}, fov {sorted(fovs)[:5]}, "
+        f"AI pass {secs:.0f} s")
+    # The synthetic ball crosses the pitch and back; with no player cluster
+    # Reco's ball mode keeps its starting zoom (FieldPanner fov_default 40).
+    check(max(yaws) - min(yaws) > 0.5, f"the camera follows the ball across the pitch "
+          f"({max(yaws) - min(yaws):.2f} rad)")
+    check(fovs == {40.0}, "ball mode keeps a fixed zoom")
+    request("PATCH", f"/api/projects/{pid}", {"style": "broadcast"})
+    p, secs, _ = process(pid)
+    broadcast = ai_path(pid, n)
+    yaws_b = [y for y, _, _ in broadcast]
+    log(f"broadcast style: yaw {min(yaws_b):.3f}..{max(yaws_b):.3f}")
+    check(max(yaws_b) - min(yaws_b) < max(yaws) - min(yaws),
+          "Broadcast follows the (still) players, Follow the ball moves much more")
+
+    # 2. AI accuracy: every frame by default, every 3rd frame on request.
+    check(p["aiAccuracy"] == "best", "the AI looks at every frame by default")
+    best_secs = ai_pass_seconds(job_log(args, pid))[-1]
+    status, p = request("PATCH", f"/api/projects/{pid}", {"aiAccuracy": "faster"})
+    check(status == 200 and p["aiAccuracy"] == "faster", "AI accuracy set to Faster")
+    forget_seen(args, pid)  # time a full AI pass (a quick re-run is checked below)
+    p, _, _ = process(pid)
+    text = job_log(args, pid)
+    faster_secs = ai_pass_seconds(text)[-1]
+    check(text.count("Detection interval: every 3 frames") == 1
+          and "the AI looks at every 3rd frame" in text, "Faster runs the AI on every 3rd frame")
+    log(f"AI pass: every frame {best_secs:.0f} s, every 3rd frame {faster_secs:.0f} s "
+        f"({best_secs / max(faster_secs, 1):.1f}x)")
+    fast_checks(args, pid, n, ball)
+    request("DELETE", f"/api/projects/{pid}")
+
+
+def max_diff(a, b):
+    """Largest |yaw|, |pitch| (rad) and |fov| (deg) difference of two paths."""
+    assert len(a) == len(b)
+    return [max(abs(p[k] - q[k]) for p, q in zip(a, b)) for k in range(3)]
+
+
+def forget_seen(args, pid):
+    """Delete the recording of what the AI saw: the next run goes through the video."""
+    for f in ("ai_seen.bin.gz", "ai_seen.json"):
+        path = os.path.join(args.data, "projects", pid, f)
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def run_timed(args, pid, quick):
+    p, secs, seen = process(pid)
+    text = job_log(args, pid).split("=== Processing started")[-1]
+    check(("Quick re-run" in text) == quick,
+          f"{'quick re-run' if quick else 'full AI pass'} as expected ({secs:.1f} s)")
+    return p, secs, text
+
+
+def read_seen(path):
+    """ai_seen.bin.gz as a list of detection frames [(camera, class, conf, x, y, w, h)]."""
+    import gzip
+    data = gzip.open(path).read()
+    frames, at = [], 0
+    while at < len(data):
+        cam, n = data[at], struct.unpack_from("<I", data, at + 1)[0]
+        at += 5
+        if cam == 0 or not frames:
+            frames.append([])
+        for _ in range(n):
+            cls, conf, x, y, w, h = struct.unpack_from("<H5f", data, at)
+            at += 22
+            frames[-1].append((cam, cls, conf, x, y, w, h))
+    return frames
+
+
+def inside(pt, poly):
+    x, y = pt
+    res = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            res = not res
+        j = i
+    return res
+
+
+def fast_checks(args, pid, n, ball_live):
+    """4. Fast re-runs from what the AI saw, against full AI passes."""
+    folder = os.path.join(args.data, "projects", pid)
+    import re
+    _, p = request("GET", f"/api/projects/{pid}")
+    # The last run was every 3rd frame: back to every frame needs the video.
+    check(p["aiSeen"] == {"every": 3}, f"recording of every 3rd frame kept: {p['aiSeen']}")
+    request("PATCH", f"/api/projects/{pid}", {"aiAccuracy": "best", "style": "ball"})
+    p, full_secs, text = run_timed(args, pid, quick=False)
+    m = re.search(r"largest difference: yaw ([\d.e+-]+) rad, pitch ([\d.e+-]+) rad, zoom "
+                  r"([\d.e+-]+) deg; checked in ([\d.]+) s", text)
+    check(m is not None, "the AI pass checked its recording by replaying it")
+    log(f"PARITY live AI pass vs replay of its recording (ball style): yaw {m[1]}, pitch {m[2]}, "
+        f"fov {m[3]} (replay took {m[4]} s)")
+    size = os.path.getsize(os.path.join(folder, "ai_seen.bin.gz"))
+    frames = read_seen(os.path.join(folder, "ai_seen.bin.gz"))
+    dets = sum(len(f) for f in frames)
+    log(f"recording: {size} bytes for {n} frames ({size / n:.0f} B/frame, {dets / len(frames):.1f} "
+        f"detections per frame); 90 min at 30 fps: about {size / n * 162000 / 1e6:.0f} MB")
+    check(len(frames) == n and p["aiSeen"] == {"every": 1}, "every frame recorded")
+    ball_full = ai_path(pid, n)
+    d = max_diff(ball_full, ball_live)
+    log(f"ball style, AI pass with recording vs Reco's plain ball mode setup: {d}")
+    check(max(d) == 0.0, "recording does not change the ball-mode path")
+
+    # Style changes run again in seconds, and match a full AI pass.
+    results = {}
+    for style in ("broadcast", "action", "frame_all", "ball"):
+        request("PATCH", f"/api/projects/{pid}", {"style": style})
+        p, secs, _ = run_timed(args, pid, quick=True)
+        results[style] = (ai_path(pid, n), secs)
+    quick_ball = results["ball"][0]
+    check(max(max_diff(quick_ball, ball_full)) == 0.0, "quick ball re-run = its AI pass")
+    request("PATCH", f"/api/projects/{pid}", {"style": "broadcast"})
+    forget_seen(args, pid)
+    p, broadcast_secs, _ = run_timed(args, pid, quick=False)
+    broadcast_full = ai_path(pid, n)
+    d = max_diff(results["broadcast"][0], broadcast_full)
+    log(f"PARITY quick broadcast (from the ball run's recording) vs full broadcast AI pass: {d}")
+    check(max(d) < 1e-5, "quick style change = full AI pass")
+    # And the other way round: ball from the broadcast run's recording.
+    request("PATCH", f"/api/projects/{pid}", {"style": "ball"})
+    p, _, _ = run_timed(args, pid, quick=True)
+    d = max_diff(ai_path(pid, n), ball_full)
+    log(f"PARITY quick ball (from the broadcast run's recording) vs full ball AI pass: {d}")
+    check(max(d) < 1e-5, "quick ball = full ball AI pass")
+
+    # AI accuracy "Faster" from a recording of every frame.
+    request("PATCH", f"/api/projects/{pid}", {"style": "broadcast", "aiAccuracy": "faster"})
+    p, faster_quick_secs, _ = run_timed(args, pid, quick=True)
+    faster_quick = ai_path(pid, n)
+    forget_seen(args, pid)
+    p, faster_full_secs, _ = run_timed(args, pid, quick=False)
+    d = max_diff(faster_quick, ai_path(pid, n))
+    log(f"PARITY quick every-3rd-frame (from every frame) vs full every-3rd-frame pass: {d}")
+    check(max(d) < 1e-5, "every 3rd frame emulated exactly")
+
+    # Pitch outline: drop the stands (the top of both pictures).
+    request("PATCH", f"/api/projects/{pid}", {"aiAccuracy": "best"})
+    p, _, _ = run_timed(args, pid, quick=False)  # every-3rd recording: needs the video
+    no_pitch = ai_path(pid, n)
+    poly = [[0.0, 0.45], [1.0, 0.45], [1.0, 1.0], [0.0, 1.0]]
+    status, p = request("PUT", f"/api/projects/{pid}/pitch", {
+        "points": [[0.9, -0.05], [-0.9, -0.05], [-0.8, -0.35], [0.8, -0.35]],
+        "left": poly, "right": poly})
+    check(status == 200 and p["pitch"]["left"] == poly, "pitch outline saved")
+    check(p["aiRun"]["pitchId"] is None, "the AI path does not use it yet")
+    p, pitch_secs, text = run_timed(args, pid, quick=True)
+    check(p["aiRun"]["pitchId"] == p["pitch"]["id"], "now it does")
+    m = re.search(r"Pitch outline: (\d+) of the (\d+) people and balls", text)
+    check(m is not None, "the job log says how many were outside the pitch")
+    # Count them ourselves from the recording, with Reco's rules (a person's
+    # feet and lower body must be inside, a ball's centre).
+    frames = read_seen(os.path.join(folder, "ai_seen.bin.gz"))
+    outside = 0
+    for f in frames:
+        for cam, cls, conf, x, y, w, h in f:
+            ok = (inside((x, y + h / 2), poly) and inside((x, y + h / 4), poly)) if cls == 0 \
+                else inside((x, y), poly)
+            outside += not ok
+    total = sum(len(f) for f in frames)
+    log(f"pitch outline: helper ignored {m[1]} of {m[2]}; counted from the recording: "
+        f"{outside} of {total}")
+    check(int(m[1]) == outside and int(m[2]) == total and outside > 0,
+          "the pitch outline removes exactly the detections outside it")
+    with_pitch = ai_path(pid, n)
+    check(max(max_diff(with_pitch, no_pitch)) > 1e-3, "the camera path changed")
+    forget_seen(args, pid)
+    p, _, _ = run_timed(args, pid, quick=False)
+    d = max_diff(with_pitch, ai_path(pid, n))
+    log(f"PARITY quick re-run with the pitch outline vs full AI pass with it: {d}")
+    check(max(d) < 1e-5, "quick pitch re-run = full AI pass with the outline")
+    status, p = request("DELETE", f"/api/projects/{pid}/pitch")
+    check(status == 200 and p["pitch"] is None, "pitch outline removed")
+
+    quick = [secs for _, secs in results.values()] + [faster_quick_secs, pitch_secs]
+    log(f"TIMINGS full AI pass (every frame): {full_secs:.1f} s ball, {broadcast_secs:.1f} s "
+        f"broadcast, every 3rd frame {faster_full_secs:.1f} s; quick re-runs: "
+        f"{min(quick):.1f}-{max(quick):.1f} s")
 
 
 def framemd5(video):

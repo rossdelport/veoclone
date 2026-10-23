@@ -7522,6 +7522,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "flate2",
  "fs4",
  "futures-util",
  "libc",

@@ -1,6 +1,6 @@
 // The editor (#/edit/:id): camera view, whole-pitch overview, timeline,
 // trims, camera fixes (keyframes), sliders, autosave and export.
-import { api, helperUrl, watchProject, type ProjectMeta } from "../api";
+import { api, helperUrl, rerunTime, watchProject, type ProjectMeta } from "../api";
 import {
   aimOfWorld,
   buildRig,
@@ -18,6 +18,7 @@ import {
   normalizeEdits,
   OverviewRenderer,
   overviewPointOf,
+  overviewPointOfAim,
   poseAt,
   renderToWorldPose,
   STRAIGHTEN_LIMITS,
@@ -34,7 +35,7 @@ import {
   type Rig,
   type Straighten,
 } from "../engine";
-import { button, describeError, errorBox, iconButton, notice, toast } from "./common";
+import { button, confirmDialog, describeError, errorBox, iconButton, notice, toast } from "./common";
 import { debounce, formatDuration, h, icon, setChildren } from "./dom";
 import { EditStore, upsertKeyframe, type SaveState } from "./editStore";
 import { ExportPanel } from "./exportPanel";
@@ -42,7 +43,8 @@ import { I } from "./icons";
 import { changeLens } from "./lens";
 import type { Page, PageContext } from "./page";
 import { STYLES } from "./newMatch";
-import { editableTitle } from "./project";
+import { markPitchDialog } from "./pitchTool";
+import { editableTitle, returnToEditorAfterRun } from "./project";
 import { cutOut, cutParts, isKept, keep, nextKept, setEnd, setStart } from "./segments";
 import { TextPanel } from "./textPanel";
 import { Timeline } from "./timeline";
@@ -118,6 +120,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   };
 
   // State.
+  let latest = project; // the match as VeoClone last reported it
   let disposedFlag = false;
   let frame = 0; // playhead
   let shownFrame = 0; // frame the video is showing
@@ -277,6 +280,8 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const straightenBox = h("div", { class: "sliders" });
   const lookRow = h("div", { class: "look-row", role: "group", "aria-label": "Point the preview across the pitch" });
   const straightenHint = h("div", { class: "straighten-hint-host" });
+  const pitchHint = h("div", { class: "pitch-hint-host" });
+  const pitchRow = h("div", { class: "pitch-row-side", "data-testid": "pitch-status" });
   const fixList = h("div", { class: "fix-list" });
   const trimInfo = h("div", { class: "trim-info" });
   const notes = h("div", { class: "editor-notes" });
@@ -284,6 +289,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     "aside",
     { class: "editor-side", "aria-label": "Editing tools" },
     notes,
+    pitchHint,
     straightenHint,
     h(
       "section",
@@ -291,7 +297,15 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       h("h2", null, "Whole pitch"),
       h("p", { class: "muted small" }, "The blue box is what the camera sees. Click or drag to point it elsewhere."),
       ovBox,
-      h("div", { class: "overview-legend" }, h("span", { class: "ov-box" }, "Camera"), h("span", { class: "ov-ai" }, "Where the AI looks"), h("span", { class: "ov-fix" }, "Your fixes")),
+      h(
+        "div",
+        { class: "overview-legend" },
+        h("span", { class: "ov-box" }, "Camera"),
+        h("span", { class: "ov-ai" }, "Where the AI looks"),
+        h("span", { class: "ov-fix" }, "Your fixes"),
+        h("span", { class: "ov-pitch" }, "Pitch outline"),
+      ),
+      pitchRow,
     ),
     h(
       "section",
@@ -631,6 +645,24 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     g.strokeStyle = "#38bdf8";
     g.lineWidth = 2;
     g.stroke(path);
+    // The pitch outline (stored as aims, so it follows the straightening).
+    const outline = latest.pitch?.points ?? [];
+    if (outline.length >= 3) {
+      g.save();
+      g.setLineDash([5, 4]);
+      g.strokeStyle = "rgba(52, 211, 153, 0.9)";
+      g.lineWidth = 1.5;
+      g.beginPath();
+      outline.forEach(([yaw, pitch], i) => {
+        const o = overviewPointOfAim({ yaw, pitch }, rig);
+        const c = ovR.yawPitchToCanvas(o.yaw, o.pitch);
+        if (i) g.lineTo(c.x, c.y);
+        else g.moveTo(c.x, c.y);
+      });
+      g.closePath();
+      g.stroke();
+      g.restore();
+    }
     // Where the AI wanted to look.
     const f = shownFrame;
     if (ai.length >= (f + 1) * 3) {
@@ -1193,10 +1225,15 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const watch = watchProject(
     id,
     (p) => {
+      const pitchChanged = JSON.stringify([p.pitch, p.aiRun, p.aiSeen]) !== JSON.stringify([latest.pitch, latest.aiRun, latest.aiSeen]);
       latest = p;
       exportPanel.update(p);
       updateExportButton(p);
       renderNotes(p);
+      if (pitchChanged) {
+        renderPitch();
+        requestDraw();
+      }
     },
     () => undefined,
   );
@@ -1230,8 +1267,103 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     );
     setChildren(notes, box);
   }
-  let latest = project;
   renderNotes(project);
+
+  // ---------------------------------------------------------------------
+  // Mark the pitch (DESIGN.md 4.8)
+  // ---------------------------------------------------------------------
+  const pitchHintKey = `veoclone.hint.pitch.${id}`;
+  const pitchHintDismissed = () => {
+    try {
+      return localStorage.getItem(pitchHintKey) === "dismissed";
+    } catch {
+      return false;
+    }
+  };
+  function dismissPitchHint() {
+    try {
+      localStorage.setItem(pitchHintKey, "dismissed");
+    } catch {
+      // Private mode: hidden until the editor opens again.
+    }
+    setChildren(pitchHint);
+  }
+  /** Does the AI camera path use the pitch outline as it is now? */
+  const pitchInUse = () => (latest.pitch?.id ?? null) === (latest.aiRun?.pitchId ?? null);
+
+  function renderPitch() {
+    const marked = !!latest.pitch;
+    const used = pitchInUse();
+    setChildren(
+      pitchRow,
+      h(
+        "p",
+        { class: `small ${marked && used ? "" : "muted"}` },
+        !marked
+          ? used
+            ? "Pitch not marked: the AI looks at everyone it sees."
+            : "You removed the pitch outline, but the AI camera still uses it until the AI runs again."
+          : used
+            ? "Pitch marked: the AI ignores everyone outside it."
+            : "Pitch marked, but the AI camera doesn't use it yet: run the AI again.",
+      ),
+      h(
+        "div",
+        { class: "row" },
+        button(marked ? "Change the pitch outline" : "Mark the pitch", () => void markPitch(), { icon: I.pencil, class: "btn-small", title: "Click round the pitch so the AI camera ignores people outside it" }),
+        used ? null : button("Run the AI again", () => void rerunAi(), { variant: "primary", class: "btn-small", icon: I.refresh }),
+      ),
+    );
+    if (marked || pitchHintDismissed()) return setChildren(pitchHint);
+    if (pitchHint.firstChild) return;
+    const box = notice(
+      "info",
+      "Mark the pitch so the camera ignores people outside it.",
+      h("p", { class: "small" }, "Substitutes, parents on the touchline or a game on the next pitch can pull the AI camera away from the play."),
+      button("Mark the pitch", () => void markPitch(), { variant: "secondary", class: "btn-small", icon: I.pencil }),
+    );
+    box.dataset.testid = "pitch-hint";
+    box.append(iconButton(I.x, "Hide this tip", () => dismissPitchHint(), "btn-ghost btn-small"));
+    setChildren(pitchHint, box);
+  }
+
+  async function markPitch() {
+    pause();
+    endPeek();
+    const result = await markPitchDialog({ calib, rigTilt: { tilt: rig.tilt.tilt, roll: rig.tilt.roll }, video, existing: latest.pitch ?? null });
+    if (result === null || disposedFlag) return;
+    try {
+      latest = result === "remove" ? await api.clearPitch(id) : await api.setPitch(id, result);
+    } catch (e) {
+      toast(describeError(e).message, "error", 6000);
+      return;
+    }
+    dismissPitchHint();
+    renderPitch();
+    requestDraw();
+    if (pitchInUse()) return;
+    const run = await confirmDialog({
+      title: result === "remove" ? "Pitch outline removed" : "Pitch outline saved",
+      text: [
+        h("p", null, result === "remove" ? "The AI needs to run again to look at everyone again." : "The AI needs to run again to ignore the people outside the pitch."),
+        h("p", { class: "small" }, rerunTime(latest), " Your trims, camera fixes and text are kept."),
+      ],
+      confirm: "Run the AI again",
+      dismiss: "Later",
+    });
+    if (run) await rerunAi();
+  }
+
+  async function rerunAi() {
+    pause();
+    try {
+      await api.process(id);
+      returnToEditorAfterRun(id);
+      location.hash = `#/project/${id}`;
+    } catch (e) {
+      toast(describeError(e).message, "error", 6000);
+    }
+  }
 
   async function fixLens() {
     pause();
@@ -1320,6 +1452,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   updateCutUi();
   updatePlayButton();
   renderSide();
+  renderPitch();
   renderStraightenHint();
   requestDraw();
 

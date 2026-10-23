@@ -19,8 +19,11 @@ use crate::media::{
     Conversion, MatchJob, MatchPlan, ProxyPlan, RunError, WASHED_OUT, check_pair, has_filter,
     make_matching_copy, make_proxy, matching_warning, plan_matching, probe, tile_size,
 };
+use crate::seen::{
+    BALL_CONFIDENCE, Classes, RECORD_CONFIDENCE, RepanSettings, RepanStats, SeenMeta, SeenWriter,
+};
 use crate::store::{
-    CalibSummary, DERIVED_FILES, Fps, ProbeInfo, ProjectMeta, Status, Step, matched_file,
+    AiRun, CalibSummary, DERIVED_FILES, Fps, ProbeInfo, ProjectMeta, Status, Step, matched_file,
     matched_record, new_id, original_file, remove_matched, working_file, write_atomic,
 };
 
@@ -161,9 +164,10 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     progress.step(Step::Calibrate, 1, "Lining up and calibrating the cameras");
     let match_path = dir.join("match.json");
     // One lens per phone, each scaled to its own video.
-    let left_lens = choose_lens(meta.lens_id.as_deref(), lp.width, lp.height);
+    let left_lens = choose_lens(meta.lens_id.as_deref(), &left, lp.width, lp.height);
     let right_lens = choose_lens(
         meta.right_lens_id.as_deref().or(meta.lens_id.as_deref()),
+        &right,
         rp.width,
         rp.height,
     );
@@ -178,6 +182,7 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
             for f in ["proxy.mp4", "calib.json", "ai_path.bin"] {
                 let _ = std::fs::remove_file(dir.join(f));
             }
+            crate::seen::remove(&dir);
             for (side, lens) in [("Left", &left_lens), ("Right", &right_lens)] {
                 tracing::info!(
                     "{side} lens: {} (fx {:.1}, k1 {:.4})",
@@ -273,28 +278,36 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     }
     cancelled(cancel)?;
 
-    // 4. AI tracking.
-    progress.step(Step::Track, 3, "AI ball tracking");
-    if meta.safe_mode() {
-        warnings.push(
-            "VeoClone stopped while working on this match before, so it now uses a slower \
-             but safer way. This takes longer."
-                .into(),
-        );
-        set_warnings(ctx, id, &warnings);
-    }
-    let path = track(
-        ctx,
-        &dir,
-        &left,
-        &right,
-        &match_path,
-        &meta,
-        fps,
-        frame_count,
-        &progress,
-        cancel,
-    )?;
+    // 4. AI tracking: quick when what the AI saw last time can be used.
+    let path = match usable_recording(ctx, &dir, &meta, summary.sync_offset_frames) {
+        Some(seen) => {
+            progress.step(Step::Track, 3, "Using what the AI saw last time");
+            repan_recorded(&dir, &match_path, &meta, &seen, &progress)?
+        }
+        None => {
+            progress.step(Step::Track, 3, "AI ball tracking");
+            if meta.safe_mode() {
+                warnings.push(
+                    "VeoClone stopped while working on this match before, so it now uses a \
+                     slower but safer way. This takes longer."
+                        .into(),
+                );
+                set_warnings(ctx, id, &warnings);
+            }
+            track(
+                ctx,
+                &dir,
+                &left,
+                &right,
+                &match_path,
+                &meta,
+                fps,
+                frame_count,
+                &progress,
+                cancel,
+            )?
+        }
+    };
     // Reco's own pairing decides the true length; trust it over the probe.
     let frame_count = path.len() as u64;
     write_atomic(&dir.join("ai_path.bin"), &encode_path(&path))
@@ -312,7 +325,15 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
         &serde_json::to_vec(&info).expect("json"),
     )
     .map_err(|e| JobError::failed("We couldn't save the calibration.", e))?;
-    store.update(id, |m| m.frame_count = Some(frame_count));
+    let ai_run = AiRun {
+        style: meta.style,
+        ai_accuracy: meta.ai_accuracy,
+        pitch_id: meta.pitch.as_ref().map(|p| p.id.clone()),
+    };
+    store.update(id, |m| {
+        m.frame_count = Some(frame_count);
+        m.ai_run = Some(ai_run);
+    });
     Ok(())
 }
 
@@ -423,6 +444,7 @@ fn match_videos(
         for f in DERIVED_FILES {
             let _ = std::fs::remove_file(dir.join(f));
         }
+        crate::seen::remove(dir);
     }
     if todo.is_empty() {
         return Ok(copies);
@@ -616,6 +638,15 @@ fn calibrate(
         cal.sync_offset,
         result.total_matches
     );
+    if cal.rig_tilt != 0.0 || cal.rig_roll != 0.0 {
+        // GoPro / DJI: kept as is; the editor's Straighten picture starts
+        // from it and the AI pass renders with it.
+        tracing::info!(
+            "The cameras measured their own level: tilt {:.1} deg, roll {:.1} deg",
+            cal.rig_tilt.to_degrees(),
+            cal.rig_roll.to_degrees()
+        );
+    }
     write_atomic(match_path, cal.to_json_pretty().as_bytes())
         .map_err(|e| JobError::failed("We couldn't save the calibration.", e))?;
     // Check it now, not after the long preview step.
@@ -628,8 +659,102 @@ fn calibrate(
     })
 }
 
+/// Reco's lookahead (seconds), as reco-gui's default.
+const LOOKAHEAD_SECS: f64 = 1.5;
+
+/// The lookahead in frames, worked out exactly like `StitchJob::run`.
+fn lookahead_frames(left: &Path) -> usize {
+    let fps = reco_io::adapters::FfmpegFileSource::frame_rate(left)
+        .map(|(n, d)| if d != 0 { n as f64 / d as f64 } else { 30.0 })
+        .unwrap_or(30.0);
+    (LOOKAHEAD_SECS * fps).round() as usize
+}
+
+/// What the AI needs from the match settings.
+fn repan_settings(meta: &ProjectMeta) -> RepanSettings {
+    RepanSettings {
+        style: meta.style,
+        every: meta.ai_accuracy.interval(),
+        roi: meta.pitch.as_ref().map(|p| p.field_roi()),
+    }
+}
+
+/// A recording of what the AI saw that can make the AI path for these
+/// settings without going through the video again (DESIGN.md 4.9).
+fn usable_recording(
+    ctx: &Context,
+    dir: &Path,
+    meta: &ProjectMeta,
+    sync_offset: i64,
+) -> Option<SeenMeta> {
+    let seen = crate::seen::read_meta(dir)?;
+    let (model, bytes) = crate::seen::model_identity(ctx.model.as_deref()?);
+    let ok = seen.model == model
+        && seen.model_bytes == bytes
+        && seen.sync_offset == sync_offset
+        && meta.ai_accuracy.interval().is_multiple_of(seen.every);
+    if !ok {
+        tracing::info!(
+            "What the AI saw last time can't be used for this run (it looked at every {} \
+             frame(s) with {}; now every {} with {model}): the AI goes through the video again",
+            seen.every,
+            seen.model,
+            meta.ai_accuracy.interval()
+        );
+    }
+    ok.then_some(seen)
+}
+
+/// The quick re-run: the AI path from the recording of an earlier AI pass.
+fn repan_recorded(
+    dir: &Path,
+    match_path: &Path,
+    meta: &ProjectMeta,
+    seen: &SeenMeta,
+    progress: &Progress,
+) -> Result<Vec<[f32; 3]>, JobError> {
+    let started = std::time::Instant::now();
+    let fail = |e: String| {
+        JobError::failed(
+            "VeoClone couldn't reuse what the AI saw last time. Press Try again: the AI then \
+             goes through the whole video again.",
+            e,
+        )
+    };
+    let cal = MatchCalibration::from_file(match_path).map_err(|e| fail(e.to_string()))?;
+    progress.fraction(0.1, Some("Reading what the AI saw last time"));
+    let frames = crate::seen::read_frames(&dir.join(crate::seen::SEEN_DATA)).map_err(|e| {
+        crate::seen::remove(dir);
+        fail(e.to_string())
+    })?;
+    progress.fraction(0.4, Some("Steering the camera again"));
+    let settings = repan_settings(meta);
+    let (poses, stats) = crate::seen::repan(&cal, seen, &frames, &settings).map_err(|e| {
+        crate::seen::remove(dir);
+        fail(e)
+    })?;
+    log_stats(&settings, &stats);
+    tracing::info!(
+        "Quick re-run: AI path for {} frames made in {:.2} s from what the AI saw",
+        poses.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(fill_path(&poses, seen.frames as usize))
+}
+
+fn log_stats(settings: &RepanSettings, stats: &RepanStats) {
+    if settings.roi.is_some() {
+        tracing::info!(
+            "Pitch outline: {} of the {} people and balls the AI found were outside the pitch \
+             and ignored",
+            stats.outside_pitch,
+            stats.seen
+        );
+    }
+}
+
 /// Run Reco's AI camera (exactly like reco-gui's export) and keep only the
-/// per-frame camera poses.
+/// per-frame camera poses, and record what the AI saw (crate::seen).
 #[allow(clippy::too_many_arguments)]
 fn track(
     ctx: &Context,
@@ -654,20 +779,67 @@ fn track(
     let setup_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicU64::new(0));
+    let source_fps: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
 
     let sink = PoseSink {
         poses: poses.clone(),
         max_frames: frame_count as usize * 2 + 10_000,
     };
     let preset = meta.style.preset();
-    let field_roi = cal.field_roi.clone();
+    let mode = meta.style.tracking_mode();
+    let interval = meta.ai_accuracy.interval();
+    tracing::info!(
+        "Camera style: {:?} (Reco {mode:?} tracking, {preset} preset); AI accuracy {:?} (the AI \
+         looks at every {})",
+        meta.style,
+        meta.ai_accuracy,
+        if interval == 1 {
+            "frame".to_string()
+        } else {
+            format!("{interval}rd frame")
+        }
+    );
+    // The model's classes, the way setup_autocam reads them.
+    let names = reco_detect::create_ort_session(&model, Vec::new())
+        .map(|(_, _, names)| names)
+        .unwrap_or_default();
+    let classes = Classes::from_names(&names);
+    let (model_name, model_bytes) = crate::seen::model_identity(&model);
+    // "Mark the pitch": people and balls outside it are ignored.
+    let settings = repan_settings(meta);
+    let field_roi = match &settings.roi {
+        Some(roi) => {
+            tracing::info!(
+                "Pitch outline: the AI ignores everything outside it ({} and {} corners)",
+                roi.left.len(),
+                roi.right.len()
+            );
+            Some(roi.clone())
+        }
+        None => cal
+            .field_roi
+            .clone()
+            .filter(|r| r.left.len() >= 3 || r.right.len() >= 3),
+    };
+    // What the AI saw, for quick re-runs; the AI pass goes on without it if
+    // it can't be written.
+    let recording = dir.join(format!("ai_seen.{}.tmp.gz", new_id()));
+    let writer = match SeenWriter::create(&recording, classes) {
+        Ok(w) => Some(Arc::new(Mutex::new(w))),
+        Err(e) => {
+            tracing::warn!("Can't record what the AI sees: {e}");
+            None
+        }
+    };
+    let hook_writer = writer.clone();
     let hook_error = setup_error.clone();
     let hook_stop = stop.clone();
+    let hook_fps = source_fps.clone();
     let d = done.clone();
     let job = reco_io::StitchJob::with_calibration(
         PathBuf::from(left),
         PathBuf::from(right),
-        cal,
+        cal.clone(),
         scratch.clone(),
     )
     .codec(reco_io::output::Codec::H264)
@@ -676,23 +848,35 @@ fn track(
     .audio(reco_io::output::AudioMode::Disabled)
     .resolution(640, 360)
     .blend_width(BLEND_WIDTH)
-    .lookahead(1.5)
+    .lookahead(LOOKAHEAD_SECS)
     .on_progress(move |p| d.store(p.frames_completed, Ordering::Relaxed))
     .on_session(move |session, source| {
         let info = source.info();
+        *hook_fps.lock().unwrap_or_else(|p| p.into_inner()) = Some(info.fps as f32);
         let is_10bit =
             source.gpu_pixel_format() == reco_core::render::renderer::GpuPixelFormat::P010;
+        // Reco's own setup, except that the detector always finds
+        // everything at the field-mode floor so the recording suits every
+        // style; the ball-mode floor and the pitch outline are applied
+        // after the recorder (crate::seen::wrap_detector), which gives the
+        // trackers exactly the detections Reco's own setup would.
         let mut config = reco_autocam::AutocamConfig::new(&model)
-            .with_tracking_mode(reco_autocam::TrackingMode::Field)
-            .with_detection_interval(3)
+            .with_tracking_mode(mode)
+            .with_detection_interval(interval)
             .with_10bit(is_10bit);
         config.field_panner_config =
             reco_autocam::panners::FieldPannerConfig::from_preset_name(preset);
-        if let Some(roi) = field_roi {
-            config = config.with_field_roi(roi);
-        }
+        config.confidence_threshold = Some(RECORD_CONFIDENCE);
+        let min_confidence = (mode == reco_autocam::TrackingMode::Ball).then_some(BALL_CONFIDENCE);
+        let roi = field_roi.map(|r| (r, classes.roi_person));
+        let mut target = crate::seen::Wiring {
+            session: &mut *session,
+            wrap: Some(move |detector| {
+                crate::seen::wrap_detector(detector, hook_writer, min_confidence, roi)
+            }),
+        };
         let error = match reco_autocam::setup_autocam(
-            session,
+            &mut target,
             &config,
             info.fps as f32,
             source.is_gpu_resident(),
@@ -734,16 +918,30 @@ fn track(
         r
     });
     let _ = std::fs::remove_file(&scratch);
+    // Finished here so a failed or cancelled pass leaves nothing behind.
+    let recorded = writer.map(|w| {
+        let r = w.lock().unwrap_or_else(|p| p.into_inner()).finish();
+        r.map(|_| ())
+    });
+    let discard = || {
+        let _ = std::fs::remove_file(&recording);
+    };
 
     if let Some(e) = setup_error.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        discard();
         return Err(JobError::failed(
             "The AI ball tracking could not start. Please download VeoClone again.",
             e,
         ));
     }
-    cancelled(cancel)?;
-    let r =
-        result.map_err(|e| JobError::failed("The AI ball tracking stopped with an error.", e))?;
+    if cancel.load(Ordering::SeqCst) {
+        discard();
+        return Err(JobError::Cancelled);
+    }
+    let r = result.map_err(|e| {
+        discard();
+        JobError::failed("The AI ball tracking stopped with an error.", e)
+    })?;
     tracing::info!(
         "AI pass: {} frames in {:.0} s ({}, encoder {})",
         r.frames_processed,
@@ -754,6 +952,7 @@ fn track(
     let poses = poses.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let decided = poses.iter().filter(|p| p.is_some()).count();
     if decided == 0 {
+        discard();
         return Err(JobError::failed(
             "The AI ball tracking produced no camera path.",
             "no pan decisions",
@@ -772,6 +971,7 @@ fn track(
     // quietly cut the match short.
     let expected = proxy_frames.unwrap_or(frame_count);
     if stopped_early(frames as u64, expected, fps) {
+        discard();
         return Err(JobError::failed(
             format!(
                 "We could only read the first {} of the videos. {DAMAGED}",
@@ -780,7 +980,81 @@ fn track(
             format!("AI pass saw {frames} of {expected} frames"),
         ));
     }
-    Ok(fill_path(&poses, frames))
+    let path = fill_path(&poses, frames);
+
+    // Keep the recording if it gives back exactly this path.
+    let seen_meta = SeenMeta {
+        version: crate::seen::VERSION,
+        model: model_name,
+        model_bytes,
+        classes,
+        fps: source_fps
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or(fps.as_f64() as f32),
+        lookahead_frames: lookahead_frames(left),
+        every: interval,
+        frames: frames as u64,
+        sync_offset: cal.sync_offset,
+    };
+    match recorded {
+        Some(Ok(())) => keep_recording(dir, &cal, &recording, &seen_meta, &settings, &path),
+        Some(Err(e)) => {
+            tracing::warn!("What the AI saw could not be saved ({e}); re-runs take the long way");
+            discard();
+        }
+        None => {}
+    }
+    Ok(path)
+}
+
+/// Check the recording against the AI pass (the same settings must give the
+/// same path) and keep it for quick re-runs, replacing the earlier one.
+fn keep_recording(
+    dir: &Path,
+    cal: &MatchCalibration,
+    recording: &Path,
+    seen: &SeenMeta,
+    settings: &RepanSettings,
+    live: &[[f32; 3]],
+) {
+    let started = std::time::Instant::now();
+    let checked = crate::seen::read_frames(recording)
+        .map_err(|e| e.to_string())
+        .and_then(|frames| crate::seen::repan(cal, seen, &frames, settings));
+    let ok = match checked {
+        Ok((poses, stats)) => {
+            log_stats(settings, &stats);
+            let replay = fill_path(&poses, seen.frames as usize);
+            let [dy, dp, df] = crate::seen::max_difference(&replay, live);
+            tracing::info!(
+                "What the AI saw: {} bytes; replaying it gives the same camera path (largest \
+                 difference: yaw {dy:.2e} rad, pitch {dp:.2e} rad, zoom {df:.2e} deg; checked \
+                 in {:.2} s)",
+                std::fs::metadata(recording).map(|m| m.len()).unwrap_or(0),
+                started.elapsed().as_secs_f64()
+            );
+            dy <= 1e-4 && dp <= 1e-4 && df <= 1e-3
+        }
+        Err(e) => {
+            tracing::warn!("What the AI saw can't be replayed: {e}");
+            false
+        }
+    };
+    let saved = ok
+        && std::fs::rename(recording, dir.join(crate::seen::SEEN_DATA)).is_ok()
+        && write_atomic(
+            &dir.join(crate::seen::SEEN_META),
+            &serde_json::to_vec_pretty(seen).expect("json"),
+        )
+        .is_ok();
+    if !saved {
+        tracing::warn!(
+            "What the AI saw is not kept: changing the style will go through the video again"
+        );
+        let _ = std::fs::remove_file(recording);
+        crate::seen::remove(dir);
+    }
 }
 
 /// Fewer frames than expected by more than two seconds' worth.
@@ -804,8 +1078,9 @@ mod tests {
 
     #[test]
     fn lens_per_phone_summary() {
-        let left = choose_lens(Some("iphone-13-pro-max:ultra"), 1920, 1080);
-        let right = choose_lens(Some("iphone-11:ultra"), 1920, 1080);
+        let none = Path::new("");
+        let left = choose_lens(Some("iphone-13-pro-max:ultra"), none, 1920, 1080);
+        let right = choose_lens(Some("iphone-11:ultra"), none, 1920, 1080);
         assert_ne!(left.params.fx, right.params.fx);
         assert_eq!(
             lens_summary(&left, &right),

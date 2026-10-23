@@ -25,17 +25,96 @@ pub enum Style {
     Broadcast,
     Action,
     FrameAll,
+    /// "Follow the ball": Reco's ball tracking mode (no player cluster).
+    Ball,
 }
 
 impl Style {
-    /// Reco FieldPanner preset name.
+    /// Reco FieldPanner preset name. Ball mode starts from the broadcast
+    /// preset like reco-gui does; Reco then forces `ball_weight` to 1.0.
     pub fn preset(self) -> &'static str {
         match self {
-            Style::Broadcast => "broadcast",
+            Style::Broadcast | Style::Ball => "broadcast",
             Style::Action => "action",
             Style::FrameAll => "frame_all",
         }
     }
+
+    /// Reco's tracking mode: the ball alone, or the players and the ball.
+    pub fn tracking_mode(self) -> reco_autocam::TrackingMode {
+        match self {
+            Style::Ball => reco_autocam::TrackingMode::Ball,
+            _ => reco_autocam::TrackingMode::Field,
+        }
+    }
+}
+
+/// "AI accuracy": how often the AI looks at the picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiAccuracy {
+    /// Every frame (Reco's detection interval 1).
+    #[default]
+    Best,
+    /// Every 3rd frame (reco-gui's default), about 3 times less AI work.
+    Faster,
+}
+
+impl AiAccuracy {
+    /// Reco's detection interval: run the AI on every Nth frame.
+    pub fn interval(self) -> u64 {
+        match self {
+            AiAccuracy::Best => 1,
+            AiAccuracy::Faster => 3,
+        }
+    }
+}
+
+/// "Mark the pitch": the outline the user clicked in the editor and, per
+/// camera, the image polygon Reco's field ROI filter uses (match.json
+/// `field_roi`, normalised `[x, y]` with y = 0 at the top).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PitchOutline {
+    /// Changes with every save, so the editor can tell whether the AI
+    /// path was made with this outline.
+    pub id: String,
+    /// The outline as clicked: `[yaw, pitch]` radians of each corner.
+    pub points: Vec<[f64; 2]>,
+    /// The left camera's polygon; empty when it sees none of the pitch.
+    pub left: Vec<[f64; 2]>,
+    /// The right camera's polygon; empty when it sees none of the pitch.
+    pub right: Vec<[f64; 2]>,
+}
+
+impl PitchOutline {
+    /// Reco's field ROI. Reco ignores a camera whose polygon has fewer
+    /// than 3 corners (it keeps everything that camera sees), so a camera
+    /// that sees none of the pitch gets a polygon outside its picture:
+    /// everything it sees is off the pitch.
+    pub fn field_roi(&self) -> reco_core::calibration::FieldRoi {
+        const NOWHERE: [[f64; 2]; 3] = [[-2.0, -2.0], [-1.0, -2.0], [-2.0, -1.0]];
+        let side = |p: &Vec<[f64; 2]>| {
+            if p.len() >= 3 {
+                p.clone()
+            } else {
+                NOWHERE.to_vec()
+            }
+        };
+        reco_core::calibration::FieldRoi {
+            left: side(&self.left),
+            right: side(&self.right),
+        }
+    }
+}
+
+/// The settings the current AI camera path was made with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRun {
+    pub style: Style,
+    pub ai_accuracy: AiAccuracy,
+    /// `PitchOutline::id` of the outline used, if any.
+    pub pitch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +296,21 @@ pub struct ProjectMeta {
     #[serde(default)]
     pub right_lens_id: Option<String>,
     pub style: Style,
+    /// How often the AI looks at the picture (missing in older matches:
+    /// every frame).
+    #[serde(default)]
+    pub ai_accuracy: AiAccuracy,
+    /// "Mark the pitch" (none: the AI looks everywhere).
+    #[serde(default)]
+    pub pitch: Option<PitchOutline>,
+    /// What the current AI camera path was made with (none: not known,
+    /// e.g. a match from an older VeoClone).
+    #[serde(default)]
+    pub ai_run: Option<AiRun>,
+    /// What the AI saw last time is kept, so a new style, AI accuracy or
+    /// pitch outline runs again in seconds (filled in when read).
+    #[serde(default)]
+    pub ai_seen: Option<crate::seen::SeenSummary>,
     pub status: Status,
     pub files: Files,
     pub job: Option<JobInfo>,
@@ -382,14 +476,18 @@ impl Store {
         let mut all: Vec<ProjectMeta> = self.lock().values().map(|e| e.meta.clone()).collect();
         all.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
         for m in &mut all {
-            m.disk_bytes = dir_size(&self.project_dir(&m.id));
+            let dir = self.project_dir(&m.id);
+            m.disk_bytes = dir_size(&dir);
+            m.ai_seen = crate::seen::summary(&dir);
         }
         all
     }
 
     pub fn get(&self, id: &str) -> Option<ProjectMeta> {
         let mut meta = self.lock().get(id)?.meta.clone();
-        meta.disk_bytes = dir_size(&self.project_dir(id));
+        let dir = self.project_dir(id);
+        meta.disk_bytes = dir_size(&dir);
+        meta.ai_seen = crate::seen::summary(&dir);
         Some(meta)
     }
 
@@ -492,6 +590,10 @@ fn recovered_meta(id: &str, dir: &Path) -> ProjectMeta {
         lens_id: None,
         right_lens_id: None,
         style: Style::Broadcast,
+        ai_accuracy: AiAccuracy::Best,
+        pitch: None,
+        ai_run: None,
+        ai_seen: None,
         status: Status::Failed,
         files,
         job: None,
@@ -664,6 +766,10 @@ pub(crate) mod tests {
             lens_id: None,
             right_lens_id: None,
             style: Style::Broadcast,
+            ai_accuracy: AiAccuracy::Best,
+            pitch: None,
+            ai_run: None,
+            ai_seen: None,
             status: Status::New,
             files: Files::default(),
             job: None,
@@ -700,6 +806,9 @@ pub(crate) mod tests {
         assert_eq!(v["job"], serde_json::Value::Null);
         assert_eq!(v["error"], serde_json::Value::Null);
         assert_eq!(v["style"], "frame_all");
+        assert_eq!(v["aiAccuracy"], "best");
+        assert_eq!(v["pitch"], serde_json::Value::Null);
+        assert_eq!(v["aiRun"], serde_json::Value::Null);
         assert_eq!(v["status"], "new");
         assert_eq!(v["files"], serde_json::json!({}));
         assert!(v.get("calibration").is_none());
@@ -891,6 +1000,61 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
         assert!(write_atomic(&tmp.path().join("missing").join("b.json"), b"x").is_err());
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    /// "Follow the ball" is Reco's ball mode; the others are field mode.
+    #[test]
+    fn styles() {
+        use reco_autocam::TrackingMode;
+        let ball: Style = serde_json::from_str("\"ball\"").unwrap();
+        assert_eq!(ball, Style::Ball);
+        assert_eq!(serde_json::to_value(Style::Ball).unwrap(), "ball");
+        assert_eq!(ball.tracking_mode(), TrackingMode::Ball);
+        assert_eq!(ball.preset(), "broadcast");
+        for s in [Style::Broadcast, Style::Action, Style::FrameAll] {
+            assert_eq!(s.tracking_mode(), TrackingMode::Field);
+            assert!(
+                reco_autocam::panners::FieldPannerConfig::from_preset_name(s.preset()).is_some()
+            );
+        }
+        assert!(serde_json::from_str::<Style>("\"wild\"").is_err());
+    }
+
+    /// A camera that sees none of the pitch ignores everything it sees.
+    #[test]
+    fn pitch_outline_as_field_roi() {
+        let square = vec![[0.1, 0.5], [0.9, 0.5], [0.9, 0.9], [0.1, 0.9]];
+        let p = PitchOutline {
+            id: "x".into(),
+            points: vec![[0.0, 0.0]; 4],
+            left: square.clone(),
+            right: vec![],
+        };
+        let roi = p.field_roi();
+        assert_eq!(roi.left, square);
+        assert_eq!(roi.right.len(), 3);
+        use reco_core::projection::point_in_polygon;
+        for x in 0..=10 {
+            for y in 0..=10 {
+                let q = [x as f64 / 10.0, y as f64 / 10.0];
+                assert!(!point_in_polygon(q, &roi.right), "{q:?}");
+            }
+        }
+        assert!(point_in_polygon([0.5, 0.7], &roi.left));
+        assert!(!point_in_polygon([0.5, 0.2], &roi.left));
+    }
+
+    /// Every frame by default, also for matches from older versions.
+    #[test]
+    fn ai_accuracy() {
+        assert_eq!(AiAccuracy::default().interval(), 1);
+        assert_eq!(AiAccuracy::Faster.interval(), 3);
+        let mut v = serde_json::to_value(sample("a1")).unwrap();
+        v.as_object_mut().unwrap().remove("aiAccuracy");
+        let m: ProjectMeta = serde_json::from_value(v).unwrap();
+        assert_eq!(m.ai_accuracy, AiAccuracy::Best);
+        let f: AiAccuracy = serde_json::from_str("\"faster\"").unwrap();
+        assert_eq!(f, AiAccuracy::Faster);
     }
 
     #[test]

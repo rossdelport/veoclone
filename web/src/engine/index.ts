@@ -20,3 +20,4 @@ export {
   type YawPitch,
 } from "./rigtilt";
 export * from "./look";
+export * from "./pitch";

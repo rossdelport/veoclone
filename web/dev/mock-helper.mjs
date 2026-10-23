@@ -50,12 +50,14 @@ const PROXY = join(FIX, "proxy.mp4");
 let projects = new Map();
 /** @type {Map<string, any>} */
 let edits = new Map();
-let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0 };
+let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0 };
 const timers = new Map(); // project id -> interval
 const uploads = new Map(); // project id -> uploads in progress
 const previous = new Map(); // project id -> the ready result a re-run started from
 const madeWith = new Map(); // project id -> camera style of the AI result on "disk"
 
+const STYLES = ["broadcast", "action", "frame_all", "ball"];
+const ACCURACY = ["best", "faster"];
 const BUSY = "VeoClone is still working on this match. Press Stop first, or wait until it has finished.";
 const GENERIC_LENS =
   "We didn't know which iPhone filmed this, so a typical iPhone lens was used. If the picture looks bent or the two halves don't join, use “Change phone or lens”.";
@@ -71,10 +73,10 @@ function probe(name) {
   };
 }
 
-function newProject({ name, lensId = null, rightLensId = null, style = "broadcast" }) {
+function newProject({ name, lensId = null, rightLensId = null, style = "broadcast", aiAccuracy = "best" }) {
   const t = now();
   return {
-    id: newId(), name, createdAt: t, updatedAt: t, lensId, rightLensId, style, status: "new",
+    id: newId(), name, createdAt: t, updatedAt: t, lensId, rightLensId, style, aiAccuracy, pitch: null, aiRun: null, aiSeen: null, status: "new",
     files: {}, job: null, error: null, warnings: [], diskBytes: 0, exports: [],
   };
 }
@@ -93,6 +95,8 @@ function seed() {
     warnings: [GENERIC_LENS],
     calibration: { confidence: 1, syncOffsetFrames: 12, syncOffsetSeconds: 0.4, lens: "Not sure · Ultra wide (0.5×)" },
     fps: FPS, frameCount: FRAME_COUNT, diskBytes: 4_538_000,
+    aiRun: { style: "broadcast", aiAccuracy: "best", pitchId: null },
+    aiSeen: { every: 1 },
   });
   projects.set(p.id, p);
   madeWith.set(p.id, p.style);
@@ -184,6 +188,9 @@ function startProcess(p) {
     onDone: () => {
       previous.delete(p.id);
       madeWith.set(p.id, p.style);
+      p.aiRun = { style: p.style, aiAccuracy: p.aiAccuracy ?? "best", pitchId: p.pitch?.id ?? null };
+      // Like the real helper: what the AI saw is kept for quick re-runs.
+      p.aiSeen = { every: p.aiAccuracy === "faster" ? 3 : 1 };
       p.status = "ready";
       p.fps = FPS;
       p.frameCount = FRAME_COUNT;
@@ -373,7 +380,7 @@ async function handle(req, res) {
       timers.clear();
       projects = new Map();
       edits = new Map();
-      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0 };
+      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0 };
       uploads.clear();
       previous.clear();
       if (url.searchParams.has("seed")) seed();
@@ -412,8 +419,10 @@ async function handle(req, res) {
       for (const id of [body.lensId, body.rightLensId]) {
         if (id && !lenses.some((l) => l.id === id)) return fail(res, 400, "That iPhone model is not in the list.");
       }
+      if (body.style !== undefined && body.style !== null && !STYLES.includes(body.style)) return fail(res, 400, "Unknown camera style.");
+      if (body.aiAccuracy !== undefined && body.aiAccuracy !== null && !ACCURACY.includes(body.aiAccuracy)) return fail(res, 400, "Unknown AI accuracy.");
       if (body.lensId === undefined) body.lensId = null;
-      const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, rightLensId: body.rightLensId ?? null, style: body.style ?? "broadcast" });
+      const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, rightLensId: body.rightLensId ?? null, style: body.style ?? "broadcast", aiAccuracy: body.aiAccuracy ?? "best" });
       projects.set(p.id, p);
       return send(res, 201, p);
     }
@@ -432,18 +441,23 @@ async function handle(req, res) {
       for (const key of ["lensId", "rightLensId"]) {
         if (body && key in body && body[key] !== null && !lenses.some((l) => l.id === body[key])) return fail(res, 400, "That iPhone model is not in the list.");
       }
-      if ((body?.lensId !== undefined || body?.rightLensId !== undefined || body?.style) && busy(p)) return fail(res, 409, BUSY);
+      if (body?.style && !STYLES.includes(body.style)) return fail(res, 400, "Unknown camera style.");
+      if (body?.aiAccuracy && !ACCURACY.includes(body.aiAccuracy)) return fail(res, 400, "Unknown AI accuracy.");
+      if ((body?.lensId !== undefined || body?.rightLensId !== undefined || body?.style || body?.aiAccuracy) && busy(p)) return fail(res, 409, BUSY);
       if (typeof body?.name === "string") p.name = body.name.trim() || p.name;
       if (body && "lensId" in body && body.lensId !== p.lensId) {
         p.lensId = body.lensId;
         delete p.calibration; // the next "process" lines the videos up again
+        p.aiSeen = null; // and the AI watches the whole match again
       }
       // null: the right phone is the same model as the left one.
       if (body && "rightLensId" in body && body.rightLensId !== (p.rightLensId ?? null)) {
         p.rightLensId = body.rightLensId;
         delete p.calibration;
+        p.aiSeen = null;
       }
       if (body?.style) p.style = body.style;
+      if (body?.aiAccuracy) p.aiAccuracy = body.aiAccuracy;
       p.updatedAt = now();
       return send(res, 200, p);
     }
@@ -473,6 +487,9 @@ async function handle(req, res) {
       p.files[side] = { name, sizeBytes: size };
       p.status = p.files.left && p.files.right ? "uploaded" : "new";
       delete p.calibration;
+      p.pitch = null; // marked on the old video
+      p.aiRun = null;
+      p.aiSeen = null;
       previous.delete(p.id);
       p.error = null;
       p.warnings = [];
@@ -498,7 +515,7 @@ async function handle(req, res) {
       if (p.rightLensId) [p.lensId, p.rightLensId] = [p.rightLensId, p.lensId ?? "generic:ultra"]; // each phone keeps its lens
       delete p.calibration;
       previous.delete(p.id);
-      Object.assign(p, { status: "uploaded", error: null, warnings: [], updatedAt: now() });
+      Object.assign(p, { status: "uploaded", error: null, warnings: [], updatedAt: now(), pitch: null, aiRun: null, aiSeen: null });
       mock.swaps++;
       return send(res, 200, p);
     case "GET calibration":
@@ -526,6 +543,22 @@ async function handle(req, res) {
       mock.editsPuts++;
       return send(res, 200, { ok: true });
     }
+    case "PUT pitch": {
+      // Like the real helper (api.rs validate_pitch).
+      const body = await readJson(req);
+      const bad = "The pitch outline was not understood. Please mark the pitch again.";
+      const pair = (q) => Array.isArray(q) && q.length === 2 && q.every(Number.isFinite);
+      const polygon = (a) => Array.isArray(a) && (a.length === 0 || (a.length >= 3 && a.length <= 500)) && a.every((q) => pair(q) && q.every((v) => v >= -0.01 && v <= 1.01));
+      if (!body || !Array.isArray(body.points) || body.points.length < 3 || body.points.length > 100 || !body.points.every(pair)) return fail(res, 400, bad);
+      if (!polygon(body.left) || !polygon(body.right)) return fail(res, 400, bad);
+      if (!body.left.length && !body.right.length) return fail(res, 400, "The outline does not cover any part of the two videos. Click the corners of the pitch on the picture.");
+      p.pitch = { id: newId(), points: body.points, left: body.left, right: body.right };
+      mock.pitchPuts++;
+      return send(res, 200, p);
+    }
+    case "DELETE pitch":
+      p.pitch = null;
+      return send(res, 200, p);
     case "POST exports": {
       if (p.status !== "ready") return fail(res, 409, "This match is not ready to export yet. Wait until processing has finished.");
       if (busy(p)) return fail(res, 409, BUSY);

@@ -1,60 +1,524 @@
 [
-  {"id": "generic:ultra", "model": "Not sure", "lens": "ultra", "label": "Not sure · Ultra wide (0.5×)", "note": "Uses a typical recent iPhone profile."},
-  {"id": "generic:main", "model": "Not sure", "lens": "main", "label": "Not sure · Normal (1×)", "note": "Uses a typical recent iPhone profile."},
-  {"id": "iphone-17-pro-max:ultra", "model": "iPhone 17 Pro Max", "lens": "ultra", "label": "iPhone 17 Pro Max · Ultra wide (0.5×)", "note": "Uses the iPhone 15 Pro Max profile (closest match)"},
-  {"id": "iphone-17-pro-max:main", "model": "iPhone 17 Pro Max", "lens": "main", "label": "iPhone 17 Pro Max · Normal (1×)", "note": "Uses the iPhone 15 Pro Max profile (closest match)"},
-  {"id": "iphone-17-pro:ultra", "model": "iPhone 17 Pro", "lens": "ultra", "label": "iPhone 17 Pro · Ultra wide (0.5×)", "note": "Uses the iPhone 15 Pro profile (closest match)"},
-  {"id": "iphone-17-pro:main", "model": "iPhone 17 Pro", "lens": "main", "label": "iPhone 17 Pro · Normal (1×)", "note": "Uses the iPhone 15 Pro profile (closest match)"},
-  {"id": "iphone-air:ultra", "model": "iPhone Air", "lens": "ultra", "label": "iPhone Air · Ultra wide (0.5×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-air:main", "model": "iPhone Air", "lens": "main", "label": "iPhone Air · Normal (1×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-17:ultra", "model": "iPhone 17", "lens": "ultra", "label": "iPhone 17 · Ultra wide (0.5×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-17:main", "model": "iPhone 17", "lens": "main", "label": "iPhone 17 · Normal (1×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-16-pro-max:ultra", "model": "iPhone 16 Pro Max", "lens": "ultra", "label": "iPhone 16 Pro Max · Ultra wide (0.5×)", "note": "Uses the iPhone 15 Pro Max profile (closest match)"},
-  {"id": "iphone-16-pro-max:main", "model": "iPhone 16 Pro Max", "lens": "main", "label": "iPhone 16 Pro Max · Normal (1×)", "note": "Uses the iPhone 15 Pro Max profile (closest match)"},
-  {"id": "iphone-16-pro:ultra", "model": "iPhone 16 Pro", "lens": "ultra", "label": "iPhone 16 Pro · Ultra wide (0.5×)", "note": "Uses the iPhone 15 Pro profile (closest match)"},
-  {"id": "iphone-16-pro:main", "model": "iPhone 16 Pro", "lens": "main", "label": "iPhone 16 Pro · Normal (1×)", "note": "Uses the iPhone 15 Pro profile (closest match)"},
-  {"id": "iphone-16-plus:ultra", "model": "iPhone 16 Plus", "lens": "ultra", "label": "iPhone 16 Plus · Ultra wide (0.5×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-16-plus:main", "model": "iPhone 16 Plus", "lens": "main", "label": "iPhone 16 Plus · Normal (1×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-16:ultra", "model": "iPhone 16", "lens": "ultra", "label": "iPhone 16 · Ultra wide (0.5×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-16:main", "model": "iPhone 16", "lens": "main", "label": "iPhone 16 · Normal (1×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-16e:ultra", "model": "iPhone 16e", "lens": "ultra", "label": "iPhone 16e · Ultra wide (0.5×)", "note": "Uses the iPhone 14 profile (closest match)"},
-  {"id": "iphone-16e:main", "model": "iPhone 16e", "lens": "main", "label": "iPhone 16e · Normal (1×)", "note": "Uses the iPhone 14 profile (closest match)"},
-  {"id": "iphone-15-pro-max:ultra", "model": "iPhone 15 Pro Max", "lens": "ultra", "label": "iPhone 15 Pro Max · Ultra wide (0.5×)"},
-  {"id": "iphone-15-pro-max:main", "model": "iPhone 15 Pro Max", "lens": "main", "label": "iPhone 15 Pro Max · Normal (1×)"},
-  {"id": "iphone-15-pro:ultra", "model": "iPhone 15 Pro", "lens": "ultra", "label": "iPhone 15 Pro · Ultra wide (0.5×)"},
-  {"id": "iphone-15-pro:main", "model": "iPhone 15 Pro", "lens": "main", "label": "iPhone 15 Pro · Normal (1×)"},
-  {"id": "iphone-15-plus:ultra", "model": "iPhone 15 Plus", "lens": "ultra", "label": "iPhone 15 Plus · Ultra wide (0.5×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-15-plus:main", "model": "iPhone 15 Plus", "lens": "main", "label": "iPhone 15 Plus · Normal (1×)", "note": "Uses the iPhone 15 profile (closest match)"},
-  {"id": "iphone-15:ultra", "model": "iPhone 15", "lens": "ultra", "label": "iPhone 15 · Ultra wide (0.5×)"},
-  {"id": "iphone-15:main", "model": "iPhone 15", "lens": "main", "label": "iPhone 15 · Normal (1×)"},
-  {"id": "iphone-14-pro-max:ultra", "model": "iPhone 14 Pro Max", "lens": "ultra", "label": "iPhone 14 Pro Max · Ultra wide (0.5×)"},
-  {"id": "iphone-14-pro-max:main", "model": "iPhone 14 Pro Max", "lens": "main", "label": "iPhone 14 Pro Max · Normal (1×)"},
-  {"id": "iphone-14-pro:ultra", "model": "iPhone 14 Pro", "lens": "ultra", "label": "iPhone 14 Pro · Ultra wide (0.5×)", "note": "Uses the iPhone 14 Pro Max profile (closest match)"},
-  {"id": "iphone-14-pro:main", "model": "iPhone 14 Pro", "lens": "main", "label": "iPhone 14 Pro · Normal (1×)", "note": "Uses the iPhone 14 Pro Max profile (closest match)"},
-  {"id": "iphone-14-plus:ultra", "model": "iPhone 14 Plus", "lens": "ultra", "label": "iPhone 14 Plus · Ultra wide (0.5×)", "note": "Uses the iPhone 14 profile (closest match)"},
-  {"id": "iphone-14-plus:main", "model": "iPhone 14 Plus", "lens": "main", "label": "iPhone 14 Plus · Normal (1×)", "note": "Uses the iPhone 14 profile (closest match)"},
-  {"id": "iphone-14:ultra", "model": "iPhone 14", "lens": "ultra", "label": "iPhone 14 · Ultra wide (0.5×)"},
-  {"id": "iphone-14:main", "model": "iPhone 14", "lens": "main", "label": "iPhone 14 · Normal (1×)"},
-  {"id": "iphone-13-pro-max:ultra", "model": "iPhone 13 Pro Max", "lens": "ultra", "label": "iPhone 13 Pro Max · Ultra wide (0.5×)"},
-  {"id": "iphone-13-pro-max:main", "model": "iPhone 13 Pro Max", "lens": "main", "label": "iPhone 13 Pro Max · Normal (1×)"},
-  {"id": "iphone-13-pro:ultra", "model": "iPhone 13 Pro", "lens": "ultra", "label": "iPhone 13 Pro · Ultra wide (0.5×)"},
-  {"id": "iphone-13-pro:main", "model": "iPhone 13 Pro", "lens": "main", "label": "iPhone 13 Pro · Normal (1×)"},
-  {"id": "iphone-13:ultra", "model": "iPhone 13", "lens": "ultra", "label": "iPhone 13 · Ultra wide (0.5×)"},
-  {"id": "iphone-13:main", "model": "iPhone 13", "lens": "main", "label": "iPhone 13 · Normal (1×)"},
-  {"id": "iphone-13-mini:ultra", "model": "iPhone 13 mini", "lens": "ultra", "label": "iPhone 13 mini · Ultra wide (0.5×)", "note": "Uses the iPhone 13 profile (closest match)"},
-  {"id": "iphone-13-mini:main", "model": "iPhone 13 mini", "lens": "main", "label": "iPhone 13 mini · Normal (1×)", "note": "Uses the iPhone 13 profile (closest match)"},
-  {"id": "iphone-12-pro-max:ultra", "model": "iPhone 12 Pro Max", "lens": "ultra", "label": "iPhone 12 Pro Max · Ultra wide (0.5×)"},
-  {"id": "iphone-12-pro-max:main", "model": "iPhone 12 Pro Max", "lens": "main", "label": "iPhone 12 Pro Max · Normal (1×)"},
-  {"id": "iphone-12-pro:ultra", "model": "iPhone 12 Pro", "lens": "ultra", "label": "iPhone 12 Pro · Ultra wide (0.5×)", "note": "Uses the iPhone 12 Pro Max profile (closest match)"},
-  {"id": "iphone-12-pro:main", "model": "iPhone 12 Pro", "lens": "main", "label": "iPhone 12 Pro · Normal (1×)", "note": "Uses the iPhone 12 Pro Max profile (closest match)"},
-  {"id": "iphone-12:ultra", "model": "iPhone 12", "lens": "ultra", "label": "iPhone 12 · Ultra wide (0.5×)"},
-  {"id": "iphone-12:main", "model": "iPhone 12", "lens": "main", "label": "iPhone 12 · Normal (1×)"},
-  {"id": "iphone-12-mini:ultra", "model": "iPhone 12 mini", "lens": "ultra", "label": "iPhone 12 mini · Ultra wide (0.5×)", "note": "Uses the iPhone 12 profile (closest match)"},
-  {"id": "iphone-12-mini:main", "model": "iPhone 12 mini", "lens": "main", "label": "iPhone 12 mini · Normal (1×)", "note": "Uses the iPhone 12 profile (closest match)"},
-  {"id": "iphone-11-pro-max:ultra", "model": "iPhone 11 Pro Max", "lens": "ultra", "label": "iPhone 11 Pro Max · Ultra wide (0.5×)"},
-  {"id": "iphone-11-pro-max:main", "model": "iPhone 11 Pro Max", "lens": "main", "label": "iPhone 11 Pro Max · Normal (1×)"},
-  {"id": "iphone-11-pro:ultra", "model": "iPhone 11 Pro", "lens": "ultra", "label": "iPhone 11 Pro · Ultra wide (0.5×)", "note": "Uses the iPhone 11 Pro Max profile (closest match)"},
-  {"id": "iphone-11-pro:main", "model": "iPhone 11 Pro", "lens": "main", "label": "iPhone 11 Pro · Normal (1×)", "note": "Uses the iPhone 11 Pro Max profile (closest match)"},
-  {"id": "iphone-11:ultra", "model": "iPhone 11", "lens": "ultra", "label": "iPhone 11 · Ultra wide (0.5×)"},
-  {"id": "iphone-11:main", "model": "iPhone 11", "lens": "main", "label": "iPhone 11 · Normal (1×)"}
+  {
+    "id": "generic:ultra",
+    "model": "Not sure",
+    "lens": "ultra",
+    "label": "Not sure · Ultra wide (0.5×)",
+    "note": "Uses a typical recent iPhone profile.",
+    "group": ""
+  },
+  {
+    "id": "generic:main",
+    "model": "Not sure",
+    "lens": "main",
+    "label": "Not sure · Normal (1×)",
+    "note": "Uses a typical recent iPhone profile.",
+    "group": ""
+  },
+  {
+    "id": "iphone-17-pro-max:ultra",
+    "model": "iPhone 17 Pro Max",
+    "lens": "ultra",
+    "label": "iPhone 17 Pro Max · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-17-pro-max:main",
+    "model": "iPhone 17 Pro Max",
+    "lens": "main",
+    "label": "iPhone 17 Pro Max · Normal (1×)",
+    "note": "Uses the iPhone 15 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-17-pro:ultra",
+    "model": "iPhone 17 Pro",
+    "lens": "ultra",
+    "label": "iPhone 17 Pro · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 Pro profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-17-pro:main",
+    "model": "iPhone 17 Pro",
+    "lens": "main",
+    "label": "iPhone 17 Pro · Normal (1×)",
+    "note": "Uses the iPhone 15 Pro profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-air:ultra",
+    "model": "iPhone Air",
+    "lens": "ultra",
+    "label": "iPhone Air · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-air:main",
+    "model": "iPhone Air",
+    "lens": "main",
+    "label": "iPhone Air · Normal (1×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-17:ultra",
+    "model": "iPhone 17",
+    "lens": "ultra",
+    "label": "iPhone 17 · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-17:main",
+    "model": "iPhone 17",
+    "lens": "main",
+    "label": "iPhone 17 · Normal (1×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16-pro-max:ultra",
+    "model": "iPhone 16 Pro Max",
+    "lens": "ultra",
+    "label": "iPhone 16 Pro Max · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16-pro-max:main",
+    "model": "iPhone 16 Pro Max",
+    "lens": "main",
+    "label": "iPhone 16 Pro Max · Normal (1×)",
+    "note": "Uses the iPhone 15 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16-pro:ultra",
+    "model": "iPhone 16 Pro",
+    "lens": "ultra",
+    "label": "iPhone 16 Pro · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 Pro profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16-pro:main",
+    "model": "iPhone 16 Pro",
+    "lens": "main",
+    "label": "iPhone 16 Pro · Normal (1×)",
+    "note": "Uses the iPhone 15 Pro profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16-plus:ultra",
+    "model": "iPhone 16 Plus",
+    "lens": "ultra",
+    "label": "iPhone 16 Plus · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16-plus:main",
+    "model": "iPhone 16 Plus",
+    "lens": "main",
+    "label": "iPhone 16 Plus · Normal (1×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16:ultra",
+    "model": "iPhone 16",
+    "lens": "ultra",
+    "label": "iPhone 16 · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16:main",
+    "model": "iPhone 16",
+    "lens": "main",
+    "label": "iPhone 16 · Normal (1×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16e:ultra",
+    "model": "iPhone 16e",
+    "lens": "ultra",
+    "label": "iPhone 16e · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 14 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-16e:main",
+    "model": "iPhone 16e",
+    "lens": "main",
+    "label": "iPhone 16e · Normal (1×)",
+    "note": "Uses the iPhone 14 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-15-pro-max:ultra",
+    "model": "iPhone 15 Pro Max",
+    "lens": "ultra",
+    "label": "iPhone 15 Pro Max · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-15-pro-max:main",
+    "model": "iPhone 15 Pro Max",
+    "lens": "main",
+    "label": "iPhone 15 Pro Max · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-15-pro:ultra",
+    "model": "iPhone 15 Pro",
+    "lens": "ultra",
+    "label": "iPhone 15 Pro · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-15-pro:main",
+    "model": "iPhone 15 Pro",
+    "lens": "main",
+    "label": "iPhone 15 Pro · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-15-plus:ultra",
+    "model": "iPhone 15 Plus",
+    "lens": "ultra",
+    "label": "iPhone 15 Plus · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-15-plus:main",
+    "model": "iPhone 15 Plus",
+    "lens": "main",
+    "label": "iPhone 15 Plus · Normal (1×)",
+    "note": "Uses the iPhone 15 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-15:ultra",
+    "model": "iPhone 15",
+    "lens": "ultra",
+    "label": "iPhone 15 · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-15:main",
+    "model": "iPhone 15",
+    "lens": "main",
+    "label": "iPhone 15 · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-14-pro-max:ultra",
+    "model": "iPhone 14 Pro Max",
+    "lens": "ultra",
+    "label": "iPhone 14 Pro Max · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-14-pro-max:main",
+    "model": "iPhone 14 Pro Max",
+    "lens": "main",
+    "label": "iPhone 14 Pro Max · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-14-pro:ultra",
+    "model": "iPhone 14 Pro",
+    "lens": "ultra",
+    "label": "iPhone 14 Pro · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 14 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-14-pro:main",
+    "model": "iPhone 14 Pro",
+    "lens": "main",
+    "label": "iPhone 14 Pro · Normal (1×)",
+    "note": "Uses the iPhone 14 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-14-plus:ultra",
+    "model": "iPhone 14 Plus",
+    "lens": "ultra",
+    "label": "iPhone 14 Plus · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 14 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-14-plus:main",
+    "model": "iPhone 14 Plus",
+    "lens": "main",
+    "label": "iPhone 14 Plus · Normal (1×)",
+    "note": "Uses the iPhone 14 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-14:ultra",
+    "model": "iPhone 14",
+    "lens": "ultra",
+    "label": "iPhone 14 · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-14:main",
+    "model": "iPhone 14",
+    "lens": "main",
+    "label": "iPhone 14 · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-13-pro-max:ultra",
+    "model": "iPhone 13 Pro Max",
+    "lens": "ultra",
+    "label": "iPhone 13 Pro Max · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-13-pro-max:main",
+    "model": "iPhone 13 Pro Max",
+    "lens": "main",
+    "label": "iPhone 13 Pro Max · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-13-pro:ultra",
+    "model": "iPhone 13 Pro",
+    "lens": "ultra",
+    "label": "iPhone 13 Pro · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-13-pro:main",
+    "model": "iPhone 13 Pro",
+    "lens": "main",
+    "label": "iPhone 13 Pro · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-13:ultra",
+    "model": "iPhone 13",
+    "lens": "ultra",
+    "label": "iPhone 13 · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-13:main",
+    "model": "iPhone 13",
+    "lens": "main",
+    "label": "iPhone 13 · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-13-mini:ultra",
+    "model": "iPhone 13 mini",
+    "lens": "ultra",
+    "label": "iPhone 13 mini · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 13 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-13-mini:main",
+    "model": "iPhone 13 mini",
+    "lens": "main",
+    "label": "iPhone 13 mini · Normal (1×)",
+    "note": "Uses the iPhone 13 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-12-pro-max:ultra",
+    "model": "iPhone 12 Pro Max",
+    "lens": "ultra",
+    "label": "iPhone 12 Pro Max · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-12-pro-max:main",
+    "model": "iPhone 12 Pro Max",
+    "lens": "main",
+    "label": "iPhone 12 Pro Max · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-12-pro:ultra",
+    "model": "iPhone 12 Pro",
+    "lens": "ultra",
+    "label": "iPhone 12 Pro · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 12 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-12-pro:main",
+    "model": "iPhone 12 Pro",
+    "lens": "main",
+    "label": "iPhone 12 Pro · Normal (1×)",
+    "note": "Uses the iPhone 12 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-12:ultra",
+    "model": "iPhone 12",
+    "lens": "ultra",
+    "label": "iPhone 12 · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-12:main",
+    "model": "iPhone 12",
+    "lens": "main",
+    "label": "iPhone 12 · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-12-mini:ultra",
+    "model": "iPhone 12 mini",
+    "lens": "ultra",
+    "label": "iPhone 12 mini · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 12 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-12-mini:main",
+    "model": "iPhone 12 mini",
+    "lens": "main",
+    "label": "iPhone 12 mini · Normal (1×)",
+    "note": "Uses the iPhone 12 profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-11-pro-max:ultra",
+    "model": "iPhone 11 Pro Max",
+    "lens": "ultra",
+    "label": "iPhone 11 Pro Max · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-11-pro-max:main",
+    "model": "iPhone 11 Pro Max",
+    "lens": "main",
+    "label": "iPhone 11 Pro Max · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-11-pro:ultra",
+    "model": "iPhone 11 Pro",
+    "lens": "ultra",
+    "label": "iPhone 11 Pro · Ultra wide (0.5×)",
+    "note": "Uses the iPhone 11 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-11-pro:main",
+    "model": "iPhone 11 Pro",
+    "lens": "main",
+    "label": "iPhone 11 Pro · Normal (1×)",
+    "note": "Uses the iPhone 11 Pro Max profile (closest match)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-11:ultra",
+    "model": "iPhone 11",
+    "lens": "ultra",
+    "label": "iPhone 11 · Ultra wide (0.5×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "iphone-11:main",
+    "model": "iPhone 11",
+    "lens": "main",
+    "label": "iPhone 11 · Normal (1×)",
+    "group": "iPhone"
+  },
+  {
+    "id": "auto",
+    "model": "GoPro or other action camera – detect automatically",
+    "lens": "auto",
+    "label": "GoPro or other action camera – detect automatically",
+    "note": "VeoClone reads the camera model and its Lens setting from the video file.",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero13-black:wide",
+    "model": "GoPro HERO13 Black",
+    "lens": "wide",
+    "label": "GoPro HERO13 Black · Wide",
+    "note": "Uses the HERO11 Black settings (the same lens)",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero13-black:linear",
+    "model": "GoPro HERO13 Black",
+    "lens": "linear",
+    "label": "GoPro HERO13 Black · Linear",
+    "note": "Uses the HERO11 Black settings (the same lens)",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero12-black:wide",
+    "model": "GoPro HERO12 Black",
+    "lens": "wide",
+    "label": "GoPro HERO12 Black · Wide",
+    "note": "Uses the HERO11 Black settings (the same lens)",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero12-black:linear",
+    "model": "GoPro HERO12 Black",
+    "lens": "linear",
+    "label": "GoPro HERO12 Black · Linear",
+    "note": "Uses the HERO11 Black settings (the same lens)",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero11-black:wide",
+    "model": "GoPro HERO11 Black",
+    "lens": "wide",
+    "label": "GoPro HERO11 Black · Wide",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero11-black:linear",
+    "model": "GoPro HERO11 Black",
+    "lens": "linear",
+    "label": "GoPro HERO11 Black · Linear",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero10-black:wide",
+    "model": "GoPro HERO10 Black",
+    "lens": "wide",
+    "label": "GoPro HERO10 Black · Wide",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero10-black:linear",
+    "model": "GoPro HERO10 Black",
+    "lens": "linear",
+    "label": "GoPro HERO10 Black · Linear",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero9-black:wide",
+    "model": "GoPro HERO9 Black",
+    "lens": "wide",
+    "label": "GoPro HERO9 Black · Wide",
+    "group": "Action camera"
+  },
+  {
+    "id": "gopro-hero9-black:linear",
+    "model": "GoPro HERO9 Black",
+    "lens": "linear",
+    "label": "GoPro HERO9 Black · Linear",
+    "group": "Action camera"
+  }
 ]

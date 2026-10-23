@@ -39,7 +39,7 @@ test("shows how to start VeoClone when the helper is not running", async ({ page
   await shot(page, "02-offline");
 });
 
-async function createMatch(page: Page, name: string) {
+async function createMatch(page: Page, name: string, style = "Action") {
   await open(page, "/new");
   await page.getByLabel("Name of the match").fill(name);
   await page.getByTestId("file-left").setInputFiles(path.join(FIXTURES, "left-small.mp4"));
@@ -48,13 +48,13 @@ async function createMatch(page: Page, name: string) {
   await expect(page.locator(".dropzone[data-side=right]")).toContainText("right-small.mp4");
   await expect(page.locator(".dropzone[data-side=left]")).toContainText("long"); // duration read from the file
   // Which iPhone and which lens: two simple choices, mapped to one lens option.
-  const model = page.getByLabel("Which iPhone?");
+  const model = page.getByLabel("Which camera?");
   await expect(model).toBeEnabled();
   await expect(model).toHaveValue("Not sure"); // the default…
   await expect(page.getByRole("radio", { name: /Ultra wide/ })).toBeChecked(); // …with the 0.5× lens
   await model.selectOption("iPhone 16 Pro");
   await expect(page.locator(".lens-note")).toHaveText("Uses the iPhone 15 Pro profile (closest match)");
-  await page.getByText("Action", { exact: true }).click();
+  await page.getByText(style, { exact: true }).click();
   await shot(page, "03-new-match");
   await page.getByRole("button", { name: "Start" }).click();
   await expect(page).toHaveURL(/#\/project\/\w+/);
@@ -74,6 +74,83 @@ test("create a match, process it and open the editor", async ({ page }) => {
   await expectPicture(page);
   const state = await mockState();
   expect(state.projects[0]).toMatchObject({ name: "Saturday league", lensId, style: "action", status: "ready" });
+});
+
+test("camera style: Follow the ball, when creating a match and when running the AI again", async ({ page }) => {
+  await resetMock();
+  await open(page, "/new");
+  const styles = page.getByRole("radiogroup", { name: "Camera style" });
+  await expect(styles.getByRole("radio")).toHaveCount(4);
+  await expect(styles.getByRole("radio", { name: /Broadcast/ })).toBeChecked(); // still the default
+  await expect(styles.getByText("Follow the ball", { exact: true })).toBeVisible();
+  await expect(styles).toContainText("Keeps the ball in the middle");
+  await createMatch(page, "Ball match", "Follow the ball");
+  expect((await mockState()).projects[0].style).toBe("ball");
+  await expect(page).toHaveURL(/#\/edit\/\w+/, { timeout: 30_000 });
+  await expect(page.locator(".style-line")).toContainText("Camera style: Follow the ball");
+  // Back on the match page, another style runs the AI again.
+  const id = (await mockState()).projects[0].id;
+  await open(page, `/project/${id}`);
+  await page.getByText("Change the camera style").click();
+  await page.getByRole("radiogroup", { name: "Camera style" }).getByText("Broadcast", { exact: true }).click();
+  await page.getByRole("button", { name: "Run the AI again" }).click();
+  await expect.poll(async () => (await mockState()).projects[0].style).toBe("broadcast");
+});
+
+test("AI accuracy: every frame by default, every 3rd frame when chosen, and changed later", async ({ page }) => {
+  await resetMock();
+  await open(page, "/new");
+  const accuracy = page.getByRole("radiogroup", { name: "AI accuracy" });
+  await expect(accuracy.getByRole("radio", { name: /Best – check every frame \(slower\)/ })).toBeChecked();
+  await expect(accuracy).toContainText("up to 3 times as long");
+  await accuracy.getByText("Faster – every 3rd frame").click();
+  await createMatch(page, "Quick match");
+  expect((await mockState()).projects[0].aiAccuracy).toBe("faster");
+  await expect(page).toHaveURL(/#\/edit\/\w+/, { timeout: 30_000 });
+  const id = (await mockState()).projects[0].id;
+  await open(page, `/project/${id}`);
+  await expect(page.locator(".facts")).toContainText("Faster – every 3rd frame");
+  await page.getByText("Change the camera style or AI accuracy").click();
+  // What the AI saw (every 3rd frame) is kept: another style takes seconds…
+  await expect(page.getByTestId("rerun-time")).toHaveText("This takes a few seconds: VeoClone reuses what the AI saw last time.");
+  await page.getByRole("radiogroup", { name: "AI accuracy" }).getByText("Best – check every frame (slower)").click();
+  // …but looking at every frame needs the whole match again.
+  await expect(page.getByTestId("rerun-time")).toContainText("about as long as the first time");
+  await shot(page, "qw-01-rerun-accuracy");
+  await page.getByRole("button", { name: "Run the AI again" }).click();
+  await expect.poll(async () => (await mockState()).projects[0].aiAccuracy).toBe("best");
+  expect((await mockState()).projects[0].style).toBe("action");
+});
+
+test("GoPro: detect automatically, or pick the model and its Lens setting", async ({ page }) => {
+  await resetMock();
+  await open(page, "/new");
+  await page.getByLabel("Name of the match").fill("GoPro match");
+  const model = page.getByLabel("Which camera?");
+  await expect(model).toBeEnabled();
+  await expect(model.locator("optgroup")).toHaveCount(2);
+  await model.selectOption("GoPro or other action camera – detect automatically");
+  // Nothing more to choose: the video file says.
+  await expect(page.getByText("Which lens?")).toBeHidden();
+  await expect(page.locator(".lens-note")).toHaveText("VeoClone reads the camera model and its Lens setting from the video file.");
+  await shot(page, "qw-05-gopro-auto");
+  await model.selectOption("GoPro HERO12 Black");
+  await expect(page.getByRole("radio", { name: /Recommended: the GoPro/ })).toBeChecked();
+  await expect(page.locator(".lens-note")).toHaveText("Uses the HERO11 Black settings (the same lens)");
+  await page.getByText("Linear", { exact: true }).click();
+  await expect(page.locator(".tips")).toContainText("HyperSmooth: Off");
+  await expect(page.locator(".tips")).toContainText("Anti-Flicker to 50 Hz");
+  await page.getByTestId("file-left").setInputFiles(path.join(FIXTURES, "left-small.mp4"));
+  await page.getByTestId("file-right").setInputFiles(path.join(FIXTURES, "right-small.mp4"));
+  await page.getByRole("button", { name: "Start" }).click();
+  await expect(page).toHaveURL(/#\/project\/\w+/);
+  expect((await mockState()).projects[0].lensId).toBe("gopro-hero12-black:linear");
+  // Back to an iPhone: its two lenses again.
+  await open(page, "/new");
+  await page.getByLabel("Which camera?").selectOption("GoPro HERO9 Black");
+  await page.getByLabel("Which camera?").selectOption("iPhone 15");
+  await expect(page.getByRole("radio", { name: /Ultra wide/ })).toBeVisible();
+  await expect(page.getByRole("radio", { name: /Normal/ })).toBeVisible();
 });
 
 test("a failed step explains itself and Try again works", async ({ page }) => {
@@ -123,6 +200,84 @@ async function clickTimeline(page: Page, fraction: number) {
   await page.mouse.click(box.x + box.width * fraction, box.y + 40);
 }
 
+/** Click a point of the "Mark the pitch" picture, as a fraction of its size. */
+async function clickPitch(page: Page, fx: number, fy: number) {
+  const box = (await page.getByTestId("pitch-canvas").boundingBox())!;
+  await page.mouse.click(box.x + box.width * fx, box.y + box.height * fy);
+}
+
+test("editor: mark the pitch, undo a point, save, and run the AI again to use it", async ({ page }) => {
+  const id = await openExample(page);
+  // Offered straight away for a match without a pitch outline.
+  const hint = page.getByTestId("pitch-hint");
+  await expect(hint).toContainText("Mark the pitch so the camera ignores people outside it.");
+  await expect(page.getByTestId("pitch-status")).toContainText("Pitch not marked");
+  await shot(page, "qw-02-pitch-hint");
+  await hint.getByRole("button", { name: "Mark the pitch" }).click();
+  const dialog = page.getByRole("dialog", { name: "Mark the pitch" });
+  await expect(dialog).toContainText("Click the corners of the pitch, going round it.");
+  const save = dialog.getByRole("button", { name: "Save the outline" });
+  await expect(save).toBeDisabled();
+  for (const [fx, fy] of [[0.12, 0.42], [0.88, 0.42], [0.95, 0.8], [0.4, 0.5]]) await clickPitch(page, fx, fy);
+  await expect(dialog.locator(".pitch-status")).toContainText("4 points");
+  // A wrong point: Undo takes it back.
+  await dialog.getByRole("button", { name: "Undo last point" }).click();
+  await expect(dialog.locator(".pitch-status")).toContainText("3 of at least 4 points");
+  await expect(save).toBeDisabled();
+  await clickPitch(page, 0.05, 0.8);
+  await expect(save).toBeEnabled();
+  await shot(page, "qw-03-mark-pitch");
+  await save.click();
+  // Saved; the AI must run again to use it.
+  const again = page.getByRole("dialog", { name: "Pitch outline saved" });
+  await expect(again).toContainText("The AI needs to run again");
+  await expect(again).toContainText("This takes a few seconds");
+  const state = await mockState();
+  const pitch = state.projects[0].pitch!;
+  expect(state.pitchPuts).toBe(1);
+  expect(pitch.points).toHaveLength(4);
+  for (const side of [pitch.left, pitch.right]) {
+    expect(side.length).toBeGreaterThanOrEqual(3);
+    for (const [x, y] of side) {
+      expect(x).toBeGreaterThanOrEqual(0);
+      expect(x).toBeLessThanOrEqual(1);
+      expect(y).toBeGreaterThanOrEqual(0);
+      expect(y).toBeLessThanOrEqual(1);
+    }
+  }
+  await again.getByRole("button", { name: "Later" }).click();
+  await expect(hint).toBeHidden();
+  await expect(page.getByTestId("pitch-status")).toContainText("doesn't use it yet");
+  await shot(page, "qw-04-pitch-marked");
+  await page.getByTestId("pitch-status").getByRole("button", { name: "Run the AI again" }).click();
+  await expect(page).toHaveURL(new RegExp(`#/project/${id}$`));
+  await expect(page).toHaveURL(new RegExp(`#/edit/${id}$`), { timeout: 30_000 });
+  await expect(page.getByTestId("pitch-status")).toContainText("Pitch marked: the AI ignores everyone outside it.");
+  expect((await mockState()).projects[0].aiRun?.pitchId).toBe(pitch.id);
+  await expect(page.getByTestId("pitch-hint")).toHaveCount(0);
+
+  // Change it: the saved outline comes back, Start again clears it; Remove takes it away.
+  await page.getByRole("button", { name: "Change the pitch outline" }).click();
+  await expect(dialog.locator(".pitch-status")).toContainText("4 points");
+  await dialog.getByRole("button", { name: "Start again" }).click();
+  await expect(dialog.locator(".pitch-status")).toContainText("Click the first corner");
+  await dialog.getByRole("button", { name: "Remove the outline" }).click();
+  await page.getByRole("dialog", { name: "Pitch outline removed" }).getByRole("button", { name: "Later" }).click();
+  expect((await mockState()).projects[0].pitch).toBeNull();
+  await expect(page.getByTestId("pitch-status")).toContainText("still uses it");
+});
+
+test("editor: the Mark the pitch tip can be hidden for good", async ({ page }) => {
+  const id = await openExample(page);
+  await page.getByTestId("pitch-hint").getByRole("button", { name: "Hide this tip" }).click();
+  await expect(page.getByTestId("pitch-hint")).toHaveCount(0);
+  await page.reload();
+  await expectPicture(page);
+  await expect(page.getByTestId("pitch-status")).toContainText("Pitch not marked");
+  await expect(page.getByTestId("pitch-hint")).toHaveCount(0);
+  expect(id).toBeTruthy();
+});
+
 test("editor: add, select, remove and undo camera fixes", async ({ page }) => {
   const id = await openExample(page);
   const view = page.getByTestId("camera-view");
@@ -147,6 +302,7 @@ test("editor: add, select, remove and undo camera fixes", async ({ page }) => {
 
   // Clicking in the whole-pitch overview points the camera there.
   await clickTimeline(page, 0.55);
+  await page.getByTestId("overview").scrollIntoViewIfNeeded();
   const ov = (await page.getByTestId("overview").boundingBox())!;
   await page.mouse.click(ov.x + ov.width * 0.45, ov.y + ov.height * 0.5);
   await expect(page.locator(".fixes li")).toHaveCount(3);
@@ -439,11 +595,11 @@ test("the iPhone list loads once VeoClone starts", async ({ page }) => {
   await page.route(`${MOCK}/**`, (route) => route.abort()); // VeoClone not running yet
   await open(page, "/new");
   await expect(page.getByTestId("helper-offline")).toBeVisible();
-  await expect(page.getByLabel("Which iPhone?")).toBeDisabled();
+  await expect(page.getByLabel("Which camera?")).toBeDisabled();
   await page.unroute(`${MOCK}/**`);
   await expect(page.getByTestId("helper-offline")).toBeHidden({ timeout: 15_000 });
-  await expect(page.getByLabel("Which iPhone?")).toBeEnabled();
-  await expect(page.getByLabel("Which iPhone?").locator("option")).not.toHaveCount(1);
+  await expect(page.getByLabel("Which camera?")).toBeEnabled();
+  await expect(page.getByLabel("Which camera?").locator("option")).not.toHaveCount(1);
 });
 
 test("Try again after a failed upload sends only the video that is missing", async ({ page }) => {
@@ -518,7 +674,7 @@ test("change phone or lens from the editor: two choices, then everything is proc
   await page.getByRole("link", { name: "Change phone or lens" }).click();
   const dialog = page.getByRole("dialog", { name: "Change phone or lens" });
   await expect(dialog).toContainText("does all the processing again");
-  await dialog.getByLabel("Which iPhone?").selectOption("iPhone 13 mini");
+  await dialog.getByLabel("Which camera?").selectOption("iPhone 13 mini");
   await dialog.getByText("Normal (1×)").click();
   await expect(dialog.locator(".lens-note")).toHaveText("Uses the iPhone 13 profile (closest match)");
   await shot(page, "11-change-lens");
@@ -535,24 +691,24 @@ test("two different iPhones: a phone and lens for each, also when changing them 
   await page.getByLabel("Name of the match").fill("Two different phones");
   await page.getByTestId("file-left").setInputFiles(path.join(FIXTURES, "left-small.mp4"));
   await page.getByTestId("file-right").setInputFiles(path.join(FIXTURES, "right-small.mp4"));
-  await expect(page.getByLabel("Which iPhone?")).toBeEnabled();
+  await expect(page.getByLabel("Which camera?")).toBeEnabled();
   // One choice for both phones unless the box is ticked.
   const differ = page.getByLabel("The two phones are different models");
   await expect(differ).not.toBeChecked();
   await expect(page.getByRole("group", { name: "Right phone" })).toBeHidden();
   await expect(page.locator(".phones-picker").getByRole("heading", { name: "Left phone" })).toBeHidden();
-  await page.getByLabel("Which iPhone?").selectOption("iPhone 13 Pro Max");
+  await page.getByLabel("Which camera?").selectOption("iPhone 13 Pro Max");
   await differ.check();
   const left = page.getByRole("group", { name: "Left phone" });
   const right = page.getByRole("group", { name: "Right phone" });
   await expect(left.getByRole("heading", { name: "Left phone" })).toBeVisible();
   await expect(right.getByRole("heading", { name: "Right phone" })).toBeVisible();
-  await expect(left.getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max");
-  await expect(right.getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max"); // starts as the left one
-  await right.getByLabel("Which iPhone?").selectOption("iPhone 11");
+  await expect(left.getByLabel("Which camera?")).toHaveValue("iPhone 13 Pro Max");
+  await expect(right.getByLabel("Which camera?")).toHaveValue("iPhone 13 Pro Max"); // starts as the left one
+  await right.getByLabel("Which camera?").selectOption("iPhone 11");
   await expect(left.getByRole("radio", { name: /Ultra wide/ })).toBeChecked();
   await expect(right.getByRole("radio", { name: /Ultra wide/ })).toBeChecked();
-  await expect(left.getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max");
+  await expect(left.getByLabel("Which camera?")).toHaveValue("iPhone 13 Pro Max");
   await shot(page, "16-two-phones");
   await page.getByRole("button", { name: "Start" }).click();
   await expect(page).toHaveURL(/#\/project\/\w+/);
@@ -565,12 +721,12 @@ test("two different iPhones: a phone and lens for each, also when changing them 
   await page.getByRole("link", { name: "Change phone or lens" }).click();
   const dialog = page.getByRole("dialog", { name: "Change phone or lens" });
   await expect(dialog.getByLabel("The two phones are different models")).toBeChecked();
-  await expect(dialog.getByRole("group", { name: "Left phone" }).getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max");
-  await expect(dialog.getByRole("group", { name: "Right phone" }).getByLabel("Which iPhone?")).toHaveValue("iPhone 11");
+  await expect(dialog.getByRole("group", { name: "Left phone" }).getByLabel("Which camera?")).toHaveValue("iPhone 13 Pro Max");
+  await expect(dialog.getByRole("group", { name: "Right phone" }).getByLabel("Which camera?")).toHaveValue("iPhone 11");
   await shot(page, "17-change-two-phones");
   await dialog.getByLabel("The two phones are different models").uncheck();
   await expect(dialog.getByRole("group", { name: "Right phone" })).toBeHidden();
-  await expect(dialog.getByLabel("Which iPhone?")).toHaveValue("iPhone 13 Pro Max");
+  await expect(dialog.getByLabel("Which camera?")).toHaveValue("iPhone 13 Pro Max");
   await dialog.getByRole("button", { name: "Process again" }).click();
   await expect(page).toHaveURL(new RegExp(`#/project/${id}$`));
   expect((await mockState()).projects[0]).toMatchObject({ lensId: "iphone-13-pro-max:ultra", rightLensId: null });

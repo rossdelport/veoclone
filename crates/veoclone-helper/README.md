@@ -63,3 +63,10 @@ python3 crates/veoclone-helper/scripts/e2e.py --helper target/release/veoclone-h
   until the next `process`, which then re-calibrates; uploading a new file
   deletes all results made from the old one (and that side's matching
   copy, `matched-<side>.mp4`).
+- `PUT /api/projects/:id/pitch` and `DELETE /api/projects/:id/pitch`
+  answer the `ProjectMeta` (DESIGN.md 4.8). `ProjectMeta.aiSeen` is filled
+  in on every read from `ai_seen.json` (DESIGN.md 4.9); a `process` that
+  can reuse the recording reports its track step as "Using what the AI saw
+  last time" and logs "Quick re-run".
+- `e2e.py --only quickwins` runs just the ball style, AI accuracy, pitch
+  outline and quick re-run checks (parity against full AI passes, timings).

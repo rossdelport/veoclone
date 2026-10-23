@@ -1,6 +1,6 @@
 # VeoClone
 
-Film a football match with two iPhones, and VeoClone turns the two videos into
+Film a football match with two iPhones (or two GoPros), and VeoClone turns the two videos into
 one video where the camera follows the ball, like a Veo camera.
 
 - **Download for Windows:** [VeoClone-windows.zip](https://github.com/rossdelport/veoclone/releases/download/helper-latest/VeoClone-windows.zip)
@@ -37,6 +37,8 @@ internet, not even when you use the online editor.
   pole with a mount for two phones. The higher, the better.
 - Power banks for both phones, and enough free space on each phone (about
   20 GB each for a full match).
+- **Or two identical GoPros** (HERO9 Black or newer works best; other action
+  cameras may work too), see [Filming with GoPros](#filming-with-gopros).
 
 ## One-time setup
 
@@ -113,6 +115,33 @@ matching copy first, which takes longer.
 - Keep recording through half-time if you can. If you stop at half-time, you
   get two videos per phone: make **one VeoClone match per half**.
 
+### Filming with GoPros
+
+Use **two identical GoPros**, side by side up high, set up like the phones
+above (left GoPro films the left half, right GoPro the right half, a little
+overlap in the middle). On **both** GoPros set:
+
+- **Resolution 4K, 30 fps, aspect ratio 16:9.**
+- **Lens: Wide.** (Not Linear, SuperView or HyperView.)
+- **HyperSmooth: Off.** Stabilisation crops and moves the picture, and the two
+  views no longer join.
+- **Horizon Levelling / Horizon Lock: Off**, for the same reason.
+- **Anti-Flicker: 50 Hz** in the UK, Europe, Australia and New Zealand
+  (**60 Hz** in North America), so floodlights don't flicker.
+
+GoPros record their own level (an accelerometer), so the picture usually
+comes out straight without touching **Straighten picture**. In VeoClone,
+under **Which camera?**, choose **GoPro or other action camera – detect
+automatically**: VeoClone reads the model and the Lens setting from the
+video file. If that doesn't work (VeoClone then says so under **Good to
+know**), choose your GoPro model and **Wide** or **Linear** instead.
+
+A GoPro saves a long recording as several files (a new one every few
+minutes, for example GX010042.MP4, GX020042.MP4…). VeoClone needs **one file
+per camera**, so first join each GoPro's files into one video, in order,
+with a free tool such as LosslessCut (its "merge" joins them without
+re-encoding).
+
 **Getting the videos onto your PC:**
 
 - On each iPhone, go to **Settings › Apps › Photos** (on older iPhones
@@ -133,16 +162,21 @@ matching copy first, which takes longer.
    onto **Right phone** (or click a box to choose the file). Left and right
    are as seen from behind the phones, facing the pitch. Mixed them up?
    Click **Swap left and right**.
-4. **Which iPhone and lens filmed this?** Under **Which iPhone?** pick your
-   iPhone model. Under **Which lens?** pick **Ultra wide (0.5×)** if you
+4. **Which camera and lens filmed this?** Under **Which camera?** pick your
+   iPhone model (for GoPros see [Filming with GoPros](#filming-with-gopros)). Under **Which lens?** pick **Ultra wide (0.5×)** if you
    tapped 0.5× when filming (as this guide says), otherwise **Normal (1×)**.
    If you don't know the model, or it isn't in the list, leave it on **Not
    sure**. Two different iPhones? Tick **The two phones are different
    models** and choose the iPhone and lens for the **Left phone** and the
    **Right phone**. You can change this later.
 5. **Camera style**: **Broadcast** (calm, like TV; best for most matches),
-   **Action** (follows the ball more closely) or **Wide** (keeps all the
-   players in the picture). You can change it later.
+   **Action** (follows the ball more closely), **Wide** (keeps all the
+   players in the picture) or **Follow the ball** (keeps the ball itself in
+   the middle at a fixed zoom; try it when the camera keeps drifting back to
+   the middle of the pitch or to people next to it). You can change it later.
+   **AI accuracy**: **Best** (the AI looks at every frame; recommended) or
+   **Faster** (every 3rd frame: the AI step takes about a third of the time,
+   but the camera reacts a little later).
 6. Click **Start**. Keep the page open until both videos have been sent to
    VeoClone. Then VeoClone works through four steps: checking the videos
    (and making them match if the phones filmed in different formats),
@@ -185,6 +219,17 @@ matching copy first, which takes longer.
   the sliders. Your fixes keep looking at the same place, and the export uses
   the same setting. GoPro footage usually needs nothing: the camera measures
   its own level and VeoClone starts from that (**Reset** goes back to it).
+- **Mark the pitch** (under **Whole pitch** on the right, also offered the
+  first time you open a match): click the corners of the pitch on the big
+  picture, going round it, plus a few points along any edge that looks
+  curved. **Undo last point** and **Start again** fix mistakes. Save it and
+  click **Run the AI again**: the AI camera then ignores everyone outside the
+  pitch (substitutes, parents, a game on the next pitch). This takes a few
+  seconds, because VeoClone reuses what the AI saw the first time.
+- To try another **camera style** or **AI accuracy**, open the match page
+  (Change, under **Camera**) and click **Run the AI again**. This also takes
+  only a few seconds, except when switching from **Faster** to **Best** (the
+  AI then has to look at every frame of the video again).
 - Picture bent, or the two halves don't join? Click **Change phone or lens**
   (under **Camera** on the right). See
   [If something goes wrong](#if-something-goes-wrong).
@@ -312,6 +357,20 @@ matching copy first, which takes longer.
   probably had **Auto FPS** on (VeoClone then says so under **Good to
   know**). Set it to **Off** before the next match (Settings › Camera ›
   Record Video).
+
+**The camera keeps going back to the middle (the halfway line), or to people next to the pitch**
+- **Mark the pitch** in the editor and run the AI again, so people outside
+  the pitch don't pull the camera away.
+- Try the **Follow the ball** camera style. It follows the ball itself
+  rather than the group of players. If the ball is hard to see (small, far
+  away, against a crowd), the camera may stop when it loses the ball.
+- Use **AI accuracy: Best** so the AI looks at every frame.
+- For moments it still gets wrong, add a fix (drag the picture).
+
+**"VeoClone couldn't recognise the camera from the video file"**
+- You chose **detect automatically** but the video file doesn't say which
+  camera filmed it (iPhone videos never do, and edited or joined files may
+  lose it). Click **Change phone or lens** and choose your camera and lens.
 
 **Processing stopped half-way**
 - If the PC was switched off or restarted, or the black window was closed,

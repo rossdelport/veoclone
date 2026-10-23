@@ -25,6 +25,9 @@ export interface MockState {
     lensId: string | null;
     rightLensId?: string | null;
     style: string;
+    aiAccuracy?: string;
+    pitch?: { id: string; points: [number, number][]; left: [number, number][]; right: [number, number][] } | null;
+    aiRun?: { style: string; aiAccuracy: string; pitchId: string | null } | null;
     warnings: string[];
     files: { left?: { name: string }; right?: { name: string } };
     exports: { id: string; status: string }[];
@@ -54,6 +57,7 @@ export interface MockState {
     rigRollDeg?: number;
   };
   editsPuts: number;
+  pitchPuts: number;
   openFolder: { project: string; export: string | null }[];
   swaps: number;
 }

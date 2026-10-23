@@ -213,6 +213,17 @@ impl CalibrationPipeline {
         Ok((left_p, right_p))
     }
 
+    /// Find out whether the cameras record a gyroscope, without picking a
+    /// lens profile. [`detect_profiles`](Self::detect_profiles) does this
+    /// as a side effect; call this instead after
+    /// [`set_profiles`](Self::set_profiles), or [`imu_sync`](Self::imu_sync)
+    /// skips the IMU sync and the rig tilt/roll (a GoPro's own level) for
+    /// footage that has them. Uses the fast metadata-only telemetry probe.
+    pub fn probe_native_gyro(&mut self) {
+        self.has_native_gyro =
+            telemetry::extract_metadata(&self.left_info.path).is_ok_and(|m| m.has_native_gyro);
+    }
+
     /// Lazily populate the left-video telemetry cache. Called from
     /// `detect_profiles` and `imu_sync`; subsequent calls are no-ops.
     ///
@@ -517,5 +528,36 @@ impl CalibrationPipeline {
     /// Get right video info.
     pub fn right_info(&self) -> &VideoInfo {
         &self.right_info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(path: &Path) -> VideoInfo {
+        VideoInfo {
+            path: path.into(),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            total_frames: 300,
+        }
+    }
+
+    /// Footage without telemetry (a phone video): no gyroscope found, and
+    /// the IMU sync is skipped without an error, as with auto-detection.
+    #[test]
+    fn probe_native_gyro_without_telemetry() {
+        let dir = std::env::temp_dir().join(format!("reco-gyro-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("phone.mp4");
+        std::fs::write(&file, b"not a video with telemetry").unwrap();
+        let mut p =
+            CalibrationPipeline::new(info(&file), info(&file), CalibrationConfig::default());
+        p.probe_native_gyro();
+        assert!(!p.has_native_gyro);
+        assert_eq!(p.imu_sync().unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

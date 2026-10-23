@@ -408,6 +408,15 @@ select.input {
   gap: 10px;
   margin-top: 12px;
 }
+/* Four choices: two by two rather than three and one. */
+.choice-grid-4 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (max-width: 560px) {
+  .choice-grid-4 {
+    grid-template-columns: 1fr;
+  }
+}
 .choice-grid-compact {
   grid-template-columns: 1fr;
   gap: 8px;
@@ -1213,6 +1222,10 @@ dialog {
 .rerun .row {
   margin-top: 14px;
 }
+.rerun-head {
+  margin: 18px 0 0;
+  font-size: 15px;
+}
 
 /* ---------------------------------------------------------------- Editor */
 body.editor-mode {
@@ -1424,7 +1437,8 @@ body.editor-mode #page {
 }
 .ov-box::before,
 .ov-ai::before,
-.ov-fix::before {
+.ov-fix::before,
+.ov-pitch::before {
   content: "";
   display: inline-block;
 }
@@ -1445,6 +1459,42 @@ body.editor-mode #page {
   height: 7px;
   background: var(--amber);
   transform: rotate(45deg);
+}
+.ov-pitch::before {
+  width: 12px;
+  height: 8px;
+  border: 1.5px dashed var(--accent);
+  border-radius: 2px;
+}
+.pitch-row-side {
+  margin-top: 10px;
+}
+.pitch-row-side .row {
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.dialog-pitch {
+  width: min(1180px, calc(100vw - 32px));
+}
+.pitch-box .overview-overlay {
+  cursor: crosshair;
+}
+.pitch-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin: 12px 0 4px;
+}
+.pitch-status {
+  margin: 0;
+}
+.pitch-problem:not(:empty) {
+  margin-top: 8px;
+}
+.pitch-help {
+  margin-bottom: 14px;
 }
 .sliders {
   display: grid;

@@ -30,9 +30,9 @@ use crate::export::{ExportBody, validate};
 use crate::jobs::{Job, Jobs};
 use crate::media::Tools;
 use crate::store::{
-    DERIVED_FILES, ExportMeta, ExportStatus, FileInfo, Files, ProjectMeta, Status, Store, Style,
-    dir_size, end_unfinished_run, new_id, now_iso, original_file, remove_matched, valid_id,
-    write_atomic,
+    AiAccuracy, DERIVED_FILES, ExportMeta, ExportStatus, FileInfo, Files, PitchOutline,
+    ProjectMeta, Status, Store, Style, dir_size, end_unfinished_run, new_id, now_iso,
+    original_file, remove_matched, valid_id, write_atomic,
 };
 
 const EDITS_LIMIT: usize = 10 * 1024 * 1024;
@@ -167,6 +167,7 @@ pub fn router(state: AppState, port: u16, origins: &[String], web_dir: &Path) ->
         .route("/projects/{id}/proxy.mp4", get(proxy))
         .route("/projects/{id}/ai-path.bin", get(ai_path))
         .route("/projects/{id}/edits", get(get_edits).put(put_edits))
+        .route("/projects/{id}/pitch", put(put_pitch).delete(delete_pitch))
         .route("/projects/{id}/exports", post(create_export))
         .route(
             "/projects/{id}/exports/{eid}",
@@ -342,6 +343,8 @@ struct NewProject {
     right_lens_id: Option<String>,
     #[serde(default)]
     style: Option<Style>,
+    #[serde(default)]
+    ai_accuracy: Option<AiAccuracy>,
 }
 
 fn clean_name(name: &str) -> ApiResult<String> {
@@ -373,6 +376,10 @@ async fn create_project(State(s): State<AppState>, body: Body) -> ApiResult<Resp
         lens_id: Some(lens_id),
         right_lens_id: req.right_lens_id,
         style: req.style.unwrap_or(Style::Broadcast),
+        ai_accuracy: req.ai_accuracy.unwrap_or_default(),
+        pitch: None,
+        ai_run: None,
+        ai_seen: None,
         status: Status::New,
         files: Files::default(),
         job: None,
@@ -424,7 +431,15 @@ async fn patch_project(
                 .map_err(|_| ApiError::bad_request("Unknown camera style."))?,
         ),
     };
-    let changes_processing = lens.is_some() || right_lens.is_some() || style.is_some();
+    let accuracy: Option<AiAccuracy> = match req.get("aiAccuracy") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|_| ApiError::bad_request("Unknown AI accuracy."))?,
+        ),
+    };
+    let changes_processing =
+        lens.is_some() || right_lens.is_some() || style.is_some() || accuracy.is_some();
     if changes_processing && s.jobs.busy(&id) {
         return Err(ApiError::conflict(BUSY));
     }
@@ -450,6 +465,9 @@ async fn patch_project(
             }
             if let Some(st) = style {
                 m.style = st;
+            }
+            if let Some(a) = accuracy {
+                m.ai_accuracy = a;
             }
         })
         .ok_or_else(ApiError::no_project)?;
@@ -594,7 +612,7 @@ async fn upload(
             .map_err(|e| ApiError::internal("The old video could not be replaced.", e))?;
     }
     remove_matched(&dir, &side);
-    for f in DERIVED_FILES {
+    for f in DERIVED_FILES.into_iter().chain(crate::seen::SEEN_FILES) {
         let _ = tokio::fs::remove_file(dir.join(f)).await;
     }
     let dest = dir.join(format!("{side}.{}", extension(&name)));
@@ -625,6 +643,9 @@ async fn upload(
             m.frame_count = None;
             m.error = None;
             m.warnings.clear();
+            // Marked on the old video.
+            m.pitch = None;
+            m.ai_run = None;
         })
         .ok_or_else(ApiError::no_project)?;
     meta.disk_bytes = dir_size(&dir);
@@ -735,6 +756,9 @@ async fn swap(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiRes
             m.frame_count = None;
             m.error = None;
             m.warnings.clear();
+            // Marked on the videos the other way round.
+            m.pitch = None;
+            m.ai_run = None;
         })
         .ok_or_else(ApiError::no_project)?;
     Ok(json(&meta))
@@ -773,6 +797,7 @@ fn swap_files(dir: &Path) -> std::io::Result<()> {
     for f in DERIVED_FILES {
         let _ = std::fs::remove_file(dir.join(f));
     }
+    crate::seen::remove(dir);
     Ok(())
 }
 
@@ -856,6 +881,78 @@ async fn put_edits(
         .map_err(|e| ApiError::internal("Your edits could not be saved.", e))?
         .map_err(|e| ApiError::internal("Your edits could not be saved.", e))?;
     Ok(json(&json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Pitch outline ("Mark the pitch")
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PitchBody {
+    points: Vec<[f64; 2]>,
+    left: Vec<[f64; 2]>,
+    right: Vec<[f64; 2]>,
+}
+
+/// Check an outline from the editor (DESIGN.md 4.8).
+fn validate_pitch(body: PitchBody) -> Result<PitchOutline, String> {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let bad = || "The pitch outline was not understood. Please mark the pitch again.".to_string();
+    if body.points.len() < 3 || body.points.len() > 100 {
+        return Err(bad());
+    }
+    let aims_ok = body.points.iter().all(|[yaw, pitch]| {
+        yaw.is_finite() && pitch.is_finite() && yaw.abs() <= PI + 1e-6 && pitch.abs() <= FRAC_PI_2
+    });
+    let polygon_ok = |p: &Vec<[f64; 2]>| {
+        (p.is_empty() || (3..=500).contains(&p.len()))
+            && p.iter()
+                .flatten()
+                .all(|v| v.is_finite() && (-0.01..=1.01).contains(v))
+    };
+    if !aims_ok || !polygon_ok(&body.left) || !polygon_ok(&body.right) {
+        return Err(bad());
+    }
+    if body.left.is_empty() && body.right.is_empty() {
+        return Err(
+            "The outline does not cover any part of the two videos. Click the corners \
+                    of the pitch on the picture."
+                .into(),
+        );
+    }
+    Ok(PitchOutline {
+        id: new_id(),
+        points: body.points,
+        left: body.left,
+        right: body.right,
+    })
+}
+
+async fn put_pitch(
+    State(s): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    body: Body,
+) -> ApiResult<Response> {
+    project(&s, &id)?;
+    let body: PitchBody = read_json(body, JSON_LIMIT).await?;
+    let outline = validate_pitch(body).map_err(ApiError::bad_request)?;
+    let (meta, _) = s
+        .store
+        .update(&id, |m| m.pitch = Some(outline))
+        .ok_or_else(ApiError::no_project)?;
+    Ok(json(&meta))
+}
+
+async fn delete_pitch(
+    State(s): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<Response> {
+    project(&s, &id)?;
+    let (meta, _) = s
+        .store
+        .update(&id, |m| m.pitch = None)
+        .ok_or_else(ApiError::no_project)?;
+    Ok(json(&meta))
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,6 +1223,7 @@ mod tests {
             let id = p["id"].as_str().unwrap().to_string();
             assert_eq!(p["status"], "new");
             assert_eq!(p["style"], "action");
+            assert_eq!(p["aiAccuracy"], "best", "every frame by default");
             assert_eq!(p["lensId"], DEFAULT_LENS);
 
             let (code, _, b) = call(&app, "GET", "/api/projects", &[], "").await;
@@ -1139,6 +1237,18 @@ mod tests {
             assert_eq!(v(&b)["name"], "Final");
             assert_eq!(v(&b)["lensId"], lens.as_str());
             assert_eq!(v(&b)["style"], "frame_all");
+            let uri = format!("/api/projects/{id}");
+            let (code, _, b) = call(&app, "PATCH", &uri, &[], r#"{"style":"ball"}"#).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(v(&b)["style"], "ball");
+            let (code, _, b) = call(&app, "PATCH", &uri, &[], r#"{"style":"wild"}"#).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert_eq!(v(&b)["error"], "Unknown camera style.");
+            let (_, _, b) = call(&app, "PATCH", &uri, &[], r#"{"aiAccuracy":"faster"}"#).await;
+            assert_eq!(v(&b)["aiAccuracy"], "faster");
+            let (code, _, b) = call(&app, "PATCH", &uri, &[], r#"{"aiAccuracy":"perfect"}"#).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert_eq!(v(&b)["error"], "Unknown AI accuracy.");
             let (code, _, _) = call(
                 &app,
                 "PATCH",
@@ -1699,6 +1809,61 @@ mod tests {
                 "{:?}",
                 p.warnings
             );
+        });
+    }
+
+    /// "Mark the pitch": saved with the match, checked, removed; a new video
+    /// drops it.
+    #[test]
+    fn pitch_outline() {
+        rt().block_on(async {
+            let (_tmp, st) = state();
+            let app = app(&st);
+            let (_, _, b) = call(&app, "POST", "/api/projects", &[], r#"{"name":"x"}"#).await;
+            let id = v(&b)["id"].as_str().unwrap().to_string();
+            assert_eq!(v(&b)["pitch"], Value::Null);
+            let uri = format!("/api/projects/{id}/pitch");
+            let body = json!({
+                "points": [[0.9, -0.05], [-0.9, -0.05], [-0.8, -0.35], [0.8, -0.35]],
+                "left": [[0.1, 0.4], [0.95, 0.42], [0.9, 0.95], [0.12, 0.9]],
+                "right": [],
+            });
+            let (code, _, b) = call(&app, "PUT", &uri, &[], body.to_string()).await;
+            assert_eq!(code, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            let pitch = &v(&b)["pitch"];
+            assert_eq!(pitch["points"], body["points"]);
+            assert_eq!(pitch["left"], body["left"]);
+            assert_eq!(pitch["right"], json!([]));
+            let first = pitch["id"].as_str().unwrap().to_string();
+            let (_, _, b) = call(&app, "PUT", &uri, &[], body.to_string()).await;
+            assert_ne!(v(&b)["pitch"]["id"], first.as_str(), "a new id per save");
+            let roi = st.store.get(&id).unwrap().pitch.unwrap().field_roi();
+            assert_eq!(roi.left.len(), 4);
+            assert_eq!(roi.right.len(), 3, "the right camera ignores everything");
+
+            for (bad, words) in [
+                (json!({"points": [[0, 0], [1, 0]], "left": [], "right": []}), "not understood"),
+                (json!({"points": [[0, 0], [1, 0], [1, 1]], "left": [], "right": []}), "does not cover"),
+                (json!({"points": [[0, 0], [1, 0], [1, 1]], "left": [[0, 0], [2, 0], [0, 1]], "right": []}), "not understood"),
+                (json!({"points": [[0, 0], [9, 0], [1, 1]], "left": [[0, 0], [1, 0], [0, 1]], "right": []}), "not understood"),
+                (json!({"points": [[0, 0], [1, 0], [1, 1]], "left": [[0, 0], [1, 0]], "right": []}), "not understood"),
+                (json!({"points": [[0, 0], [1, 0], [1, 1]]}), "not understood"),
+            ] {
+                let (code, _, b) = call(&app, "PUT", &uri, &[], bad.to_string()).await;
+                assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}");
+                assert!(v(&b)["error"].as_str().unwrap().contains(words), "{bad}: {}", String::from_utf8_lossy(&b));
+            }
+            assert!(st.store.get(&id).unwrap().pitch.is_some(), "refused saves change nothing");
+
+            let (code, _, b) = call(&app, "DELETE", &uri, &[], "").await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(v(&b)["pitch"], Value::Null);
+
+            // Marked on a video that is then replaced: gone.
+            call(&app, "PUT", &uri, &[], body.to_string()).await;
+            let up = format!("/api/projects/{id}/files/left");
+            let (_, _, b) = call(&app, "PUT", &up, &[("x-filename", "a.mp4")], "data").await;
+            assert_eq!(v(&b)["pitch"], Value::Null);
         });
     }
 

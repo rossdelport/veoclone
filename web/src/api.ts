@@ -1,7 +1,9 @@
 // Typed client for the VeoClone helper's HTTP API (docs/veoclone/DESIGN.md 4.5).
 import type { CalibInfo, Edits, ExportQuality, Fps } from "./engine";
 
-export type Style = "broadcast" | "action" | "frame_all";
+export type Style = "broadcast" | "action" | "frame_all" | "ball";
+/** "AI accuracy": best = the AI looks at every frame, faster = every 3rd frame. */
+export type AiAccuracy = "best" | "faster";
 export type ProjectStatus = "new" | "uploaded" | "queued" | "processing" | "ready" | "failed" | "cancelled";
 export type Side = "left" | "right";
 export type JobStep = "probe" | "calibrate" | "proxy" | "track" | "export" | "finalize" | "overlay";
@@ -23,10 +25,31 @@ export interface LensOption {
   id: string;
   /** "iPhone 15 Pro", newest first; "Not sure" for the generic choices. */
   model: string;
-  /** ultra = 0.5× ultra wide, main = 1× normal. */
-  lens: "ultra" | "main";
+  /** iPhones: ultra = 0.5× ultra wide, main = 1× normal; GoPros: wide, linear; auto = detect from the video file. */
+  lens: "ultra" | "main" | "wide" | "linear" | "auto";
   label: string;
   note?: string;
+  /** "iPhone" or "Action camera"; empty for "Not sure". */
+  group?: string;
+}
+
+/** "Mark the pitch" (DESIGN.md 4.8): what the editor saves and the helper keeps. */
+export interface PitchOutline {
+  /** Changes with every save. */
+  id: string;
+  /** The outline as aims, [yaw, pitch] radians. */
+  points: [number, number][];
+  /** Per camera: normalised image polygon; [] when that camera sees none of the pitch. */
+  left: [number, number][];
+  right: [number, number][];
+}
+
+/** The settings the current AI camera path was made with. */
+export interface AiRun {
+  style: Style;
+  aiAccuracy: AiAccuracy;
+  /** PitchOutline.id of the outline the AI used, if any. */
+  pitchId: string | null;
 }
 
 export interface ProbeInfo {
@@ -85,6 +108,14 @@ export interface ProjectMeta {
   /** The right phone's lens when the two phones are different models; null (or missing, older VeoClone): the same as the left. */
   rightLensId?: string | null;
   style: Style;
+  /** Missing from older VeoClone versions: best. */
+  aiAccuracy?: AiAccuracy;
+  /** "Mark the pitch"; null (or missing): not marked. */
+  pitch?: PitchOutline | null;
+  /** What the current AI path was made with; null (or missing): not known. */
+  aiRun?: AiRun | null;
+  /** What the AI saw last time is kept (it looked at every `every`th frame): re-runs take seconds. */
+  aiSeen?: { every: number } | null;
   status: ProjectStatus;
   files: { left?: FileInfo; right?: FileInfo };
   job: JobInfo | null;
@@ -119,6 +150,22 @@ export interface ExportRequest {
    */
   rigTiltDeg: number;
   rigRollDeg: number;
+}
+
+/**
+ * Can "Run the AI again" reuse what the AI saw last time (seconds instead of
+ * a pass over the whole video)? Only for the same or a coarser AI accuracy.
+ */
+export function quickRerun(p: ProjectMeta, accuracy: AiAccuracy = p.aiAccuracy ?? "best"): boolean {
+  const every = accuracy === "faster" ? 3 : 1;
+  return !!p.aiSeen && every % p.aiSeen.every === 0;
+}
+
+/** How long running the AI again takes, in words. */
+export function rerunTime(p: ProjectMeta, accuracy?: AiAccuracy): string {
+  return quickRerun(p, accuracy)
+    ? "This takes a few seconds: VeoClone reuses what the AI saw last time."
+    : "This takes about as long as the first time: the AI watches the whole match again.";
 }
 
 /** An error with a plain-English message; `detail` holds the technical part. */
@@ -237,10 +284,13 @@ export const api = {
   health: () => json<Health>("GET", "/api/health", undefined, 4000),
   lenses: () => json<LensOption[]>("GET", "/api/lenses"),
   listProjects: () => json<ProjectMeta[]>("GET", "/api/projects"),
-  createProject: (body: { name: string; lensId?: string | null; rightLensId?: string | null; style: Style }) =>
+  createProject: (body: { name: string; lensId?: string | null; rightLensId?: string | null; style: Style; aiAccuracy?: AiAccuracy }) =>
     json<ProjectMeta>("POST", "/api/projects", body),
   getProject: (id: string) => json<ProjectMeta>("GET", project(id)),
-  updateProject: (id: string, body: { name?: string; lensId?: string | null; rightLensId?: string | null; style?: Style }) =>
+  updateProject: (
+    id: string,
+    body: { name?: string; lensId?: string | null; rightLensId?: string | null; style?: Style; aiAccuracy?: AiAccuracy },
+  ) =>
     json<ProjectMeta>("PATCH", project(id), body),
   deleteProject: (id: string) => request("DELETE", project(id)).then(() => undefined),
   process: (id: string) => json<ProjectMeta>("POST", `${project(id)}/process`),
@@ -252,6 +302,9 @@ export const api = {
     return new Float32Array(await res.arrayBuffer());
   },
   getEdits: (id: string) => json<unknown>("GET", `${project(id)}/edits`),
+  setPitch: (id: string, body: { points: [number, number][]; left: [number, number][]; right: [number, number][] }) =>
+    json<ProjectMeta>("PUT", `${project(id)}/pitch`, body),
+  clearPitch: (id: string) => json<ProjectMeta>("DELETE", `${project(id)}/pitch`),
   putEdits: (id: string, edits: Edits) => request("PUT", `${project(id)}/edits`, edits).then(() => undefined),
   startExport: (id: string, body: ExportRequest) =>
     json<ExportMeta>("POST", `${project(id)}/exports`, body, 120_000),

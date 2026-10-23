@@ -1,5 +1,5 @@
 // New match: name, iPhone model, camera style, the two videos, filming tips.
-import { api, ApiError, uploadFile, type ProjectMeta, type Side, type Style, type Upload } from "../api";
+import { api, ApiError, uploadFile, type AiAccuracy, type ProjectMeta, type Side, type Style, type Upload } from "../api";
 import { button, describeError, errorBox, notice, toast } from "./common";
 import { formatBytes, h, icon, setChildren } from "./dom";
 import { assignFiles, dropZone, type DropZone } from "./dropzone";
@@ -12,19 +12,50 @@ export const STYLES: { id: Style; name: string; text: string }[] = [
   { id: "broadcast", name: "Broadcast", text: "Calm, TV-style camera that follows the play. Best for most matches." },
   { id: "action", name: "Action", text: "Follows the ball more closely and zooms in tighter on the action." },
   { id: "frame_all", name: "Wide", text: "Keeps all the players in the picture. Wider and steadier." },
+  { id: "ball", name: "Follow the ball", text: "Keeps the ball in the middle, at a fixed zoom. Try it when the camera wanders off to people next to the pitch." },
 ];
 
-/** Style picker: three big radio cards. */
+/** Style picker: four big radio cards. */
 export function stylePicker(value: Style, onChange: (s: Style) => void, name = "style"): HTMLElement {
   return h(
     "div",
-    { class: "choice-grid", role: "radiogroup", "aria-label": "Camera style" },
+    { class: "choice-grid choice-grid-4", role: "radiogroup", "aria-label": "Camera style" },
     STYLES.map((s) =>
       h(
         "label",
         { class: "choice" },
         h("input", { type: "radio", name, value: s.id, checked: s.id === value, onChange: () => onChange(s.id) }),
         h("span", { class: "choice-body" }, h("strong", null, s.name), h("span", { class: "muted small" }, s.text)),
+      ),
+    ),
+  );
+}
+
+export const ACCURACY: { id: AiAccuracy; name: string; text: string }[] = [
+  {
+    id: "best",
+    name: "Best – check every frame (slower)",
+    text: "The AI looks at every frame, so the camera reacts sooner and loses the ball less often. The AI step takes longer: up to 3 times as long.",
+  },
+  {
+    id: "faster",
+    name: "Faster – every 3rd frame",
+    text: "The AI looks at every 3rd frame. Quicker, but the camera can react a little late to fast play.",
+  },
+];
+
+/** "AI accuracy": every frame (default) or every 3rd frame. */
+export function accuracyPicker(value: AiAccuracy | undefined, onChange: (a: AiAccuracy) => void, name = "accuracy"): HTMLElement {
+  const current = value ?? "best";
+  return h(
+    "div",
+    { class: "choice-grid", role: "radiogroup", "aria-label": "AI accuracy" },
+    ACCURACY.map((a) =>
+      h(
+        "label",
+        { class: "choice" },
+        h("input", { type: "radio", name, value: a.id, checked: a.id === current, onChange: () => onChange(a.id) }),
+        h("span", { class: "choice-body" }, h("strong", null, a.name), h("span", { class: "muted small" }, a.text)),
       ),
     ),
   );
@@ -41,6 +72,10 @@ export function filmingTips(): HTMLElement {
     ["Start both together", "Press record on both phones within a few seconds of each other. VeoClone lines them up using the sound."],
     ["Keep them still", "Don't touch or move the phones while recording. Plug in power banks for a full match."],
     ["One video per phone", "If you stopped recording at half-time, make two matches: one for each half."],
+    [
+      "Filming with GoPros?",
+      "Use two identical GoPros, both set to 4K, 30 fps, 16:9, Lens: Wide, HyperSmooth: Off and Horizon Levelling: Off. Set Anti-Flicker to 50 Hz in the UK, Europe and Australia (60 Hz in North America). A GoPro saves a long recording as several files: join each camera's files into one video first (see the user guide).",
+    ],
   ];
   return h(
     "aside",
@@ -97,6 +132,7 @@ function defaultName(): string {
 export function newMatchPage(ctx: PageContext): Page {
   ctx.setTitle("New match");
   let style: Style = "broadcast";
+  let aiAccuracy: AiAccuracy = "best";
   let lensId: string | null = DEFAULT_LENS;
   let rightLensId: string | null = null; // the right phone is another model
   let lensesLoaded = false;
@@ -155,8 +191,8 @@ export function newMatchPage(ctx: PageContext): Page {
           h(
             "section",
             { class: "card form-section" },
-            h("h2", null, "Which iPhone and lens filmed this?"),
-            h("p", { class: "muted small" }, "Two identical phones work best, but different iPhones are fine: tick the box and choose each phone. Not sure which iPhone? Leave it on Not sure."),
+            h("h2", null, "Which camera and lens filmed this?"),
+            h("p", { class: "muted small" }, "Two identical phones work best, but different iPhones are fine: tick the box and choose each phone. Not sure which iPhone? Leave it on Not sure. Filmed with GoPros? Choose “GoPro or other action camera – detect automatically”."),
             lensHost,
           ),
           h(
@@ -165,6 +201,13 @@ export function newMatchPage(ctx: PageContext): Page {
             h("h2", null, "Camera style"),
             h("p", { class: "muted small" }, "How the AI camera should move. You can fine-tune everything in the editor afterwards."),
             stylePicker(style, (s) => (style = s)),
+          ),
+          h(
+            "section",
+            { class: "card form-section" },
+            h("h2", null, "AI accuracy"),
+            h("p", { class: "muted small" }, "How often the AI looks at the picture to find the ball and the players."),
+            accuracyPicker(aiAccuracy, (a) => (aiAccuracy = a)),
           ),
           aiNote,
           h("div", { class: "start-row" }, start, stop, status),
@@ -239,8 +282,8 @@ export function newMatchPage(ctx: PageContext): Page {
     setChildren(status, h("p", { class: "small" }, "Sending your videos to VeoClone. Keep this page open."));
     try {
       await stopping; // a Stop that is still tidying up
-      if (projectId) await api.updateProject(projectId, { name, lensId, rightLensId, style });
-      else projectId = (await api.createProject({ name, lensId, rightLensId, style })).id;
+      if (projectId) await api.updateProject(projectId, { name, lensId, rightLensId, style, aiAccuracy });
+      else projectId = (await api.createProject({ name, lensId, rightLensId, style, aiAccuracy })).id;
       await sendVideos(projectId, zones, (u) => (upload = u));
       await api.process(projectId);
       busy = false;

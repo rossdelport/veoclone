@@ -219,7 +219,14 @@ pub fn calibrate_videos(
 
     // Lens profiles: direct params > path > auto-detect.
     match (options.left_params.clone(), options.right_params.clone()) {
-        (Some(lp), Some(rp)) => pipeline.set_profiles(lp, rp),
+        (Some(lp), Some(rp)) => {
+            pipeline.set_profiles(lp, rp);
+            // A chosen lens must not lose the IMU sync and the rig
+            // tilt/roll of cameras that record them (detect_profiles
+            // would have found that out).
+            check_interrupted(interrupted)?;
+            pipeline.probe_native_gyro();
+        }
         (left_params, right_params) => {
             if left_params.is_some() || right_params.is_some() {
                 log::warn!(

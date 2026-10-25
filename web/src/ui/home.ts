@@ -5,6 +5,7 @@ import { formatBytes, formatDate, formatTimeLeft, h, icon, plural, setChildren }
 import { onHelperState } from "./health";
 import { I } from "./icons";
 import type { Page, PageContext } from "./page";
+import { updatesCard } from "./updates";
 
 /**
  * Plain-words status of a match and a colour class; while VeoClone works on
@@ -45,6 +46,7 @@ export function openHref(p: ProjectMeta): string {
 export function homePage(ctx: PageContext): Page {
   ctx.setTitle("Your matches");
   const list = h("div", { class: "match-list", "aria-live": "polite" });
+  const updates = updatesCard();
   ctx.root.append(
     h(
       "div",
@@ -56,6 +58,7 @@ export function homePage(ctx: PageContext): Page {
         button("New match", () => (location.hash = "#/new"), { variant: "primary", icon: I.plus, big: true }),
       ),
       list,
+      updates.el,
     ),
   );
   setChildren(list, h("div", { class: "skeleton-card" }), h("div", { class: "skeleton-card" }));
@@ -165,7 +168,8 @@ export function homePage(ctx: PageContext): Page {
     const wasOnline = online;
     online = s.kind === "online";
     if (online && !wasOnline) void load();
-    if (s.kind === "offline") {
+    // Restarting after an update: keep the list, it comes back in a moment.
+    if (s.kind === "offline" && !s.restarting) {
       clearTimeout(timer);
       setChildren(
         list,
@@ -179,6 +183,7 @@ export function homePage(ctx: PageContext): Page {
       disposed = true;
       clearTimeout(timer);
       unsubscribe();
+      updates.dispose();
     },
   };
 }

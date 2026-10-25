@@ -67,7 +67,7 @@ workflows needs to change. Two things to know:
 |---|---|
 | Any push or pull request | **VeoClone CI** checks the editor (type check, tests, build) and the helper (formatting, clippy, tests, an export test on a software GPU). |
 | Push to `main` or a `claude/...` branch | **VeoClone Windows** builds the VeoClone folder on a Windows computer, starts it once to check it works, and keeps it as a download on the run's page (Artifacts › VeoClone-windows) for 90 days. |
-| Push to the default branch | The same build also replaces the zip in the **"VeoClone for Windows (latest build)"** pre-release (tag `helper-latest`). The release is updated in place, so the link the user guide gives out never changes, and the old zip stays downloadable until the new one is fully uploaded. **VeoClone Pages** publishes the editor. (On other branches VeoClone Pages shows as skipped.) |
+| Push to the default branch | The same build also replaces the zip in the **"VeoClone for Windows (latest build)"** pre-release (tag `helper-latest`), then its `latest.json` (the build and the zip's size and SHA-256). The release is updated in place, so the link the user guide gives out never changes, and the old zip stays downloadable until the new one is fully uploaded. Installed copies of VeoClone read `latest.json` every few hours and update themselves to the new build (DESIGN.md 4.11). **VeoClone Pages** publishes the editor. (On other branches VeoClone Pages shows as skipped.) |
 | Tag `veoclone-v...` | **VeoClone Windows** makes a normal, permanent release with the zip, for example "VeoClone v0.2.0". |
 | Never by themselves | Reco's own workflows (**Rust CI**, **Release**, **Build Test Binary**, **Test Build (Windows GUI)**). They check and package Reco's own programs, not VeoClone, so in this repository they only run if someone starts them by hand (Actions › choose one › Run workflow). |
 
@@ -87,7 +87,10 @@ git push origin veoclone-v0.2.0
   "VeoClone isn't running" until VeoClone is started on that PC; that is
   expected.
 - The **Releases** page lists "VeoClone for Windows (latest build)" with
-  `VeoClone-windows.zip` under Assets.
+  `VeoClone-windows.zip` and `latest.json` under Assets. `latest.json`
+  names the commit the release notes name.
+- A VeoClone that is running shows "VeoClone is up to date" (or "Update
+  ready") under **VeoClone on this PC** on the editor's home page.
 
 ## Limits worth knowing
 
@@ -100,7 +103,14 @@ git push origin veoclone-v0.2.0
   yellow warning, and the download is fine.
 - GitHub Pages: 1 GB per site. The editor is well under 1 MB.
 - Release files can be up to 2 GB each. `VeoClone-windows.zip` is a few
-  hundred MB at most.
+  hundred MB at most (VeoClone's own zip reader does not read zip64, so it
+  must stay under 4 GB anyway).
+- Every push to the default branch is an update for everyone who has
+  VeoClone: installed copies take a newer `latest.json` within a few hours.
+  Anyone who can push to the default branch can therefore change the
+  program on those PCs; keep write access to the repository to people you
+  trust. Builds on other branches (and the artifacts of their runs) never
+  reach installed copies.
 
 ## How the online editor talks to VeoClone on your PC
 

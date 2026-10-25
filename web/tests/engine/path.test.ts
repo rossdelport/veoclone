@@ -10,6 +10,8 @@ import {
   poseAt,
   straightenOfMatch,
   straightenRadians,
+  WIDEST_VIEW_MAX_FOV,
+  widestViewMaxFov,
 } from "../../src/engine/path";
 import type { CalibInfo, Coverage, Edits, Keyframe } from "../../src/engine/types";
 import { buildRig, viewBasis, withRigTilt } from "../../src/engine/projection";
@@ -404,6 +406,98 @@ describe("computeFinalPath", () => {
     times.sort((a, b) => a - b);
     console.log(`computeFinalPath 162k frames, ${keyframes.length} keyframes: median ${times[2].toFixed(1)} ms`);
     expect(times[2]).toBeLessThan(100);
+  });
+});
+
+describe("computeFinalPath with a widest view (DESIGN.md 4.12)", () => {
+  const natural = widestViewMaxFov("natural");
+
+  it("uses the helper's limits: 34 and 44 degrees tall, about 57 and 71 across; none for widest or not set", () => {
+    expect(WIDEST_VIEW_MAX_FOV).toEqual({ natural: 34, wide: 44, widest: Infinity });
+    expect(widestViewMaxFov("wide")).toBe(44);
+    for (const w of ["widest", null, undefined, "toString", "fisheye"] as never[]) expect(widestViewMaxFov(w)).toBe(Infinity);
+    const across = (v: number) => (2 * Math.atan((16 / 9) * Math.tan((v * Math.PI) / 360)) * 180) / Math.PI;
+    expect(across(34)).toBeCloseTo(57.06, 1);
+    expect(across(44)).toBeCloseTo(71.4, 1);
+  });
+
+  it("no frame is wider than the limit: not the AI, not the Zoom slider, not a fix", () => {
+    const n = 600;
+    const ai = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) ai.set([0.2 * Math.sin(i / 40), -0.05, 25 + 30 * Math.abs(Math.sin(i / 90))], i * 3);
+    const e = edits(n, { keyframes: [kf(300, 0.1, 0, 80)], zoom: 0.5 });
+    const free = computeFinalPath(ai, calibWith(n), e);
+    const out = computeFinalPath(ai, calibWith(n), e, natural);
+    let capped = 0;
+    for (let f = 0; f < n; f++) {
+      const want = Math.min(free[f * 3 + 2], natural);
+      expect(out[f * 3 + 2]).toBe(f32(want));
+      if (free[f * 3 + 2] > natural) capped++;
+      // Only the zoom changes (the huge coverage clamps nothing here).
+      expect(out[f * 3]).toBe(free[f * 3]);
+      expect(out[f * 3 + 1]).toBe(free[f * 3 + 1]);
+    }
+    expect(capped).toBeGreaterThan(n / 2);
+    expect(poseAt(out, 300).fov).toBe(34); // the wide fix
+    expect(Math.max(...Array.from(out).filter((_, i) => i % 3 === 2))).toBe(34);
+  });
+
+  it("zooming in is not limited", () => {
+    const n = 300;
+    const ai = constantAi(n, 0.1, 0, 30);
+    const e = edits(n, { zoom: 2, keyframes: [kf(150, 0, 0, 40)] });
+    const out = computeFinalPath(ai, calibWith(n), e, natural);
+    expect(sameBits(out, computeFinalPath(ai, calibWith(n), e))).toBe(true);
+    expect(poseAt(out, 0).fov).toBeCloseTo(15, 5);
+    expect(poseAt(out, 150).fov).toBeCloseTo(20, 5);
+  });
+
+  it("widest (or a match from before the setting) is exactly the path without a limit", () => {
+    const n = 400;
+    const cov = coverageFromMatch(RECO_TEST_MATCH);
+    const ai = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) ai.set([Math.sin(i / 10) * 3, Math.cos(i / 7), 10 + (i % 90)], i * 3);
+    const e = edits(n, { keyframes: [kf(100, 5, -2, 120)], zoom: 0.7 });
+    const base = computeFinalPath(ai, calibWith(n, cov), e);
+    for (const w of ["widest", null, undefined] as const) {
+      expect(sameBits(computeFinalPath(ai, calibWith(n, cov), e, widestViewMaxFov(w)), base)).toBe(true);
+    }
+  });
+
+  it("limits before Reco's clamp: the export's own clamp leaves every frame as it is", () => {
+    const cov = coverageFromMatch(RECO_TEST_MATCH);
+    const n = 400;
+    const ai = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) ai.set([Math.sin(i / 10) * 3, Math.cos(i / 7), 10 + (i % 90)], i * 3);
+    const e = edits(n, { keyframes: [kf(100, 5, -2, 120)], zoom: 0.7 });
+    for (const limit of [WIDEST_VIEW_MAX_FOV.natural, WIDEST_VIEW_MAX_FOV.wide]) {
+      const out = computeFinalPath(ai, calibWith(n, cov), e, limit);
+      for (let f = 0; f < n; f++) {
+        const p = poseAt(out, f);
+        const again = clampPose(p, cov, ASPECT);
+        expect(p.fov).toBeLessThanOrEqual(Math.min(limit, f32(cov.maxFovDeg)));
+        expect(p.yaw).toBeCloseTo(again.yaw, 5);
+        expect(p.pitch).toBeCloseTo(again.pitch, 5);
+        expect(p.fov).toBeCloseTo(again.fov, 4);
+      }
+      // A narrower view is clamped for its own size: frame 0 is the AI pose
+      // zoomed, limited, then clamped.
+      const want = clampPose({ yaw: ai[0], pitch: ai[1], fov: Math.min(ai[2] / 0.7, limit) }, cov, ASPECT);
+      expect(out[0]).toBeCloseTo(want.yaw, 6);
+      expect(out[1]).toBeCloseTo(want.pitch, 6);
+      expect(out[2]).toBeCloseTo(want.fov, 4);
+    }
+    // Coverage narrower than the limit: Reco's own cap wins.
+    const tight = { ...huge, maxFovDeg: 30 };
+    const out = computeFinalPath(constantAi(10, 0, 0, 50), calibWith(10, tight), edits(10), natural);
+    expect(poseAt(out, 5).fov).toBe(30);
+  });
+
+  it("ignores a broken limit", () => {
+    const n = 50;
+    const ai = constantAi(n, 0, 0, 50);
+    const base = computeFinalPath(ai, calibWith(n), edits(n));
+    for (const bad of [Number.NaN, 0, -5]) expect(sameBits(computeFinalPath(ai, calibWith(n), edits(n), bad), base)).toBe(true);
   });
 });
 

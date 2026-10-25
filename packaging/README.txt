@@ -28,6 +28,24 @@ If the browser did not open, go to:  http://127.0.0.1:47863/
 The online editor also works while VeoClone is running:
 https://rossdelport.github.io/veoclone/
 
+Next time, start VeoClone from the Start menu (it adds itself there the
+first time), or double-click VeoClone.exe again.
+
+
+UPDATES AND STARTING WITH WINDOWS
+---------------------------------
+VeoClone updates itself: you don't need to download this zip again. It
+downloads a new version in the background, checks it, and installs it when
+it is not busy (never while it processes a match, makes a video or
+receives a video), then restarts by itself in the same window. Your matches
+are not touched. Keep this folder somewhere you can change files, such as
+Documents (not Program Files).
+The home page of the editor shows "VeoClone on this PC": whether it is up
+to date (with "Install now" when an update is ready), and two settings:
+- "Update VeoClone automatically" (on by default).
+- "Start VeoClone when Windows starts": VeoClone then starts by itself in
+  a minimised window when you sign in, without opening the browser.
+
 
 FILMING (on both iPhones)
 -------------------------
@@ -84,6 +102,9 @@ IF SOMETHING GOES WRONG
 - "We couldn't line up the two videos": the videos may be the wrong way
   round. Click "Swap left and right and try again".
 - Videos not lined up: start the phones closer together and clap.
+- "VeoClone couldn't update itself": it keeps the version you have and
+  tries again later. If it keeps failing, download VeoClone again and unzip
+  it over this folder (your matches are kept).
 - Each match folder has a log.txt file; include it when you ask for help.
 
 
@@ -99,6 +120,7 @@ onnxruntime.dll, DirectML.dll
 vcruntime140*.dll, msvcp140*.dll
                     Microsoft Visual C++ runtime
 LICENSE             VeoClone's licence (GNU AGPL v3.0)
+version.json        which version this is (VeoClone reads it to update itself)
 licenses\           licences of the other programs included
 
 

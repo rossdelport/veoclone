@@ -64,6 +64,10 @@ pub struct AppState {
     pub info: Arc<HelperInfo>,
     /// Uploads in progress per project (processing waits for them).
     pub uploads: Arc<Mutex<HashMap<String, usize>>>,
+    /// Self-update (DESIGN.md 4.11).
+    pub updater: Arc<crate::update::Updater>,
+    pub settings: Arc<crate::settings::SettingsStore>,
+    pub shortcuts: Arc<crate::shortcuts::Shortcuts>,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +132,10 @@ fn json<T: Serialize>(value: &T) -> Response {
 const BUSY: &str = "This match is busy. Wait for it to finish or press Cancel first.";
 
 /// Read a JSON request body of at most `limit` bytes.
-async fn read_json<T: serde::de::DeserializeOwned>(body: Body, limit: usize) -> ApiResult<T> {
+pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(
+    body: Body,
+    limit: usize,
+) -> ApiResult<T> {
     let bytes = axum::body::to_bytes(body, limit).await.map_err(|e| {
         ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "The request is too big.").detail(e)
     })?;
@@ -176,6 +183,12 @@ pub fn router(state: AppState, port: u16, origins: &[String], web_dir: &Path) ->
         .route("/projects/{id}/exports/{eid}/file", get(export_file))
         .route("/projects/{id}/open-folder", post(open_folder))
         .route("/projects/{id}/swap", post(swap))
+        .route("/update/check", post(crate::update::check))
+        .route("/update/install", post(crate::update::install))
+        .route(
+            "/settings",
+            get(crate::update::get_settings).patch(crate::update::patch_settings),
+        )
         .fallback(|| async {
             ApiError::new(StatusCode::NOT_FOUND, "Unknown address.").into_response()
         });
@@ -216,9 +229,14 @@ pub fn router(state: AppState, port: u16, origins: &[String], web_dir: &Path) ->
         hosts: vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")],
         origins,
     });
+    let activity = state.updater.activity.clone();
     Router::new()
         .nest("/api", api)
         .merge(web)
+        .layer(middleware::from_fn_with_state(
+            activity,
+            crate::update::track,
+        ))
         .layer(DefaultBodyLimit::disable())
         .layer(cors)
         .layer(middleware::from_fn_with_state(allowed, guard))
@@ -292,7 +310,8 @@ async fn health(State(s): State<AppState>) -> Response {
         });
     json(&json!({
         "app": "veoclone-helper",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": s.updater.build().to_json(),
+        "update": s.updater.status(),
         "gpu": gpu,
         "ai": ai,
         "ffmpeg": info.tools.ffmpeg.is_some() && info.tools.ffprobe.is_some(),
@@ -345,6 +364,8 @@ struct NewProject {
     style: Option<Style>,
     #[serde(default)]
     ai_accuracy: Option<AiAccuracy>,
+    #[serde(default)]
+    widest_view: Option<crate::seen::WidestView>,
 }
 
 fn clean_name(name: &str) -> ApiResult<String> {
@@ -377,6 +398,10 @@ async fn create_project(State(s): State<AppState>, body: Body) -> ApiResult<Resp
         right_lens_id: req.right_lens_id,
         style: req.style.unwrap_or(Style::Broadcast),
         ai_accuracy: req.ai_accuracy.unwrap_or_default(),
+        widest_view: Some(
+            req.widest_view
+                .unwrap_or(crate::seen::WidestView::NEW_MATCH),
+        ),
         pitch: None,
         ai_run: None,
         ai_seen: None,
@@ -438,8 +463,18 @@ async fn patch_project(
                 .map_err(|_| ApiError::bad_request("Unknown AI accuracy."))?,
         ),
     };
-    let changes_processing =
-        lens.is_some() || right_lens.is_some() || style.is_some() || accuracy.is_some();
+    let widest: Option<crate::seen::WidestView> = match req.get("widestView") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|_| ApiError::bad_request("Unknown widest view."))?,
+        ),
+    };
+    let changes_processing = lens.is_some()
+        || right_lens.is_some()
+        || style.is_some()
+        || accuracy.is_some()
+        || widest.is_some();
     if changes_processing && s.jobs.busy(&id) {
         return Err(ApiError::conflict(BUSY));
     }
@@ -468,6 +503,9 @@ async fn patch_project(
             }
             if let Some(a) = accuracy {
                 m.ai_accuracy = a;
+            }
+            if let Some(w) = widest {
+                m.widest_view = Some(w);
             }
         })
         .ok_or_else(ApiError::no_project)?;
@@ -1191,11 +1229,31 @@ mod tests {
             ai: Mutex::new(None),
             model: None,
         });
+        let uploads: Arc<Mutex<HashMap<String, usize>>> = Default::default();
+        let settings = Arc::new(crate::settings::SettingsStore::open(tmp.path()));
+        let updater = crate::update::Updater::new(
+            crate::update::Config {
+                build: crate::update::Build::dev(),
+                install: tmp.path().to_path_buf(),
+                data_dir: tmp.path().to_path_buf(),
+                url: crate::update::DEFAULT_URL.into(),
+                relaunch: Vec::new(),
+                updated_from: None,
+            },
+            settings.clone(),
+            Arc::new(crate::update::AppWork {
+                jobs: jobs.clone(),
+                uploads: uploads.clone(),
+            }),
+        );
         let st = AppState {
             store,
             jobs,
             info,
-            uploads: Default::default(),
+            uploads,
+            updater,
+            settings,
+            shortcuts: Arc::new(crate::shortcuts::Shortcuts::new(PathBuf::from("VeoClone"))),
         };
         (tmp, st)
     }
@@ -1271,6 +1329,7 @@ mod tests {
             assert_eq!(p["status"], "new");
             assert_eq!(p["style"], "action");
             assert_eq!(p["aiAccuracy"], "best", "every frame by default");
+            assert_eq!(p["widestView"], "natural", "new matches look like Veo");
             assert_eq!(p["lensId"], DEFAULT_LENS);
 
             let (code, _, b) = call(&app, "GET", "/api/projects", &[], "").await;
@@ -1296,6 +1355,11 @@ mod tests {
             let (code, _, b) = call(&app, "PATCH", &uri, &[], r#"{"aiAccuracy":"perfect"}"#).await;
             assert_eq!(code, StatusCode::BAD_REQUEST);
             assert_eq!(v(&b)["error"], "Unknown AI accuracy.");
+            let (_, _, b) = call(&app, "PATCH", &uri, &[], r#"{"widestView":"widest"}"#).await;
+            assert_eq!(v(&b)["widestView"], "widest");
+            let (code, _, b) = call(&app, "PATCH", &uri, &[], r#"{"widestView":"huge"}"#).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert_eq!(v(&b)["error"], "Unknown widest view.");
             let (code, _, _) = call(
                 &app,
                 "PATCH",
@@ -2056,5 +2120,102 @@ mod tests {
             content_disposition("Café final.mp4"),
             "attachment; filename=\"Caf_ final.mp4\"; filename*=UTF-8''Caf%C3%A9%20final.mp4"
         );
+    }
+
+    /// Version and update status in /api/health, the update calls (a test
+    /// build never updates), and the settings (DESIGN.md 4.11).
+    #[test]
+    fn update_status_and_settings() {
+        rt().block_on(async {
+            let (tmp, st) = state();
+            let app = app(&st);
+            let (_, _, b) = call(&app, "GET", "/api/health", &[], "").await;
+            let h = v(&b);
+            assert_eq!(h["version"]["sha"], "dev");
+            assert_eq!(h["version"]["date"], Value::Null);
+            assert_eq!(h["version"]["number"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(h["update"]["state"], "disabled");
+            assert_eq!(h["update"]["canUpdate"], false);
+            assert!(
+                h["update"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("doesn't update")
+            );
+
+            for path in ["/api/update/check", "/api/update/install"] {
+                let (code, _, b) = call(&app, "POST", path, &[], "").await;
+                assert_eq!(code, StatusCode::CONFLICT, "{path}");
+                assert!(
+                    v(&b)["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("development copy")
+                );
+            }
+
+            let (code, _, b) = call(&app, "GET", "/api/settings", &[], "").await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(v(&b)["autoUpdate"], true);
+            if !cfg!(windows) {
+                assert_eq!(v(&b)["startWithWindows"], Value::Null);
+            }
+            let (code, _, b) = call(
+                &app,
+                "PATCH",
+                "/api/settings",
+                &[],
+                r#"{"autoUpdate":false}"#,
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(v(&b)["autoUpdate"], false);
+            assert!(
+                !crate::settings::SettingsStore::open(tmp.path())
+                    .get()
+                    .auto_update
+            );
+            let (_, _, b) = call(&app, "GET", "/api/health", &[], "").await;
+            assert_eq!(v(&b)["update"]["auto"], false);
+
+            let (code, _, b) = call(
+                &app,
+                "PATCH",
+                "/api/settings",
+                &[],
+                r#"{"autoUpdate":"no"}"#,
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert!(v(&b)["error"].as_str().unwrap().contains("true or false"));
+            if !cfg!(windows) {
+                let body = r#"{"startWithWindows":true}"#;
+                let (code, _, b) = call(&app, "PATCH", "/api/settings", &[], body).await;
+                assert_eq!(code, StatusCode::BAD_REQUEST);
+                assert!(
+                    v(&b)["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("only works on Windows")
+                );
+            }
+            // Other web pages cannot change them.
+            let evil = [("origin", "https://evil.example")];
+            let body = r#"{"autoUpdate":true}"#;
+            let (code, _, _) = call(&app, "PATCH", "/api/settings", &evil, body).await;
+            assert_eq!(code, StatusCode::FORBIDDEN);
+            let (code, _, _) = call(&app, "POST", "/api/update/install", &evil, "").await;
+            assert_eq!(code, StatusCode::FORBIDDEN);
+            assert!(!st.settings.get().auto_update);
+
+            // Changes count as activity for the update's quiet time; the
+            // editor's own status calls do not.
+            assert_eq!(st.updater.activity.quiet_for(), None);
+            call(&app, "GET", "/api/projects", &[], "").await;
+            assert_eq!(st.updater.activity.quiet_for(), None);
+            call(&app, "POST", "/api/projects", &[], r#"{"name":"A"}"#).await;
+            assert!(st.updater.activity.quiet_for().is_some());
+            assert_eq!(st.updater.activity.in_flight(), 0);
+        });
     }
 }

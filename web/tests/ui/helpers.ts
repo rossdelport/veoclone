@@ -32,8 +32,9 @@ export interface MockState {
     rightLensId?: string | null;
     style: string;
     aiAccuracy?: string;
+    widestView?: string | null;
     pitch?: { id: string; points: [number, number][]; left: [number, number][]; right: [number, number][] } | null;
-    aiRun?: { style: string; aiAccuracy: string; pitchId: string | null } | null;
+    aiRun?: { style: string; aiAccuracy: string; pitchId: string | null; widestView?: string | null } | null;
     warnings: string[];
     files: { left?: MockFile; right?: MockFile };
     exports: { id: string; status: string }[];
@@ -55,7 +56,8 @@ export interface MockState {
     width: number;
     height: number;
     quality: string;
-    path: { frames: number; finite: boolean; first: { yaw: number; pitch: number; fov: number } };
+    /** maxFov: the widest frame of the camera path (vertical degrees). */
+    path: { frames: number; finite: boolean; first: { yaw: number; pitch: number; fov: number }; maxFov: number };
     /** Size of each text PNG and when it shows (seconds of the finished video). */
     overlays: { width: number; height: number; bytes: number; ranges: [number, number][] }[];
     /** Straighten picture, degrees. */
@@ -64,6 +66,8 @@ export interface MockState {
   };
   editsPuts: number;
   pitchPuts: number;
+  /** How often the editor fetched the AI camera path. */
+  aiPathGets: number;
   /** Every video file received, in order (part/parts: a video in several files). */
   uploads: { side: string; name: string; part: number | null; parts: number | null }[];
   openFolder: { project: string; export: string | null }[];

@@ -115,6 +115,9 @@ pub struct AiRun {
     pub ai_accuracy: AiAccuracy,
     /// `PitchOutline::id` of the outline used, if any.
     pub pitch_id: Option<String>,
+    /// The widest view used (none: made before the setting, i.e. Widest).
+    #[serde(default)]
+    pub widest_view: Option<crate::seen::WidestView>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +383,10 @@ pub struct ProjectMeta {
     /// every frame).
     #[serde(default)]
     pub ai_accuracy: AiAccuracy,
+    /// How far the AI camera may zoom out (none: a match from before this
+    /// setting, which keeps behaving as Widest; new matches: Natural).
+    #[serde(default)]
+    pub widest_view: Option<crate::seen::WidestView>,
     /// "Mark the pitch" (none: the AI looks everywhere).
     #[serde(default)]
     pub pitch: Option<PitchOutline>,
@@ -679,6 +686,7 @@ fn recovered_meta(id: &str, dir: &Path) -> ProjectMeta {
         right_lens_id: None,
         style: Style::Broadcast,
         ai_accuracy: AiAccuracy::Best,
+        widest_view: None,
         pitch: None,
         ai_run: None,
         ai_seen: None,
@@ -907,6 +915,7 @@ pub(crate) mod tests {
             right_lens_id: None,
             style: Style::Broadcast,
             ai_accuracy: AiAccuracy::Best,
+            widest_view: None,
             pitch: None,
             ai_run: None,
             ai_seen: None,
@@ -947,6 +956,7 @@ pub(crate) mod tests {
         assert_eq!(v["error"], serde_json::Value::Null);
         assert_eq!(v["style"], "frame_all");
         assert_eq!(v["aiAccuracy"], "best");
+        assert_eq!(v["widestView"], serde_json::Value::Null);
         assert_eq!(v["pitch"], serde_json::Value::Null);
         assert_eq!(v["aiRun"], serde_json::Value::Null);
         assert_eq!(v["status"], "new");
@@ -1199,8 +1209,10 @@ pub(crate) mod tests {
         assert_eq!(AiAccuracy::Faster.interval(), 3);
         let mut v = serde_json::to_value(sample("a1")).unwrap();
         v.as_object_mut().unwrap().remove("aiAccuracy");
+        v.as_object_mut().unwrap().remove("widestView");
         let m: ProjectMeta = serde_json::from_value(v).unwrap();
         assert_eq!(m.ai_accuracy, AiAccuracy::Best);
+        assert_eq!(m.widest_view, None, "older matches: no widest view stored");
         let f: AiAccuracy = serde_json::from_str("\"faster\"").unwrap();
         assert_eq!(f, AiAccuracy::Faster);
     }

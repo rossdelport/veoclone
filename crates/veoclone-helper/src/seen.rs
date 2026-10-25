@@ -1,7 +1,8 @@
 //! "What the AI saw": the AI pass records every person and ball the AI
-//! found (before any filtering), so a new camera style, AI accuracy or
-//! pitch outline needs no new pass over the video. [`repan`] rebuilds the
-//! AI camera path from the recording the way Reco's session does:
+//! found (before any filtering), so a new camera style, AI accuracy, widest
+//! view or pitch outline needs no new pass over the video. [`repan`]
+//! rebuilds the AI camera path from the recording the way Reco's session
+//! does:
 //!
 //! 1. per detection frame, the recorded detections of both cameras, left
 //!    then right (session/detection.rs), the ball-mode confidence floor and
@@ -29,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use reco_autocam::panners::FieldPannerConfig;
 use reco_core::calibration::{FieldRoi, MatchCalibration};
 use reco_core::detect::DetectionTarget;
 use reco_core::detect::detector::{
@@ -113,6 +115,91 @@ pub struct SeenMeta {
     pub frames: u64,
     /// The calibration's sync offset (the frame pairing).
     pub sync_offset: i64,
+}
+
+/// "Widest view": how far the AI camera may zoom out (DESIGN.md 4.12).
+///
+/// Reco's presets let the camera zoom out to 58° (broadcast), 48° (action)
+/// or 70° (frame-all) of vertical view, about 89°, 77° and 102° across at
+/// 16:9. A flat (rectilinear) picture that wide stretches whatever is at its
+/// sides: something at the left or right edge looks `1 / cos²(half the
+/// width)` times wider than in the middle, about twice as wide at 89°. Veo
+/// stays near 50–60° across. The cap is applied to the FieldPanner config
+/// ([`WidestView::limit`]) the same way by the AI pass and by [`repan`], so
+/// changing it re-runs in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WidestView {
+    /// Like Veo: at most 34° tall, about 57° across (a 33 mm lens on a
+    /// full-frame camera). The sides look at most 1.3 times wider than the
+    /// middle.
+    Natural,
+    /// At most 44° tall, about 71° across; the sides up to 1.5 times wider.
+    Wide,
+    /// No extra cap: Reco's preset as it is (VeoClone before this setting).
+    Widest,
+}
+
+impl WidestView {
+    /// What new matches use.
+    pub const NEW_MATCH: WidestView = WidestView::Natural;
+
+    /// The setting a match uses: none stored means a match from before the
+    /// setting existed, which keeps behaving as it did (Widest).
+    pub fn effective(stored: Option<WidestView>) -> WidestView {
+        stored.unwrap_or(WidestView::Widest)
+    }
+
+    /// The widest vertical field of view in degrees; `None`: the preset's.
+    /// The editor uses the same numbers (`web/src/engine/path.ts`).
+    pub fn max_fov_deg(self) -> Option<f32> {
+        match self {
+            WidestView::Natural => Some(34.0),
+            WidestView::Wide => Some(44.0),
+            WidestView::Widest => None,
+        }
+    }
+
+    /// A FieldPanner config that never zooms out beyond the cap:
+    /// `fov_wide = min(preset, cap)`, then the start (`fov_default`, also
+    /// ball mode's fixed zoom) and the tightest zoom brought down so that
+    /// `fov_tight <= fov_default <= fov_wide`, which Reco's `sanitized`
+    /// then leaves as it is.
+    pub fn limit(self, mut config: FieldPannerConfig) -> FieldPannerConfig {
+        if let Some(cap) = self.max_fov_deg() {
+            config.fov_wide = config.fov_wide.min(cap);
+            config.fov_default = config.fov_default.min(config.fov_wide);
+            config.fov_tight = config.fov_tight.min(config.fov_default);
+        }
+        config
+    }
+
+    /// For the job log.
+    pub fn describe(self) -> String {
+        let name = match self {
+            WidestView::Natural => "Natural",
+            WidestView::Wide => "Wide",
+            WidestView::Widest => "Widest",
+        };
+        match self.max_fov_deg() {
+            Some(v) => {
+                let across = 2.0 * (16.0 / 9.0 * (v.to_radians() / 2.0).tan()).atan();
+                format!(
+                    "{name}: the AI camera zooms out to at most {v:.0} deg tall ({:.0} deg \
+                     across)",
+                    across.to_degrees()
+                )
+            }
+            None => format!("{name}: the AI camera zooms out as far as Reco's preset allows"),
+        }
+    }
+}
+
+/// The FieldPanner config of a camera style with the widest view applied,
+/// as both the AI pass (given to `setup_autocam`) and [`repan`] use it.
+/// Ball mode's `ball_weight = 1.0` comes on top (`setup_autocam` / repan).
+pub fn panner_config(style: Style, widest: WidestView) -> Option<FieldPannerConfig> {
+    FieldPannerConfig::from_preset_name(style.preset()).map(|c| widest.limit(c))
 }
 
 /// What a re-run needs to know about a recording, for the editor.
@@ -389,6 +476,8 @@ pub struct RepanSettings {
     /// Run the AI on every `every`th frame (a multiple of the recording's).
     pub every: u64,
     pub roi: Option<FieldRoi>,
+    /// How far the AI camera may zoom out.
+    pub widest: WidestView,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -478,10 +567,9 @@ pub fn repan(
         ),
     };
 
-    // setup_autocam's trackers and panner for this style.
-    let preset =
-        reco_autocam::panners::FieldPannerConfig::from_preset_name(settings.style.preset())
-            .ok_or("unknown preset")?;
+    // setup_autocam's trackers and panner for this style (the config the AI
+    // pass gives it).
+    let preset = panner_config(settings.style, settings.widest).ok_or("unknown preset")?;
     let (mut players, mut ball, config): (Option<Box<dyn Tracker>>, Box<dyn Tracker>, _) =
         if ball_mode {
             let mut config = preset;
@@ -705,7 +793,12 @@ mod tests {
         let frames = synth_frames(300);
         let meta = synth_meta(300, 1);
         let run = |style, every, roi| {
-            let s = RepanSettings { style, every, roi };
+            let s = RepanSettings {
+                style,
+                every,
+                roi,
+                widest: WidestView::Widest,
+            };
             repan(&cal, &meta, &frames, &s).unwrap()
         };
         let (broadcast, stats) = run(Style::Broadcast, 1, None);
@@ -737,6 +830,7 @@ mod tests {
             style: Style::Broadcast,
             every: 1,
             roi: None,
+            widest: WidestView::Widest,
         };
         assert!(repan(&cal, &coarse, &frames, &s).is_err());
         // The pitch outline drops the spectator high up in the right camera.
@@ -748,5 +842,122 @@ mod tests {
         assert_eq!(stats.outside_pitch, 300);
         // Too short a recording is refused.
         assert!(repan(&cal, &meta, &frames[..100], &s).is_err());
+    }
+
+    /// The cap of every widest view on every style's preset: never wider
+    /// than the cap, tight <= start <= wide, nothing for Reco to correct;
+    /// Widest is the preset itself.
+    #[test]
+    fn widest_view_caps_every_preset() {
+        let styles = [
+            Style::Broadcast,
+            Style::Action,
+            Style::FrameAll,
+            Style::Ball,
+        ];
+        for style in styles {
+            let preset = FieldPannerConfig::from_preset_name(style.preset()).unwrap();
+            assert_eq!(
+                panner_config(style, WidestView::Widest),
+                Some(preset.clone())
+            );
+            for widest in [WidestView::Natural, WidestView::Wide] {
+                let cap = widest.max_fov_deg().unwrap();
+                let c = panner_config(style, widest).unwrap();
+                assert_eq!(c.fov_wide, preset.fov_wide.min(cap), "{style:?} {widest:?}");
+                assert!(c.fov_tight <= c.fov_default && c.fov_default <= c.fov_wide);
+                assert_eq!(c.clone().sanitized(), c, "Reco changes nothing");
+                // Only the zoom range changes.
+                let same = FieldPannerConfig {
+                    fov_wide: preset.fov_wide,
+                    fov_default: preset.fov_default,
+                    fov_tight: preset.fov_tight,
+                    ..c.clone()
+                };
+                assert_eq!(same, preset);
+            }
+        }
+        // Natural: Reco's broadcast preset starts at 40 and may go to 58.
+        let n = panner_config(Style::Broadcast, WidestView::Natural).unwrap();
+        assert_eq!((n.fov_tight, n.fov_default, n.fov_wide), (22.0, 34.0, 34.0));
+        let w = panner_config(Style::Broadcast, WidestView::Wide).unwrap();
+        assert_eq!((w.fov_tight, w.fov_default, w.fov_wide), (22.0, 40.0, 44.0));
+        let a = panner_config(Style::Action, WidestView::Natural).unwrap();
+        assert_eq!((a.fov_tight, a.fov_default, a.fov_wide), (20.0, 34.0, 34.0));
+        // A cap below the tightest zoom pins the zoom (not used, but safe).
+        let mut tiny = FieldPannerConfig::broadcast();
+        tiny.fov_wide = 10.0;
+        let t = WidestView::Natural.limit(tiny);
+        assert_eq!((t.fov_tight, t.fov_default, t.fov_wide), (10.0, 10.0, 10.0));
+    }
+
+    #[test]
+    fn widest_view_names_and_defaults() {
+        for (w, s) in [
+            (WidestView::Natural, "natural"),
+            (WidestView::Wide, "wide"),
+            (WidestView::Widest, "widest"),
+        ] {
+            assert_eq!(serde_json::to_value(w).unwrap(), s);
+            assert_eq!(serde_json::from_value::<WidestView>(s.into()).unwrap(), w);
+        }
+        assert!(serde_json::from_str::<WidestView>("\"fisheye\"").is_err());
+        assert_eq!(WidestView::NEW_MATCH, WidestView::Natural);
+        // A match from before the setting keeps the old camera.
+        assert_eq!(WidestView::effective(None), WidestView::Widest);
+        assert_eq!(
+            WidestView::effective(Some(WidestView::Wide)),
+            WidestView::Wide
+        );
+        assert!(
+            WidestView::Natural
+                .describe()
+                .contains("34 deg tall (57 deg across)")
+        );
+        assert!(
+            WidestView::Wide
+                .describe()
+                .contains("44 deg tall (71 deg across)")
+        );
+    }
+
+    /// Natural keeps the AI camera at or inside its cap for every style,
+    /// ball mode at that fixed zoom; it changes the zoom only, not where the
+    /// camera looks.
+    #[test]
+    fn repan_with_a_widest_view() {
+        let cal: MatchCalibration = serde_json::from_str(crate::calib::tests::SYNTH_MATCH).unwrap();
+        let frames = synth_frames(300);
+        let meta = synth_meta(300, 1);
+        let run = |style, widest| {
+            let s = RepanSettings {
+                style,
+                every: 1,
+                roi: None,
+                widest,
+            };
+            let (p, _) = repan(&cal, &meta, &frames, &s).unwrap();
+            p.into_iter().map(|x| x.unwrap()).collect::<Vec<_>>()
+        };
+        let max_fov = |p: &[[f32; 3]]| p.iter().map(|x| x[2]).fold(f32::MIN, f32::max);
+        for style in [Style::Broadcast, Style::Action, Style::FrameAll] {
+            let widest = run(style, WidestView::Widest);
+            let natural = run(style, WidestView::Natural);
+            assert!(max_fov(&widest) > 34.5, "{style:?} zooms out past the cap");
+            assert!(
+                max_fov(&natural) <= 34.0 + 1e-3,
+                "{style:?}: {}",
+                max_fov(&natural)
+            );
+            assert!(max_fov(&run(style, WidestView::Wide)) <= 44.0 + 1e-3);
+            // Reco's FieldPanner aims without looking at its zoom.
+            let [dy, dp, df] = max_difference(&natural, &widest);
+            assert_eq!((dy, dp), (0.0, 0.0), "{style:?}: only the zoom changes");
+            assert!(df > 1.0, "{style:?} zoom changed by {df}");
+        }
+        let ball = run(Style::Ball, WidestView::Natural);
+        assert!(ball.iter().all(|p| p[2] == 34.0));
+        let [dy, dp, _] = max_difference(&ball, &run(Style::Ball, WidestView::Widest));
+        assert_eq!((dy, dp), (0.0, 0.0), "ball mode: only the zoom changes");
     }
 }

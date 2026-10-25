@@ -76,6 +76,12 @@ jobs:
       - name: Tests
         run: cargo test --locked -p veoclone-helper
 
+      # VeoClone updating itself (DESIGN.md 4.11): two builds with different
+      # build identities, a pretend release on this machine, a real restart.
+      - name: Self-update test
+        timeout-minutes: 15
+        run: python3 crates/veoclone-helper/scripts/update_e2e.py --work "$RUNNER_TEMP/update-e2e"
+
       # Checks that every exported frame uses the editor's pose for that
       # frame (DESIGN.md 4.3) by stitching short clips on the software GPU
       # (about 20 s here).

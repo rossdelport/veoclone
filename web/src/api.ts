@@ -1,6 +1,7 @@
 // Typed client for the VeoClone helper's HTTP API (docs/veoclone/DESIGN.md 4.5).
-import type { CalibInfo, Edits, ExportQuality, Fps } from "./engine";
+import type { CalibInfo, Edits, ExportQuality, Fps, WidestView } from "./engine";
 
+export type { WidestView } from "./engine";
 export type Style = "broadcast" | "action" | "frame_all" | "ball";
 /** "AI accuracy": best = the AI looks at every frame, faster = every 3rd frame. */
 export type AiAccuracy = "best" | "faster";
@@ -11,12 +12,47 @@ export type ExportStatus = "queued" | "running" | "done" | "failed" | "cancelled
 
 export interface Health {
   app: string;
-  version: string;
+  /** Which build (DESIGN.md 4.11); a plain version number from VeoClone before it updated itself. */
+  version: BuildVersion | string;
+  /** Missing from VeoClone before it updated itself. */
+  update?: UpdateStatus;
   gpu: { name: string; backend: string };
   ai: { available: boolean; provider: string; model: string | null };
   ffmpeg: boolean;
   dataDir: string;
   freeDiskBytes: number;
+}
+
+/** The commit a VeoClone build was made from; sha "dev" and no date: a development build. */
+export interface BuildVersion {
+  number: string;
+  sha: string;
+  date: string | null;
+}
+
+export type UpdateState = "up-to-date" | "checking" | "downloading" | "ready" | "installing" | "failed" | "disabled";
+
+/** VeoClone updating itself (DESIGN.md 4.11). */
+export interface UpdateStatus {
+  state: UpdateState;
+  /** The newest build, once known. */
+  latest?: { sha: string; date: string | null };
+  /** Download progress 0..1. */
+  progress?: number;
+  /** In plain words. */
+  message?: string;
+  /** Technical reason of a failure. */
+  detail?: string;
+  /** Automatic updates are on. */
+  auto: boolean;
+  /** This copy can update itself at all (not a development build, in its own folder). */
+  canUpdate: boolean;
+}
+
+/** VeoClone's own settings. startWithWindows: null where that is not possible (not Windows). */
+export interface HelperSettings {
+  autoUpdate: boolean;
+  startWithWindows: boolean | null;
 }
 
 /** One "which iPhone, which lens" choice (DESIGN.md 4.6). */
@@ -50,6 +86,8 @@ export interface AiRun {
   aiAccuracy: AiAccuracy;
   /** PitchOutline.id of the outline the AI used, if any. */
   pitchId: string | null;
+  /** The widest view the AI used; null (or missing): made before the setting existed, i.e. "widest". */
+  widestView?: WidestView | null;
 }
 
 export interface ProbeInfo {
@@ -127,6 +165,12 @@ export interface ProjectMeta {
   style: Style;
   /** Missing from older VeoClone versions: best. */
   aiAccuracy?: AiAccuracy;
+  /**
+   * How far the camera may zoom out (DESIGN.md 4.12). New matches: natural.
+   * null (or missing): a match from before the setting existed, which keeps
+   * behaving as "widest".
+   */
+  widestView?: WidestView | null;
   /** "Mark the pitch"; null (or missing): not marked. */
   pitch?: PitchOutline | null;
   /** What the current AI path was made with; null (or missing): not known. */
@@ -176,6 +220,16 @@ export interface ExportRequest {
 export function quickRerun(p: ProjectMeta, accuracy: AiAccuracy = p.aiAccuracy ?? "best"): boolean {
   const every = accuracy === "faster" ? 3 : 1;
   return !!p.aiSeen && every % p.aiSeen.every === 0;
+}
+
+/** The widest view a match uses (not set: "widest", the camera as before the setting existed). */
+export function widestViewOf(p: Pick<ProjectMeta, "widestView">): WidestView {
+  return p.widestView ?? "widest";
+}
+
+/** Is the current AI path made with the match's widest view? */
+export function aiUsesWidestView(p: ProjectMeta): boolean {
+  return !p.aiRun || (p.aiRun.widestView ?? "widest") === widestViewOf(p);
 }
 
 /** How long running the AI again takes, in words. */
@@ -299,14 +353,18 @@ const project = (id: string) => `/api/projects/${enc(id)}`;
 
 export const api = {
   health: () => json<Health>("GET", "/api/health", undefined, 4000),
+  checkForUpdate: () => json<UpdateStatus>("POST", "/api/update/check"),
+  installUpdate: () => json<UpdateStatus>("POST", "/api/update/install"),
+  settings: () => json<HelperSettings>("GET", "/api/settings"),
+  changeSettings: (body: Partial<HelperSettings>) => json<HelperSettings>("PATCH", "/api/settings", body),
   lenses: () => json<LensOption[]>("GET", "/api/lenses"),
   listProjects: () => json<ProjectMeta[]>("GET", "/api/projects"),
-  createProject: (body: { name: string; lensId?: string | null; rightLensId?: string | null; style: Style; aiAccuracy?: AiAccuracy }) =>
+  createProject: (body: { name: string; lensId?: string | null; rightLensId?: string | null; style: Style; aiAccuracy?: AiAccuracy; widestView?: WidestView }) =>
     json<ProjectMeta>("POST", "/api/projects", body),
   getProject: (id: string) => json<ProjectMeta>("GET", project(id)),
   updateProject: (
     id: string,
-    body: { name?: string; lensId?: string | null; rightLensId?: string | null; style?: Style; aiAccuracy?: AiAccuracy },
+    body: { name?: string; lensId?: string | null; rightLensId?: string | null; style?: Style; aiAccuracy?: AiAccuracy; widestView?: WidestView },
   ) =>
     json<ProjectMeta>("PATCH", project(id), body),
   deleteProject: (id: string) => request("DELETE", project(id)).then(() => undefined),

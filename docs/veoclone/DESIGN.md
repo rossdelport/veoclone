@@ -32,7 +32,9 @@ browser to the helper on the same PC.
    (Broadcast / Action / Wide / Follow the ball), AI accuracy (Best: every
    frame, default / Faster: every 3rd frame), and two drop boxes: **Left phone** and
    **Right phone**, each taking one file or all the files of a recording the
-   camera split into parts (GoPro chapters, 4.10). Filming tips shown
+   camera split into parts (GoPro chapters, 4.10). Under the camera style,
+   **Widest view** (4.12): Natural (like Veo), default / Wide / Widest.
+   Filming tips shown
    alongside. "Start" uploads both videos to the helper (progress bar per
    file) and then starts processing.
 3. Processing: steps with progress bars and time remaining:
@@ -58,6 +60,9 @@ browser to the helper on the same PC.
      centre / right", for phones that pointed down.
    - **Mark the pitch** (4.8): click round the pitch on a big overview so the
      AI ignores people outside it; offered the first time a match opens.
+   - **Widest view** (4.12) under Camera: Natural (like Veo) / Wide /
+     Widest; a change shows at once and runs the AI again in seconds without
+     leaving the editor.
    - Keyboard: Space play/pause, ←/→ 1 frame (Shift = 5 s), K add keyframe
      at the current view, Delete remove selected keyframe, Ctrl+Z undo.
    - Edits autosave to the helper.
@@ -116,8 +121,9 @@ workflows stay but only run on manual dispatch (section 6).
 - Serves the editor's static files from `web/` next to the executable (or
   `--web-dir`), so `http://127.0.0.1:47863/` opens the editor.
 - On start: prints a friendly banner ("Keep this window open while you use
-  VeoClone"), opens the browser at `http://127.0.0.1:47863/` (disable with
-  `--no-open`).
+  VeoClone", the build), opens the browser at `http://127.0.0.1:47863/`
+  (disable with `--no-open`; never after an update, 4.11). `--minimized`
+  minimises the console window (the "Start with Windows" shortcut, 4.11).
 - Only one copy runs: it takes the port, then locks `<data>/veoclone.lock`,
   before touching the data dir; a second copy only opens the browser and
   exits ("VeoClone is already running").
@@ -269,7 +275,8 @@ log.txt           human-readable log of jobs for this project
    style's tracking mode and preset (`broadcast`/`action`/`frame_all`
    field mode; `ball` = `TrackingMode::Ball` with the broadcast preset,
    which Reco turns into `ball_weight` 1.0, `BallTracker` max jump 0.5 and
-   no player tracker), detection interval from `aiAccuracy` (1 or 3),
+   no player tracker) with the widest view's zoom limit
+   (`seen::panner_config`, 4.12), detection interval from `aiAccuracy` (1 or 3),
    lookahead 1.5 s, the pitch outline as `field_roi` (4.8), output to a
    throwaway 640x360 MKV with audio disabled (deleted afterwards). Instead
    of `.events()`, install a custom `PipelineEventSink` that records only
@@ -372,19 +379,24 @@ Body (JSON):
 
 `GET /api/projects/:id/ai-path.bin` → `application/octet-stream`, Float32 LE,
 `frameCount*3` values `[yaw, pitch, fovDeg]`, world space for match.json's
-rig tilt/roll (the AI pass renders with it), before the FOV cap/clamp (the
-editor applies them).
+rig tilt/roll (the AI pass renders with it), before the widest view's limit,
+the FOV cap and the clamp (the editor applies them; the AI path itself already
+keeps to the widest view it was made with, 4.12).
 
 ### 4.5 HTTP API (JSON unless noted; errors are `{ "error": "plain words", "detail": "technical" }` with 4xx/5xx)
 
 | Method & path | Purpose |
 |---|---|
-| `GET /api/health` | `{ app:"veoclone-helper", version, gpu:{name,backend}, ai:{available, provider, model}, ffmpeg:bool, dataDir, freeDiskBytes }` |
+| `GET /api/health` | `{ app:"veoclone-helper", version:{number, sha, date}, update:UpdateStatus (4.11), gpu:{name,backend}, ai:{available, provider, model}, ffmpeg:bool, dataDir, freeDiskBytes }` (VeoClone before 4.11: `version` is the version number, no `update`) |
+| `POST /api/update/check` | check for a newer build now (also when automatic updates are off) → `UpdateStatus`; 409 for a copy that cannot update itself |
+| `POST /api/update/install` | install the update that is ready now, if VeoClone is idle → 202 `UpdateStatus`; 409 with plain words otherwise (none ready, busy) |
+| `GET /api/settings` | `{ autoUpdate: bool, startWithWindows: bool \| null }` (null: not Windows) |
+| `PATCH /api/settings` | `{ autoUpdate?, startWithWindows? }` → the settings |
 | `GET /api/lenses` | Curated lens choices, see 4.6 |
 | `GET /api/projects` | `ProjectMeta[]` newest first |
-| `POST /api/projects` | body `{ name, lensId?, rightLensId?, style, aiAccuracy? }` → `ProjectMeta` |
+| `POST /api/projects` | body `{ name, lensId?, rightLensId?, style, aiAccuracy?, widestView? }` → `ProjectMeta` |
 | `GET /api/projects/:id` | `ProjectMeta` |
-| `PATCH /api/projects/:id` | `{ name?, lensId?, rightLensId?, style?, aiAccuracy? }` |
+| `PATCH /api/projects/:id` | `{ name?, lensId?, rightLensId?, style?, aiAccuracy?, widestView? }` |
 | `DELETE /api/projects/:id` | deletes the folder (refuse while a job runs on it) |
 | `PUT /api/projects/:id/files/:side` | side = `left`/`right`; raw body streamed to disk (write `*.part`, rename at end); header `X-Filename` (original name, for the extension); `?part=N&parts=M`: part N (from 1) of a video in M files (4.10), else (or 1 of 1) the whole video; deletes that side's matching copy; returns updated `ProjectMeta` |
 | `POST /api/projects/:id/process` | start/queue the pipeline (also used for "Try again" and "Re-run AI with a different style") |
@@ -410,8 +422,9 @@ editor applies them).
   rightLensId: string | null;  // the right phone when it is another model; null = same as left
   style: "broadcast" | "action" | "frame_all" | "ball";
   aiAccuracy: "best" | "faster";   // detection interval 1 / 3; missing in older files: best
+  widestView: null | "natural" | "wide" | "widest";  // 4.12; null (older files): behaves as widest
   pitch: null | { id: string; points: [number, number][]; left: [number, number][]; right: [number, number][] }; // 4.8
-  aiRun: null | { style; aiAccuracy; pitchId: string | null };  // what ai_path.bin was made with
+  aiRun: null | { style; aiAccuracy; pitchId: string | null; widestView? };  // what ai_path.bin was made with (widestView null/missing: widest)
   aiSeen: null | { every: number };  // a recording for quick re-runs exists (4.9); filled in when read
   status: "new" | "uploaded" | "queued" | "processing" | "ready" | "failed" | "cancelled";
   files: { left?: FileInfo; right?: FileInfo };  // FileInfo = { name, sizeBytes, probe?: {...}, parts? } (4.10)
@@ -435,7 +448,10 @@ technical detail. `lensId` is never null for new matches: `POST`/`PATCH`
 with no or a `null` lensId store `"generic:ultra"`; only the ids from
 `GET /api/lenses` are accepted. `rightLensId` (missing in older
 `project.json` files: `null`) accepts those ids or `null`; changing either
-id clears `calibration` so the next `process` calibrates again. `swap` also works with only one video
+id clears `calibration` so the next `process` calibrates again. `widestView`:
+`POST` without one stores `"natural"`; `PATCH` takes the three names
+("Unknown widest view." otherwise) and, like `style` and `aiAccuracy`, is
+refused (409) while the match is busy. `swap` also works with only one video
 uploaded (it moves sides; status `new`) and refuses while busy (409).
 
 ### 4.6 Lens choices
@@ -582,6 +598,9 @@ pass bit for bit for every style, for every 3rd frame emulated from a
 recording of every frame, and with a pitch outline; a re-run takes 0.5 s
 against 70 s for the AI pass.
 
+The panner config comes from `seen::panner_config(style, widestView)` in
+both, so a widest view (4.12) replays as exactly as a style.
+
 `process` uses the recording when the model is the same, the sync offset
 matches and the new detection interval is a multiple of the recorded one
 (every frame → every frame or every 3rd; every 3rd → only every 3rd), else
@@ -672,6 +691,194 @@ video.
   last part has the same 195 frames and the same sound packets as the
   one-file export.
 
+### 4.11 VeoClone updates itself
+
+The user downloads the zip once; from then on VeoClone keeps itself up to
+date (`update.rs`, `swap.rs`, `unzip.rs`, `settings.rs`, `shortcuts.rs`).
+
+- **Build identity.** CI sets `VEOCLONE_BUILD_SHA` (the commit) and
+  `VEOCLONE_BUILD_DATE` (its committer date, UTC, RFC 3339) when it builds
+  VeoClone.exe; the helper embeds them (`option_env!`) and shows them in the
+  banner, `--version` and `/api/health` (`version: { number, sha, date }`).
+  Without both it is a **development build** (`sha: "dev"`, `date: null`),
+  which never updates itself. CI also writes `VeoClone/version.json`
+  (`{ sha, date, files }`, `files` = every file of the folder,
+  `/`-separated); VeoClone only updates itself when the `version.json` next
+  to it names its own build (so a copied-out exe never unpacks a folder
+  around itself).
+- **Release.** Next to `VeoClone-windows.zip` the `helper-latest` release has
+  `latest.json`: `{ sha, date, zipSize, zipSha256 }`, made by the publish job
+  after zipping and uploaded after the zip (`--clobber`). A build is
+  **newer** when its sha differs and its date is later (an older release
+  never replaces a newer install). Address: `https://github.com/rossdelport/veoclone/releases/download/helper-latest`,
+  overridable with env `VEOCLONE_UPDATE_URL` (`https://`, or `http://` on
+  127.0.0.1/localhost, for tests).
+- **When.** 10 s after start, then every 4 hours (1 hour after a problem),
+  over HTTPS with `ureq` (rustls, bundled web roots; proxies from
+  `HTTPS_PROXY`). Settings: `<data>/settings.json` `{ autoUpdate,
+  startMenuDone }`; with `autoUpdate` off nothing happens unless the user
+  presses Check for updates / Install now.
+- **Download.** Into `<data>/updates/VeoClone-<sha>.zip` (`.part` first, one
+  zip at a time, free-space check), size and SHA-256 checked while it
+  arrives. A mismatch reads `latest.json` again once (the release may have
+  changed meanwhile) and otherwise fails ("didn't download properly").
+- **Unpack.** Into `<install>/.veoclone-update/new` (inside the VeoClone
+  folder: same disk, and no folder appears next to it) with a small zip
+  reader (stored/deflated entries, CRC-32 and size checked, no zip64; names
+  must stay inside `VeoClone/`: no `..`, `:`, `\`, drive letters, trailing
+  dots or spaces). It must contain `VeoClone.exe` and a `version.json` of
+  the build `latest.json` names. `staged.json` records what is unpacked.
+  State `ready`.
+- **Never while busy.** Installing waits until no job runs or waits, no
+  video is being received and no API request is being answered (a download
+  of a finished video counts until its last byte), and, for an automatic
+  install, nothing was changed through the API and no job ran for 10
+  minutes. "Install now" skips the 10 minutes. The job queue is paused
+  first (`Jobs::pause_if_idle`: only when idle; jobs submitted meanwhile wait
+  in the queue) and "Updating VeoClone…" shows for 3 s; anything that
+  started meanwhile puts the install off (state back to `ready`).
+- **Swap** (`swap.rs`, platform-neutral, tested on Linux). Windows can rename
+  a running exe and loaded DLLs but not overwrite or delete them. The plan
+  (`.veoclone-update/swap.json`, written first): for every new file, the
+  old one (if any) is renamed to `<name>.old` (`<name>.<n>.old` when an old
+  backup cannot be deleted), then the new one moved in; files the old
+  version had (its `version.json`) that the new one has not are backed up
+  too (compared without case); `VeoClone.exe` last. Nothing else in the
+  folder is touched. Any failed rename undoes everything (new files back to
+  staging, backups back); renames are retried for a moment (virus
+  scanners).
+- **Restart.** The new `VeoClone.exe` is started with this run's options
+  plus `--updated-from <old sha>` (same console window; no browser tab; it
+  retries the port and the folder lock for 60 s). If it ends within 5 s
+  (a missing DLL, a crash, an unknown option) the swap is undone and the
+  old version keeps running ("didn't start"). If something started
+  meanwhile the new one is stopped and the swap undone. Otherwise the old
+  one exits. Every future version must accept `--updated-from`.
+- **Next start** (`recover_install`, right after the folder lock): a plan
+  whose new build is this one → delete the backups, staging, plan and the
+  zip (retried for 2 minutes while the old exe is still closing); a plan
+  from this build (cut short, e.g. a power cut: the exe is swapped last, so
+  the old exe is still in place) → undo it; staging without a plan →
+  deleted.
+- **Status** (`update` in `/api/health`): `{ state, latest?: {sha, date},
+  progress?, message?, detail?, auto, canUpdate }`, `state` one of
+  `up-to-date`, `checking`, `downloading`, `ready`, `installing`, `failed`,
+  `disabled` (a development build, not in its own folder, or automatic
+  updates off); `message` in plain words ("Update ready — it installs when
+  nothing is processing.", "The update didn't download properly, so
+  VeoClone kept the version you have. It will try again later.").
+- **Editor** (`web/src/ui/updates.ts`, `health.ts`): a "VeoClone on this PC"
+  card on the home page (status line, Install now / Check for updates /
+  Try again, "Show details" for failures, the two settings); the build and
+  update line in the Connected pill's tooltip; only while installing and
+  restarting a banner on every page ("Updating VeoClone… it will restart in
+  a moment" / "VeoClone is restarting after an update…" instead of "isn't
+  running", for up to 2 minutes), then a toast when the build changed. The
+  editor polls every 2 s while an update is on its way. An older helper
+  (no `update`) gets "Download the newest VeoClone once".
+- **Start with Windows** (`shortcuts.rs`): a `VeoClone.lnk` in the user's
+  Startup folder (`SHGetKnownFolderPath(FOLDERID_Startup)`) made with the
+  shell's `IShellLinkW`: `VeoClone.exe --no-open --minimized`, window
+  "Run: Minimised"; the toggle is whether that file exists. On the first run
+  of a release build a Start menu shortcut "VeoClone" (`FOLDERID_Programs`)
+  is made once (`startMenuDone`); existing shortcuts are rewritten at every
+  start so they follow a moved folder.
+- **Verified**: unit tests (version comparison, `latest.json`, checksums,
+  zip reader with Python- and Info-ZIP-made zips and unsafe names, swap /
+  undo at every rename / interrupted swap / commit, never while busy, the
+  download-counting middleware, the API) and `scripts/update_e2e.py` (two
+  real builds, a pretend release on 127.0.0.1: a damaged zip is refused and
+  nothing changes; the right one installs by itself, restarts as the new
+  build from the same folder with the same options and no new browser tab,
+  removes only the old version's files; it waits while a video is being
+  received; a new version that does not start is undone). The Windows-only
+  code is compile-checked for `x86_64-pc-windows-msvc`; the rename trick
+  itself can only be tried on Windows.
+
+### 4.12 Widest view (how far the camera may zoom out)
+
+Reco's FieldPanner presets let the AI camera zoom out to `fov_wide` = 58°
+of vertical view (broadcast, also Follow the ball), 48° (action) or 70°
+(frame-all): about 89°, 77° and 102° across at 16:9. The output is a flat
+(rectilinear) view, so something at an angle θ from the centre is drawn
+`1/cos²θ` times wider along the radius than in the middle: at 89° across a
+player at the left or right edge looks 1.97 times as wide, at 102° 2.55
+times. A user with iPhone 0.5× footage called this "fisheye" (play at the far
+corners); Veo's camera stays near 50–60° across. `ProjectMeta.widestView`,
+stored with the style and AI accuracy, caps the zoom:
+
+| `widestView` | most vertical fov | across (16:9) | side of the picture drawn |
+|---|---|---|---|
+| `natural` (default for new matches) | 34° | 57° | ≤ 1.30× as wide |
+| `wide` | 44° | 71° | ≤ 1.52× |
+| `widest` (and `null`: matches from before the setting) | the preset's | up to 89° / 77° / 102° | up to 1.97× / 1.63× / 2.55× |
+
+Why 34°: 57° across is what a 33 mm lens shows on a full-frame camera (an
+ordinary, not a wide-angle, look) and inside Veo's 50–60°; the sides
+stretch by at most 30 %, against 97 % at Reco's broadcast widest. It is also
+about where a 1080p export of 4K ultra-wide iPhone footage stops being
+downscaled: about 30 pixels per degree in the middle of both (the generic
+0.5× profile has fx 1707 px at 3840 wide, the 1080p view at 34° 30.8 px per
+degree), so the limit costs no sharpness. 44° (Wide) is the in-between,
+for example for a small pitch filmed from close by.
+
+- **Helper** (`seen.rs` `WidestView`): `limit` overlays the preset:
+  `fov_wide = min(preset, cap)`, then `fov_default = min(fov_default,
+  fov_wide)` (where the zoom starts, and Follow the ball's fixed zoom) and
+  `fov_tight = min(fov_tight, fov_default)`, so `tight ≤ default ≤ wide` and
+  Reco's `sanitized()` changes nothing (unit-tested for every style).
+  Natural: broadcast 22/34/34 (tight/start/wide), action 20/34/34,
+  frame-all 22/34/34, Follow the ball fixed at 34; Wide: 22/40/44, 20/34/44,
+  22/40/44, ball 40. `seen::panner_config(style, widest)` is the config both
+  the AI pass (given to `setup_autocam`) and `repan` (4.9) use, so a change
+  is a quick re-run and replays exactly. FieldPanner aims without looking at
+  its zoom, so only the fov changes: yaw and pitch stay bit-identical. A
+  missing `widestView` means Widest (`WidestView::effective`), so old matches
+  keep their camera; `aiRun.widestView` says what the AI path was made with
+  (missing: Widest). The job log names it ("Widest view: Natural: the AI
+  camera zooms out to at most 34 deg tall (57 deg across)") and the zoom
+  range given to Reco.
+- **Editor**: `computeFinalPath(…, widestViewMaxFov(widestView))` limits
+  every frame after the zoom (5.3), so neither the Zoom slider nor a fix
+  goes wider; dragging and the mouse wheel stop there too; zooming in is
+  free; Widest / not set is `Infinity`, bit-identical to the path before.
+  The limits (34/44) are the helper's (`WIDEST_VIEW_MAX_FOV`, tested on both
+  sides).
+- **UI**: the editor's Camera section has the three choices (Natural (like
+  Veo) / Wide / Widest, one line each). A change is saved (`PATCH
+  widestView`), the editor keeps to it at once (`EditStore.setMaxFov`), and,
+  when what the AI saw can be used (4.9), the AI runs again from the editor
+  (`POST process`) with a small progress note under the choices; when the
+  run is done (status `ready`, new `aiRun`) the editor fetches the new
+  `ai-path.bin` and swaps it in (`EditStore.setAiPath`), the edits untouched.
+  Without a usable recording it asks first and runs it the long way through
+  the match page. A run that fails goes back to ready (4.7): the editor says
+  so, keeps to the new limit and offers "Run the AI again". The choices are
+  also on the new match page (under the camera style), on the match page
+  before processing and in its "Change the camera style, widest view or AI
+  accuracy" box, and the ready page lists the setting. A match with no
+  `widestView` shows a one-time tip "New: Natural look stops the camera
+  zooming out so far that the edges stretch." with **Try it** (Natural, the
+  quick re-run) and × (both remembered in `veoclone.hint.natural`).
+- **Mock helper**: new matches are Natural, the seeded example match has no
+  `widestView`; a re-run with a usable recording is quick ("Using what the
+  AI saw last time"); `ai-path.bin` is the fixture path limited to the
+  `aiRun`'s widest view.
+- **Verified**: unit tests (`seen::tests::widest_view_*`,
+  `repan_with_a_widest_view`; `api`/`store` shapes; `path.test.ts`);
+  UI tests (new match default and Wide, the tip and Try it with the progress
+  note, the new AI path loaded in place and an export at Zoom 50 % with a
+  zoomed-out fix sent at most 34°, a failed run, hiding the tip); and
+  `e2e.py --only natural` with the release helper on the synthetic footage:
+  a Widest AI pass (fov up to 51.4°), Natural from its recording in 0.5 s
+  (fov ≤ 34.0000°, yaw/pitch unchanged, fov up to 17.4° less), a full
+  Natural AI pass whose own replay differs by 0 and which equals the quick
+  re-run bit for bit, Wide ≤ 44° and Follow the ball fixed at 34° in 0.5 s
+  each, and the editor's own `computeFinalPath` (bundled with esbuild) on
+  that match: Natural at most 34.00° at Zoom 50/100/200 % with an 80° fix,
+  Wide at most 44°, Widest / not set identical to no limit, zoom in
+  unchanged.
+
 ## 5. Editor engine (`web/src/engine/`) — pure TS, unit tested
 
 ### 5.1 Projection (must match Reco's export exactly)
@@ -746,7 +953,8 @@ show a little black in a corner, in the preview and the export alike.
 
 ### 5.3 Final path algorithm (`computeFinalPath`)
 
-Input: AI path (Float32Array, frameCount×3), fps, `Edits`, `CalibInfo`.
+Input: AI path (Float32Array, frameCount×3), fps, `Edits`, `CalibInfo`, and
+the widest view's limit `maxFovDeg` (4.12; `Infinity` for Widest or not set).
 Output: Float32Array frameCount×3 of final clamped poses.
 
 ```ts
@@ -785,6 +993,8 @@ interface Edits {
    largest weight. `pose = lerp(base, M, w)`.
 4. Zoom: `fov = fov / zoom`. Keyframes store the pre-zoom fov (the fov the
    user saw × zoom at the time), so the zoom slider affects everything.
+   Then the widest view: `fov = min(fov, maxFovDeg)` (zooming in is never
+   limited).
 5. Render → world pose (`render_to_world`), then clamp (5.2) with aspect
    16/9. The output is exactly what the export's Panner returns (with
    `rigTiltDeg`/`rigRollDeg` = `edits.straighten`).
@@ -894,7 +1104,7 @@ a known rig tilt/roll (5.1); the editor lets the user set it.
 
 - `veoclone-ci.yml` (push/PR): web typecheck + unit tests + build; helper
   `cargo fmt --check`, `clippy -D warnings`, `cargo test -p veoclone-helper`
-  on Ubuntu.
+  and the self-update test `scripts/update_e2e.py` (4.11) on Ubuntu.
 - `veoclone-windows.yml` (push to the default branch and `claude/**`
   branches, tags `veoclone-v*`, manual): builds `veoclone-helper.exe --features load-dynamic` on
   `windows-latest` the way Reco's `release.yml` does (BtbN FFmpeg n7.1
@@ -910,12 +1120,16 @@ VeoClone/
   models/yolo26n.onnx models/yolo26n_640.onnx
   web/…                     (built editor)
   LICENSE  README.txt
+  version.json              (build sha, date, every file; 4.11)
 ```
 
-  Uploaded as a workflow artifact; builds of the repository's **default
-  branch** (whatever it is called — today `claude/happy-einstein-iqtkqs`,
-  later perhaps `main`) also update a rolling GitHub release
-  `helper-latest`; `veoclone-v*` tags make a normal release.
+  The exe is built with `VEOCLONE_BUILD_SHA`/`VEOCLONE_BUILD_DATE` (4.11);
+  the smoke test checks the build it reports and fetches `latest.json`
+  (automatic updates off). Uploaded as a workflow artifact; builds of the
+  repository's **default branch** (whatever it is called — today
+  `claude/happy-einstein-iqtkqs`, later perhaps `main`) also update a
+  rolling GitHub release `helper-latest` (the zip, then `latest.json`);
+  `veoclone-v*` tags make a normal release (with both).
 - `veoclone-pages.yml` (push, manual): builds `web/` and deploys to GitHub
   Pages only from the default branch (one-time: Settings → Pages → Source:
   GitHub Actions).
@@ -946,7 +1160,13 @@ VeoClone/
   missing in one camera puts the two cameras out of step from there on.
   Not tried with real GoPro chapter files here (no sample files).
 - "Follow the ball" keeps a fixed zoom (Reco's ball mode has no player
-  cluster to size it) and holds still when the ball is lost.
+  cluster to size it: 34° with Natural, 40° with Wide or Widest) and holds
+  still when the ball is lost.
+- With the Natural widest view (4.12) the camera cannot show all the players
+  when they spread over more than about 57° across, also with the Wide
+  (frame-all) camera style; Widest gives Reco's own range back. The edge
+  stretch numbers are geometry, not measured on real footage; the 34° was
+  not compared side by side with real Veo footage here.
 - GoPro auto-detection could not be tried on real GoPro footage here (no
   sample files); the unrecognised-camera path is tested.
 - Straightening is set by eye (5.5); Reco's clamp keeps only the centre box

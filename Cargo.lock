@@ -7525,6 +7525,7 @@ dependencies = [
  "flate2",
  "fs4",
  "futures-util",
+ "http-body",
  "libc",
  "log",
  "open",
@@ -7533,6 +7534,7 @@ dependencies = [
  "reco-core",
  "reco-detect",
  "reco-io",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
@@ -7541,7 +7543,9 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "uuid",
+ "windows 0.62.2",
  "windows-sys 0.61.2",
 ]
 

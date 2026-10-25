@@ -456,6 +456,16 @@ select.input {
   display: grid;
   gap: 2px;
 }
+.choice:has(input:disabled) {
+  opacity: 0.6;
+  cursor: default;
+}
+/* Smaller cards, one per row (the editor's side panel). */
+.choice-grid-tight .choice {
+  padding: 9px 11px;
+  gap: 9px;
+  border-radius: 10px;
+}
 
 /* ---------------------------------------------------------------- Pages */
 main {
@@ -1270,6 +1280,9 @@ dialog {
   margin: 18px 0 0;
   font-size: 15px;
 }
+.rerun-head + p.muted {
+  margin-top: 4px;
+}
 
 /* ---------------------------------------------------------------- Editor */
 body.editor-mode {
@@ -1566,6 +1579,29 @@ body.editor-mode #page {
 }
 .style-line {
   margin-top: 14px;
+}
+/* Widest view */
+.widest {
+  margin-top: 18px;
+}
+.widest-title {
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 2px;
+}
+.widest-note:not(:empty) {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+.widest-note .btn-small {
+  justify-self: start;
+}
+.natural-hint-host .notice {
+  margin: 12px 18px;
+}
+.natural-hint-host .notice .btn-small {
+  margin-top: 8px;
 }
 /* Straighten picture */
 .side-section.straighten > h2 {
@@ -2195,4 +2231,67 @@ body.editor-mode #toasts {
   top: calc(var(--appbar-h) + 16px);
   bottom: auto;
   left: calc((100vw - clamp(300px, 25vw, 400px)) / 2);
+}
+
+/* ------------------------------------------- VeoClone updating itself (4.11) */
+.banner-info {
+  background: rgba(56, 189, 248, 0.08);
+  border-color: rgba(56, 189, 248, 0.35);
+  align-items: center;
+}
+.banner-info > .icon {
+  color: var(--sky);
+}
+.updates-card {
+  margin-top: 28px;
+  padding: 18px 22px;
+  display: grid;
+  gap: 10px;
+}
+.updates-card h2 {
+  font-size: 17px;
+}
+.update-status {
+  display: grid;
+  gap: 8px;
+}
+.update-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--text-2);
+}
+.update-line > p {
+  flex: 1;
+  min-width: 220px;
+}
+.update-line > .icon {
+  flex: none;
+  color: var(--sky);
+}
+.update-good > .icon {
+  color: var(--accent);
+}
+.update-bad > .icon {
+  color: var(--red);
+}
+.update-muted > .icon {
+  color: var(--muted);
+}
+.update-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.update-toggles {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+}
+.update-toggles:empty {
+  display: none;
+}
+.toggle-note {
+  margin: -4px 0 0 26px;
 }

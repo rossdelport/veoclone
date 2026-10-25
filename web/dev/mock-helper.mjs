@@ -17,8 +17,15 @@
 // Test hooks: a match whose name contains "fail" fails once while lining up
 // the videos (press Try again to succeed; a re-run of a ready match then goes
 // back to ready with a warning, DESIGN.md 4.7); "slow" makes its jobs 10x
-// slower. GET /__mock/state shows what the editor sent; POST /__mock/reset
-// forgets everything.
+// slower. A re-run that can reuse what the AI saw is quick, like the real
+// helper's (DESIGN.md 4.9). The AI path served keeps to the widest view it was
+// made with (DESIGN.md 4.12). GET /__mock/state shows what the editor sent;
+// POST /__mock/reset forgets everything.
+// Updates (DESIGN.md 4.11): POST /__mock/update {status?, version?} sets what
+// /api/health says about updates; "Install now" on a ready update shows
+// "installing" for 3 s, then the pretend helper is gone for 4 s and comes
+// back as a newer build. GET /__mock/update shows the update state and the
+// settings the editor sent.
 import { createReadStream, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, extname, join, normalize, resolve } from "node:path";
@@ -50,7 +57,7 @@ const PROXY = join(FIX, "proxy.mp4");
 let projects = new Map();
 /** @type {Map<string, any>} */
 let edits = new Map();
-let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [] };
+let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [], aiPathGets: 0 };
 const timers = new Map(); // project id -> interval
 const uploads = new Map(); // project id -> uploads in progress
 const previous = new Map(); // project id -> the ready result a re-run started from
@@ -58,6 +65,9 @@ const madeWith = new Map(); // project id -> camera style of the AI result on "d
 
 const STYLES = ["broadcast", "action", "frame_all", "ball"];
 const ACCURACY = ["best", "faster"];
+const WIDEST = ["natural", "wide", "widest"];
+/** The widest vertical fov of each widest view, like the real helper (seen.rs WidestView::max_fov_deg). */
+const WIDEST_FOV = { natural: 34, wide: 44, widest: Infinity };
 const BUSY = "VeoClone is still working on this match. Press Stop first, or wait until it has finished.";
 const GENERIC_LENS =
   "We didn't know which iPhone filmed this, so a typical iPhone lens was used. If the picture looks bent or the two halves don't join, use “Change phone or lens”.";
@@ -73,16 +83,17 @@ function probe(name) {
   };
 }
 
-function newProject({ name, lensId = null, rightLensId = null, style = "broadcast", aiAccuracy = "best" }) {
+function newProject({ name, lensId = null, rightLensId = null, style = "broadcast", aiAccuracy = "best", widestView = "natural" }) {
   const t = now();
   return {
-    id: newId(), name, createdAt: t, updatedAt: t, lensId, rightLensId, style, aiAccuracy, pitch: null, aiRun: null, aiSeen: null, status: "new",
+    id: newId(), name, createdAt: t, updatedAt: t, lensId, rightLensId, style, aiAccuracy, widestView, pitch: null, aiRun: null, aiSeen: null, status: "new",
     files: {}, job: null, error: null, warnings: [], diskBytes: 0, exports: [],
   };
 }
 
 function seed() {
-  const p = newProject({ name: "Example match", style: "broadcast" });
+  // Made before "Widest view" existed: no setting stored (behaves as widest).
+  const p = newProject({ name: "Example match", style: "broadcast", widestView: null });
   const yesterday = new Date(Date.now() - 86400e3).toISOString().replace(/\.\d+Z$/, "Z");
   Object.assign(p, {
     createdAt: yesterday, updatedAt: yesterday, status: "ready",
@@ -167,11 +178,18 @@ function backToReady(p, problem) {
 }
 
 function startProcess(p) {
+  // Like the real helper: with the earlier calibration and what the AI saw,
+  // a re-run takes seconds.
+  const every = p.aiAccuracy === "faster" ? 3 : 1;
+  const quick = !!(p.calibration && p.aiSeen && every % p.aiSeen.every === 0);
+  const steps = quick
+    ? PROCESS_STEPS.map((s) => ({ ...s, seconds: s.seconds * 0.15, ...(s.step === "track" ? { message: "Using what the AI saw last time" } : {}) }))
+    : PROCESS_STEPS;
   p.status = "processing";
   p.error = null;
   p.warnings = [];
   const failThisTime = /fail/i.test(p.name) && !mock.failedOnce.has(p.id);
-  runJob(p, "process", PROCESS_STEPS, {
+  runJob(p, "process", steps, {
     onFail: (step, progress) => {
       if (!failThisTime || step !== "calibrate" || progress < 0.5) return false;
       mock.failedOnce.add(p.id);
@@ -188,7 +206,7 @@ function startProcess(p) {
     onDone: () => {
       previous.delete(p.id);
       madeWith.set(p.id, p.style);
-      p.aiRun = { style: p.style, aiAccuracy: p.aiAccuracy ?? "best", pitchId: p.pitch?.id ?? null };
+      p.aiRun = { style: p.style, aiAccuracy: p.aiAccuracy ?? "best", pitchId: p.pitch?.id ?? null, widestView: p.widestView ?? "widest" };
       // Like the real helper: what the AI saw is kept for quick re-runs.
       p.aiSeen = { every: p.aiAccuracy === "faster" ? 3 : 1 };
       p.status = "ready";
@@ -351,12 +369,96 @@ function pathSummary(b64) {
   const f = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
   const pose = (i) => ({ yaw: f[i * 3], pitch: f[i * 3 + 1], fov: f[i * 3 + 2] });
   const frames = f.length / 3;
-  return { frames, first: pose(0), middle: pose(Math.floor(frames / 2)), last: pose(frames - 1), finite: f.every(Number.isFinite) };
+  let maxFov = -Infinity;
+  for (let i = 2; i < f.length; i += 3) maxFov = Math.max(maxFov, f[i]);
+  return { frames, first: pose(0), middle: pose(Math.floor(frames / 2)), last: pose(frames - 1), finite: f.every(Number.isFinite), maxFov };
+}
+
+/** The fixture AI path as the AI would make it with this widest view: never wider than its limit. */
+function aiPathFor(widestView) {
+  const bytes = readFileSync(join(FIX, "ai_path.bin"));
+  const cap = WIDEST_FOV[widestView ?? "widest"] ?? Infinity;
+  if (cap === Infinity) return bytes;
+  const out = Buffer.from(bytes);
+  for (let i = 8; i + 4 <= out.length; i += 12) out.writeFloatLE(Math.min(out.readFloatLE(i), cap), i);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// VeoClone updating itself (DESIGN.md 4.11)
+// ---------------------------------------------------------------------------
+
+const MOCK_BUILD = { number: "0.1.0", sha: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", date: "2026-10-20T08:00:00Z" };
+const NEWER_BUILD = { number: "0.1.0", sha: "9f8e7d6c5b4a39281706f5e4d3c2b1a098f7e6d5", date: "2026-10-25T08:00:00Z" };
+let updater;
+
+function resetUpdates() {
+  updater = {
+    version: { ...MOCK_BUILD },
+    status: { state: "up-to-date", latest: { sha: MOCK_BUILD.sha, date: MOCK_BUILD.date }, auto: true, canUpdate: true },
+    settings: { autoUpdate: true, startWithWindows: false },
+    offlineUntil: 0,
+    checks: 0,
+    installs: 0,
+    settingsPatches: [],
+  };
+}
+resetUpdates();
+
+function updateStatus() {
+  return { ...updater.status, auto: updater.settings.autoUpdate };
+}
+
+async function handleUpdate(req, res, parts, M) {
+  if (parts[1] === "settings") {
+    if (M === "GET") return send(res, 200, updater.settings);
+    if (M === "PATCH") {
+      const body = await readJson(req);
+      for (const key of ["autoUpdate", "startWithWindows"]) {
+        if (body && key in body && body[key] !== null && typeof body[key] !== "boolean") return fail(res, 400, `${key} must be true or false.`);
+      }
+      updater.settingsPatches.push(body);
+      if (typeof body?.autoUpdate === "boolean") updater.settings.autoUpdate = body.autoUpdate;
+      if (typeof body?.startWithWindows === "boolean") updater.settings.startWithWindows = body.startWithWindows;
+      const s = updater.status.state;
+      if (!updater.settings.autoUpdate && s === "up-to-date") updater.status = { ...updater.status, state: "disabled", message: "Automatic updates are off." };
+      if (updater.settings.autoUpdate && s === "disabled") updater.status = { ...updater.status, state: "up-to-date", message: undefined };
+      return send(res, 200, updater.settings);
+    }
+  }
+  if (parts[1] === "update" && parts[2] === "check" && M === "POST") {
+    updater.checks++;
+    updater.status = { ...updater.status, state: "checking", message: undefined, detail: undefined };
+    setTimeout(() => {
+      if (updater.status.state === "checking") updater.status = { ...updater.status, state: "up-to-date" };
+    }, 800);
+    return send(res, 200, updateStatus());
+  }
+  if (parts[1] === "update" && parts[2] === "install" && M === "POST") {
+    if (updater.status.state !== "ready") return fail(res, 409, "There is no update to install yet.");
+    if ([...projects.values()].some(busy))
+      return fail(res, 409, "VeoClone is busy (processing a match, making a video or adding a video). The update installs when it has finished.");
+    updater.installs++;
+    updater.status = { ...updater.status, state: "installing", message: "Updating VeoClone… it will restart in a moment." };
+    setTimeout(() => {
+      // Restarting: gone for a moment, then back as the newer build.
+      updater.offlineUntil = Date.now() + 4000;
+      updater.version = { ...NEWER_BUILD };
+      updater.status = {
+        state: "up-to-date", latest: { sha: NEWER_BUILD.sha, date: NEWER_BUILD.date },
+        message: "VeoClone updated itself to the newest version.", auto: true, canUpdate: true,
+      };
+    }, 3000);
+    return send(res, 202, updateStatus());
+  }
+  return fail(res, 404, "Unknown address.");
 }
 
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".json": "application/json", ".mp4": "video/mp4" };
 
 async function handle(req, res) {
+  // Restarting after an update (see handleUpdate): not there for a moment.
+  if (Date.now() < updater.offlineUntil && !req.url.startsWith("/__mock")) return req.socket.destroy();
   cors(req, res);
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -371,6 +473,15 @@ async function handle(req, res) {
   const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
   const M = req.method;
 
+  if (parts[0] === "__mock" && parts[1] === "update") {
+    if (M === "POST") {
+      const body = (await readJson(req)) ?? {};
+      if (body.status) updater.status = { ...updater.status, ...body.status };
+      if (body.version) updater.version = body.version;
+    }
+    return send(res, 200, updater);
+  }
+  if (parts[0] === "__mock" && parts[1] === "reset" && M === "POST") resetUpdates();
   if (parts[0] === "__mock") {
     if (parts[1] === "state") {
       return send(res, 200, { projects: [...projects.values()], edits: Object.fromEntries(edits), ...mock, failedOnce: [...mock.failedOnce] });
@@ -380,7 +491,7 @@ async function handle(req, res) {
       timers.clear();
       projects = new Map();
       edits = new Map();
-      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [] };
+      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [], aiPathGets: 0 };
       uploads.clear();
       previous.clear();
       if (url.searchParams.has("seed")) seed();
@@ -402,13 +513,14 @@ async function handle(req, res) {
 
   if (parts[1] === "health" && M === "GET") {
     return send(res, 200, {
-      app: "veoclone-helper", version: "0.0.0-mock",
+      app: "veoclone-helper", version: updater.version, update: updateStatus(),
       gpu: { name: "AMD Radeon RX 6800 (pretend)", backend: "Dx12" },
       ai: { available: true, provider: "DirectML", model: "yolo26n.onnx" },
       ffmpeg: true, dataDir: "C:\\Users\\You\\Videos\\VeoClone", freeDiskBytes: 412_000_000_000,
     });
   }
   if (parts[1] === "lenses" && M === "GET") return send(res, 200, lenses);
+  if (parts[1] === "update" || parts[1] === "settings") return handleUpdate(req, res, parts, M);
 
   if (parts[1] !== "projects") return fail(res, 404, "Unknown address.");
   if (parts.length === 2) {
@@ -421,8 +533,9 @@ async function handle(req, res) {
       }
       if (body.style !== undefined && body.style !== null && !STYLES.includes(body.style)) return fail(res, 400, "Unknown camera style.");
       if (body.aiAccuracy !== undefined && body.aiAccuracy !== null && !ACCURACY.includes(body.aiAccuracy)) return fail(res, 400, "Unknown AI accuracy.");
+      if (body.widestView !== undefined && body.widestView !== null && !WIDEST.includes(body.widestView)) return fail(res, 400, "Unknown widest view.");
       if (body.lensId === undefined) body.lensId = null;
-      const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, rightLensId: body.rightLensId ?? null, style: body.style ?? "broadcast", aiAccuracy: body.aiAccuracy ?? "best" });
+      const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, rightLensId: body.rightLensId ?? null, style: body.style ?? "broadcast", aiAccuracy: body.aiAccuracy ?? "best", widestView: body.widestView ?? "natural" });
       projects.set(p.id, p);
       return send(res, 201, p);
     }
@@ -443,7 +556,8 @@ async function handle(req, res) {
       }
       if (body?.style && !STYLES.includes(body.style)) return fail(res, 400, "Unknown camera style.");
       if (body?.aiAccuracy && !ACCURACY.includes(body.aiAccuracy)) return fail(res, 400, "Unknown AI accuracy.");
-      if ((body?.lensId !== undefined || body?.rightLensId !== undefined || body?.style || body?.aiAccuracy) && busy(p)) return fail(res, 409, BUSY);
+      if (body?.widestView && !WIDEST.includes(body.widestView)) return fail(res, 400, "Unknown widest view.");
+      if ((body?.lensId !== undefined || body?.rightLensId !== undefined || body?.style || body?.aiAccuracy || body?.widestView) && busy(p)) return fail(res, 409, BUSY);
       if (typeof body?.name === "string") p.name = body.name.trim() || p.name;
       if (body && "lensId" in body && body.lensId !== p.lensId) {
         p.lensId = body.lensId;
@@ -458,6 +572,7 @@ async function handle(req, res) {
       }
       if (body?.style) p.style = body.style;
       if (body?.aiAccuracy) p.aiAccuracy = body.aiAccuracy;
+      if (body?.widestView) p.widestView = body.widestView;
       p.updatedAt = now();
       return send(res, 200, p);
     }
@@ -556,7 +671,8 @@ async function handle(req, res) {
       return sendFile(req, res, PROXY, "video/mp4");
     case "GET ai-path.bin":
       if (p.status !== "ready") return fail(res, 404, "This match has not been processed yet.");
-      return sendFile(req, res, join(FIX, "ai_path.bin"), "application/octet-stream");
+      mock.aiPathGets++;
+      return send(res, 200, aiPathFor(p.aiRun?.widestView), { "Content-Type": "application/octet-stream" });
     case "GET edits":
       return send(res, 200, edits.get(p.id) ?? {});
     case "PUT edits": {

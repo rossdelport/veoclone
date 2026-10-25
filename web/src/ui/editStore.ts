@@ -21,20 +21,51 @@ export class EditStore {
   private disposed = false;
 
   readonly recompute = debounce(() => {
-    this.finalPath = computeFinalPath(this.ai, this.calib, this.edits);
+    this.finalPath = computeFinalPath(this.ai, this.calib, this.edits, this.maxFov);
     this.emit();
   }, 40);
 
   private readonly autosave = debounce(() => void this.save(), 1000);
 
+  /**
+   * `maxFov`: the match's widest view (widestViewMaxFov), Infinity for no
+   * limit. It and the AI path are match settings, not edits: changing them
+   * makes a new path but no undo point and nothing to save.
+   */
   constructor(
-    private readonly ai: Float32Array,
+    private ai: Float32Array,
     private readonly calib: CalibInfo,
     initial: Edits,
     private readonly saveFn: (e: Edits) => Promise<void>,
+    private maxFov = Infinity,
   ) {
     this.edits = initial;
-    this.finalPath = computeFinalPath(ai, calib, initial);
+    this.finalPath = computeFinalPath(ai, calib, initial, maxFov);
+  }
+
+  /** The AI camera path the final path is made from. */
+  get aiPath(): Float32Array {
+    return this.ai;
+  }
+
+  /** The widest vertical fov (degrees) any frame may show. */
+  get maxFovDeg(): number {
+    return this.maxFov;
+  }
+
+  /** A new AI path (the AI ran again): a new final path, the edits stay. */
+  setAiPath(ai: Float32Array): void {
+    this.ai = ai;
+    this.recompute();
+    this.recompute.flush();
+  }
+
+  /** Another widest view: a new final path, the edits stay. */
+  setMaxFov(deg: number): void {
+    if (deg === this.maxFov) return;
+    this.maxFov = deg;
+    this.recompute();
+    this.recompute.flush();
   }
 
   onChange(fn: () => void): () => void {

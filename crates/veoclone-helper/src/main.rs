@@ -11,24 +11,30 @@ mod logging;
 mod media;
 mod process;
 mod seen;
+mod settings;
+mod shortcuts;
 mod store;
+mod swap;
+mod unzip;
+mod update;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 
 use crate::api::{AppState, GpuInfo, HelperInfo};
 use crate::jobs::{Context, Jobs};
+use crate::settings::SettingsStore;
+use crate::shortcuts::Shortcuts;
 use crate::store::Store;
+use crate::update::{AppWork, Build, Updater};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "veoclone-helper",
-    version,
-    about = "VeoClone helper (local server)"
-)]
+#[command(name = "veoclone-helper", about = "VeoClone helper (local server)")]
 struct Args {
     /// Port to listen on (127.0.0.1 only).
     #[arg(long, default_value_t = 47863)]
@@ -48,6 +54,61 @@ struct Args {
     /// Do not open the browser on start.
     #[arg(long)]
     no_open: bool,
+    /// Minimise this window on start ("Start VeoClone when Windows starts").
+    #[arg(long)]
+    minimized: bool,
+    /// Started by an update of this build: no new browser tab (the editor
+    /// that is open reconnects), and wait for the old copy to free the port.
+    /// Every future version must accept it (DESIGN.md 4.11).
+    #[arg(long, hide = true, value_name = "BUILD")]
+    updated_from: Option<String>,
+}
+
+/// `--version`: the version number and the build.
+fn version_text(build: &Build) -> String {
+    match build.date {
+        Some(date) => format!(
+            "{} (build {}, {})",
+            env!("CARGO_PKG_VERSION"),
+            build.short(),
+            date.format("%-d %b %Y")
+        ),
+        None => format!("{} (development build)", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+/// The options to start the new version with after an update: the same
+/// as this run's, plus `--updated-from <this build>`. Not `--minimized`: the
+/// new version uses the same window, which the user may have opened since.
+fn relaunch_args(args: impl Iterator<Item = OsString>, from: &str) -> Vec<OsString> {
+    let mut out = Vec::new();
+    let mut args = args.peekable();
+    while let Some(a) = args.next() {
+        if a == "--updated-from" {
+            args.next();
+            continue;
+        }
+        if a.to_string_lossy().starts_with("--updated-from=") || a == "--minimized" {
+            continue;
+        }
+        out.push(a);
+    }
+    out.push("--updated-from".into());
+    out.push(from.into());
+    out
+}
+
+/// Try `f` until it works, for up to `patience` (none: once).
+fn retry<T, E>(patience: Option<Duration>, mut f: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    let start = Instant::now();
+    loop {
+        match f() {
+            Err(_) if patience.is_some_and(|p| start.elapsed() < p) => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            r => return r,
+        }
+    }
 }
 
 /// Where matches are stored: `--data-dir`, else env `VEOCLONE_HOME`, else
@@ -122,17 +183,28 @@ fn exit_with(message: &str) -> ! {
 }
 
 fn main() {
-    let args = Args::parse();
+    let build = Build::current();
+    let version: &'static str = Box::leak(version_text(&build).into_boxed_str());
+    let args = Args::from_arg_matches(&Args::command().version(version).get_matches())
+        .unwrap_or_else(|e| e.exit());
+    if args.minimized {
+        shortcuts::minimize_console();
+    }
     put_exe_dir_on_path();
     logging::init();
     let url = format!("http://127.0.0.1:{}/", args.port);
+    // After an update the old copy is still closing: wait for it.
+    let patience = args.updated_from.as_ref().map(|_| Duration::from_secs(60));
+    let open_browser = !args.no_open && args.updated_from.is_none();
 
     // One VeoClone at a time. The port is taken before anything else: a
     // second copy must not tidy up the folder the first one is working in.
-    let listener = match std::net::TcpListener::bind(("127.0.0.1", args.port)) {
+    let listener = match retry(patience, || {
+        std::net::TcpListener::bind(("127.0.0.1", args.port))
+    }) {
         Ok(l) => l,
         Err(e) => {
-            if !args.no_open {
+            if open_browser {
                 let _ = open::that_detached(&url);
             }
             exit_with(&format!(
@@ -151,7 +223,7 @@ fn main() {
             data.display()
         ));
     }
-    let _lock = match lock_folder(&data) {
+    let _lock = match retry(patience, || lock_folder(&data)) {
         Ok(file) => Some(file),
         Err(std::fs::TryLockError::WouldBlock) => exit_with(&format!(
             "VeoClone is already running and using the folder {}. You can close this window.",
@@ -162,6 +234,13 @@ fn main() {
             None
         }
     };
+    // Finish or undo an update that was in progress (DESIGN.md 4.11).
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(update::app_exe()));
+    let install = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    update::recover_install(&install, &build);
     let store = match Store::open(&data) {
         Ok(s) => Arc::new(s),
         Err(e) => exit_with(&format!(
@@ -224,11 +303,47 @@ fn main() {
         tools,
         model,
     });
+    let uploads: Arc<Mutex<HashMap<String, usize>>> = Default::default();
+    let settings = Arc::new(SettingsStore::open(&data));
+    let shortcuts = Arc::new(Shortcuts::new(exe.clone()));
+    if !build.is_dev() {
+        // Shortcuts follow the folder when it moves; the Start menu one is
+        // made once (COM takes a moment: not in the way of starting).
+        let (shortcuts, settings) = (shortcuts.clone(), settings.clone());
+        std::thread::spawn(move || {
+            let first = !settings.get().start_menu_done;
+            if shortcuts.refresh(first)
+                && first
+                && let Err(e) = settings.update(|s| s.start_menu_done = true)
+            {
+                log::warn!("Could not save the settings: {e}");
+            }
+        });
+    }
+    let updater = Updater::new(
+        update::Config {
+            build: build.clone(),
+            install,
+            data_dir: data.clone(),
+            url: update::update_url(),
+            relaunch: relaunch_args(std::env::args_os().skip(1), &build.sha),
+            updated_from: args.updated_from.clone(),
+        },
+        settings.clone(),
+        Arc::new(AppWork {
+            jobs: jobs.clone(),
+            uploads: uploads.clone(),
+        }),
+    );
+    updater.start();
     let state = AppState {
         store,
         jobs,
         info,
-        uploads: Default::default(),
+        uploads,
+        updater,
+        settings,
+        shortcuts,
     };
     let web_dir = args
         .web_dir
@@ -252,13 +367,20 @@ fn main() {
             Err(e) => exit_with(&format!("VeoClone could not start: {e}")),
         };
         println!();
-        println!("  VeoClone {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "  VeoClone {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            build.describe()
+        );
+        if args.updated_from.is_some() {
+            println!("  {}", update::UPDATED);
+        }
         println!();
         println!("  Keep this window open while you use VeoClone.");
         println!("  If your browser did not open, go to {url}");
         println!("  Your matches are saved in {}", data.display());
         println!();
-        if !args.no_open && open::that_detached(&url).is_err() {
+        if open_browser && open::that_detached(&url).is_err() {
             println!("  (Could not open the browser by itself.)");
         }
         if let Err(e) = axum::serve(listener, app).await {
@@ -288,6 +410,56 @@ mod tests {
             &roots
         ));
         assert_eq!(data_dir(Some("/x".into())), PathBuf::from("/x"));
+    }
+
+    #[test]
+    fn relaunched_with_the_same_options() {
+        let args = [
+            "--port",
+            "47870",
+            "--updated-from",
+            "old",
+            "--no-open",
+            "--minimized",
+            "--updated-from=x",
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            relaunch_args(args.into_iter(), "abc"),
+            ["--port", "47870", "--no-open", "--updated-from", "abc"].map(OsString::from)
+        );
+        // Both forms parse; hidden from --help.
+        let a = Args::try_parse_from(["x", "--updated-from", "abc", "--minimized"]).unwrap();
+        assert_eq!(a.updated_from.as_deref(), Some("abc"));
+        assert!(a.minimized);
+        assert!(
+            !Args::command()
+                .render_help()
+                .to_string()
+                .contains("updated-from")
+        );
+        assert!(version_text(&Build::dev()).ends_with("(development build)"));
+        let b = Build::from_env(Some("abcdef0123"), Some("2026-10-25T09:30:00Z"));
+        assert!(version_text(&b).ends_with("(build abcdef0, 25 Oct 2026)"));
+    }
+
+    #[test]
+    fn retries_for_a_while() {
+        let mut n = 0;
+        let r: Result<(), ()> = retry(Some(Duration::from_secs(5)), || {
+            n += 1;
+            if n < 3 { Err(()) } else { Ok(()) }
+        });
+        assert!(r.is_ok());
+        n = 0;
+        assert!(
+            retry(None, || -> Result<(), ()> {
+                n += 1;
+                Err(())
+            })
+            .is_err()
+        );
+        assert_eq!(n, 1);
     }
 
     #[test]

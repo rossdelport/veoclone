@@ -1,6 +1,6 @@
 // The editor (#/edit/:id): camera view, whole-pitch overview, timeline,
 // trims, camera fixes (keyframes), sliders, autosave and export.
-import { api, helperUrl, rerunTime, watchProject, type ProjectMeta } from "../api";
+import { aiUsesWidestView, api, helperUrl, quickRerun, rerunTime, watchProject, widestViewOf, type ProjectMeta, type WidestView } from "../api";
 import {
   aimOfWorld,
   buildRig,
@@ -25,6 +25,7 @@ import {
   straightenOfMatch,
   straightenRadians,
   timeToFrame,
+  widestViewMaxFov,
   withRigTilt,
   worldToRenderPose,
   yawPitchToDirection,
@@ -35,14 +36,14 @@ import {
   type Rig,
   type Straighten,
 } from "../engine";
-import { button, confirmDialog, describeError, errorBox, iconButton, notice, toast } from "./common";
+import { button, confirmDialog, describeError, errorBox, iconButton, notice, progressBar, setProgress, toast } from "./common";
 import { debounce, formatDuration, h, icon, setChildren } from "./dom";
 import { EditStore, upsertKeyframe, type SaveState } from "./editStore";
 import { ExportPanel } from "./exportPanel";
 import { I } from "./icons";
 import { changeLens } from "./lens";
 import type { Page, PageContext } from "./page";
-import { STYLES } from "./newMatch";
+import { STYLES, WIDEST, WIDEST_HELP, widestPicker } from "./newMatch";
 import { markPitchDialog } from "./pitchTool";
 import { editableTitle, returnToEditorAfterRun } from "./project";
 import { cutOut, cutParts, isKept, keep, nextKept, setEnd, setStart } from "./segments";
@@ -112,7 +113,8 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const matchStraighten = straightenOfMatch(calib.match);
   const cameraLevel = matchStraighten.tiltDeg !== 0 || matchStraighten.rollDeg !== 0;
   let rig: Rig = buildRig(calib, straightenRadians(initial.straighten));
-  const store = new EditStore(ai, calib, initial, (e) => api.putEdits(id, e));
+  // "Widest view" (DESIGN.md 4.12): no frame of the final path is wider.
+  const store = new EditStore(ai, calib, initial, (e) => api.putEdits(id, e), widestViewMaxFov(project.widestView));
   const disposers: (() => void)[] = [];
   const listen = <K extends keyof WindowEventMap>(target: Window, type: K, fn: (e: WindowEventMap[K]) => void) => {
     target.addEventListener(type, fn);
@@ -281,6 +283,9 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const lookRow = h("div", { class: "look-row", role: "group", "aria-label": "Point the preview across the pitch" });
   const straightenHint = h("div", { class: "straighten-hint-host" });
   const pitchHint = h("div", { class: "pitch-hint-host" });
+  const naturalHint = h("div", { class: "natural-hint-host" });
+  const widestHost = h("div", { class: "widest-host" });
+  const widestNote = h("div", { class: "widest-note", "aria-live": "polite", "data-testid": "widest-note" });
   const pitchRow = h("div", { class: "pitch-row-side", "data-testid": "pitch-status" });
   const fixList = h("div", { class: "fix-list" });
   const trimInfo = h("div", { class: "trim-info" });
@@ -289,6 +294,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     "aside",
     { class: "editor-side", "aria-label": "Editing tools" },
     notes,
+    naturalHint,
     pitchHint,
     straightenHint,
     h(
@@ -312,6 +318,14 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       { class: "side-section" },
       h("h2", null, "Camera"),
       sliders,
+      h(
+        "div",
+        { class: "widest", "data-testid": "widest-view" },
+        h("p", { class: "widest-title" }, "Widest view"),
+        h("p", { class: "muted small" }, WIDEST_HELP),
+        widestHost,
+        widestNote,
+      ),
       h(
         "p",
         { class: "small muted style-line" },
@@ -665,6 +679,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     }
     // Where the AI wanted to look.
     const f = shownFrame;
+    const ai = store.aiPath;
     if (ai.length >= (f + 1) * 3) {
       const a = toCanvas(aimOfWorld({ yaw: ai[f * 3], pitch: ai[f * 3 + 1] }, aiRig, aiRig.tilt));
       g.strokeStyle = "rgba(255,255,255,0.85)";
@@ -725,7 +740,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   // ---------------------------------------------------------------------
   // Camera fixes
   // ---------------------------------------------------------------------
-  const clampView = (p: Pose): Pose => clampPose({ ...p, fov: Math.min(Math.max(p.fov, MIN_FOV), maxFov) }, cov, ASPECT);
+  const clampView = (p: Pose): Pose => clampPose({ ...p, fov: Math.min(Math.max(p.fov, MIN_FOV), maxFov, store.maxFovDeg) }, cov, ASPECT);
 
   function commitLive() {
     if (!livePose) return;
@@ -1230,6 +1245,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       exportPanel.update(p);
       updateExportButton(p);
       renderNotes(p);
+      syncWidest(p);
       if (pitchChanged) {
         renderPitch();
         requestDraw();
@@ -1371,6 +1387,208 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   }
 
   // ---------------------------------------------------------------------
+  // Widest view (DESIGN.md 4.12)
+  // ---------------------------------------------------------------------
+  // A match setting, not an edit: it limits every frame of the final path at
+  // once (store.setMaxFov), and the AI runs again (seconds, from what it saw
+  // last time) so the AI camera zooms with the limit too.
+  let aiMadeWith = JSON.stringify(project.aiRun ?? null); // what store.aiPath was made with
+  let loadingAi = false;
+  let widestRun: WidestView | null = null; // our own re-run is making this
+  let widestShown: WidestView | null = null;
+  let widestSending = false; // saving the choice / starting the run
+  const processing = (p: ProjectMeta) => p.status === "queued" || p.status === "processing" || p.job?.kind === "process";
+  const widestBusy = () => widestSending || processing(latest);
+  const widestName = (w: WidestView) => WIDEST.find((x) => x.id === w)?.name ?? w;
+
+  function renderWidest() {
+    const value = widestViewOf(latest);
+    if (value !== widestShown) {
+      widestShown = value;
+      setChildren(widestHost, widestPicker(value, (w) => void changeWidest(w), "editor-widest", true));
+    }
+    // No other choice while the AI runs (VeoClone would refuse it).
+    for (const input of widestHost.querySelectorAll("input")) input.disabled = widestBusy();
+    renderWidestNote();
+    renderNaturalHint();
+  }
+
+  function renderWidestNote() {
+    const p = latest;
+    if (processing(p)) {
+      const job = p.job?.kind === "process" ? p.job : null;
+      if (!widestNote.querySelector(".progress")) {
+        setChildren(widestNote, h("p", { class: "small widest-status" }), progressBar(0, "Updating the AI camera"), h("p", { class: "muted small widest-msg" }));
+      }
+      const what = widestRun ? `Updating the AI camera for “${widestName(widestRun)}”…` : "The AI is running again…";
+      widestNote.querySelector(".widest-status")!.textContent = `${what} ${Math.round((job?.progress ?? 0) * 100)}%`;
+      widestNote.querySelector(".widest-msg")!.textContent = job?.message ?? "Waiting to start";
+      setProgress(widestNote.querySelector<HTMLElement>(".progress")!, job?.progress ?? 0);
+      return;
+    }
+    if (widestSending) return setChildren(widestNote, h("p", { class: "small muted" }, "One moment…"));
+    if (aiUsesWidestView(p) || loadingAi) return setChildren(widestNote);
+    if (widestNote.dataset.key === JSON.stringify(p.aiRun) && widestNote.querySelector(".widest-stale")) return;
+    widestNote.dataset.key = JSON.stringify(p.aiRun);
+    setChildren(
+      widestNote,
+      h("p", { class: "small muted widest-stale" }, `The AI camera was made with “${widestName(p.aiRun?.widestView ?? "widest")}”. Your fixes and the Zoom slider already keep to “${widestName(widestViewOf(p))}”; run the AI again so the AI camera does too.`),
+      button("Run the AI again", () => void runAiForWidest(), { variant: "secondary", class: "btn-small", icon: I.refresh }),
+    );
+  }
+
+  /** The user picked another widest view. */
+  async function changeWidest(w: WidestView) {
+    pause();
+    if (widestBusy()) return;
+    widestSending = true;
+    renderWidest();
+    let p: ProjectMeta;
+    try {
+      p = await api.updateProject(id, { widestView: w });
+    } catch (e) {
+      widestSending = false;
+      toast(describeError(e).message, "error", 6000);
+      widestShown = null; // show what is stored again
+      renderWidest();
+      return;
+    }
+    if (disposedFlag) return;
+    latest = p;
+    watch.refresh(); // polls from before the change are dropped
+    dismissNaturalHint();
+    store.setMaxFov(widestViewMaxFov(w)); // the editor keeps to it at once
+    if (aiUsesWidestView(p)) {
+      widestSending = false;
+      renderWidest();
+      return;
+    }
+    await runAiForWidest(true);
+  }
+
+  /**
+   * Run the AI again for the widest view: in seconds here, or the long way
+   * on the match page. `sending`: called by changeWidest, which set widestSending.
+   */
+  async function runAiForWidest(sending = false) {
+    pause();
+    if (!sending) {
+      if (widestBusy()) return;
+      widestSending = true;
+    }
+    try {
+      await startAiForWidest();
+    } finally {
+      widestSending = false;
+      if (!disposedFlag) renderWidest();
+    }
+  }
+
+  async function startAiForWidest() {
+    if (!quickRerun(latest)) {
+      const run = await confirmDialog({
+        title: "Run the AI again?",
+        text: [
+          h("p", null, `Your fixes and the Zoom slider already keep to “${widestName(widestViewOf(latest))}”. For the AI camera to zoom with it too, the AI needs to run again.`),
+          h("p", { class: "small" }, rerunTime(latest), " Your trims, camera fixes and text are kept."),
+        ],
+        confirm: "Run the AI again",
+        dismiss: "Later",
+      });
+      if (run && !disposedFlag) await rerunAi();
+      return;
+    }
+    try {
+      latest = await api.process(id);
+    } catch (e) {
+      toast(describeError(e).message, "error", 6000);
+      return;
+    }
+    widestRun = widestViewOf(latest);
+    watch.refresh();
+  }
+
+  /** A poll: the widest view's limit, and the new AI path once a run is done. */
+  function syncWidest(p: ProjectMeta) {
+    store.setMaxFov(widestViewMaxFov(p.widestView));
+    renderWidest();
+    void refreshAiPath(p);
+  }
+
+  async function refreshAiPath(p: ProjectMeta) {
+    if (processing(p) || loadingAi) return;
+    if (p.status !== "ready") {
+      if (widestRun) {
+        widestRun = null;
+        toast("The AI could not run again. Open the match page to see why.", "error", 8000);
+      }
+      return;
+    }
+    const key = JSON.stringify(p.aiRun ?? null);
+    if (key === aiMadeWith) {
+      if (widestRun) {
+        // The run ended without a new AI path (it failed or was stopped; the note at the top says why).
+        widestRun = null;
+        toast("The AI camera could not be updated. Press Run the AI again to try once more.", "error", 6000);
+        renderWidest();
+      }
+      return;
+    }
+    if (p.frameCount !== undefined && p.frameCount !== calib.frameCount) {
+      // Made from other videos (e.g. in another tab): open the editor again.
+      await store.save();
+      location.reload();
+      return;
+    }
+    loadingAi = true;
+    try {
+      const next = await api.aiPath(id);
+      if (disposedFlag) return;
+      aiMadeWith = key;
+      store.setAiPath(next);
+      if (widestRun) toast(`Done: the AI camera now uses “${widestName(widestRun)}”.`, "success", 3000);
+      widestRun = null;
+    } catch {
+      // The next poll tries again.
+    } finally {
+      loadingAi = false;
+      if (!disposedFlag) renderWidest();
+    }
+  }
+
+  // One-time tip for matches made before the setting existed (they keep
+  // the old, widest camera until the user picks something).
+  const NATURAL_HINT = "veoclone.hint.natural";
+  const naturalHintDismissed = () => {
+    try {
+      return localStorage.getItem(NATURAL_HINT) === "dismissed";
+    } catch {
+      return false;
+    }
+  };
+  function dismissNaturalHint() {
+    try {
+      localStorage.setItem(NATURAL_HINT, "dismissed");
+    } catch {
+      // Private mode: hidden until the editor opens again.
+    }
+    setChildren(naturalHint);
+  }
+  function renderNaturalHint() {
+    if (latest.widestView || naturalHintDismissed()) return setChildren(naturalHint);
+    if (naturalHint.firstChild) return;
+    const box = notice(
+      "info",
+      "New: Natural look stops the camera zooming out so far that the edges stretch.",
+      h("p", { class: "small" }, "Like Veo, the camera stays close to the play. You can change it any time under Camera › Widest view."),
+      button("Try it", () => void changeWidest("natural"), { variant: "secondary", class: "btn-small", icon: I.sparkle }),
+    );
+    box.dataset.testid = "natural-hint";
+    box.append(iconButton(I.x, "Hide this tip", () => dismissNaturalHint(), "btn-ghost btn-small"));
+    setChildren(naturalHint, box);
+  }
+
+  // ---------------------------------------------------------------------
   // Keyboard
   // ---------------------------------------------------------------------
   listen(window, "keydown", (e) => {
@@ -1454,6 +1672,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   renderSide();
   renderPitch();
   renderStraightenHint();
+  renderWidest();
   requestDraw();
 
   return {

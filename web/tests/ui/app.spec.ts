@@ -40,7 +40,7 @@ test("shows how to start VeoClone when the helper is not running", async ({ page
   await shot(page, "02-offline");
 });
 
-async function createMatch(page: Page, name: string, style = "Action") {
+async function createMatch(page: Page, name: string, style = "Action", widest?: string) {
   await open(page, "/new");
   await page.getByLabel("Name of the match").fill(name);
   await page.getByTestId("file-left").setInputFiles(path.join(FIXTURES, "left-small.mp4"));
@@ -56,6 +56,7 @@ async function createMatch(page: Page, name: string, style = "Action") {
   await model.selectOption("iPhone 16 Pro");
   await expect(page.locator(".lens-note")).toHaveText("Uses the iPhone 15 Pro profile (closest match)");
   await page.getByText(style, { exact: true }).click();
+  if (widest) await page.getByRole("radiogroup", { name: "Widest view" }).getByText(widest, { exact: true }).click();
   await shot(page, "03-new-match");
   await page.getByRole("button", { name: "Start" }).click();
   await expect(page).toHaveURL(/#\/project\/\w+/);
@@ -111,7 +112,7 @@ test("AI accuracy: every frame by default, every 3rd frame when chosen, and chan
   const id = (await mockState()).projects[0].id;
   await open(page, `/project/${id}`);
   await expect(page.locator(".facts")).toContainText("Faster – every 3rd frame");
-  await page.getByText("Change the camera style or AI accuracy").click();
+  await page.getByText("Change the camera style, widest view or AI accuracy").click();
   // What the AI saw (every 3rd frame) is kept: another style takes seconds…
   await expect(page.getByTestId("rerun-time")).toHaveText("This takes a few seconds: VeoClone reuses what the AI saw last time.");
   await page.getByRole("radiogroup", { name: "AI accuracy" }).getByText("Best – check every frame (slower)").click();
@@ -202,6 +203,123 @@ async function clickTimeline(page: Page, fraction: number) {
 }
 
 /** Click a point of the "Mark the pitch" picture, as a fraction of its size. */
+test("widest view: Natural (like Veo) for a new match, Wide when chosen, shown on the match page and in the editor", async ({ page }) => {
+  await resetMock();
+  await open(page, "/new");
+  const choices = page.getByRole("radiogroup", { name: "Widest view" });
+  await expect(choices.getByRole("radio")).toHaveCount(3);
+  await expect(choices.getByRole("radio", { name: /^Natural \(like Veo\)/ })).toBeChecked();
+  await expect(choices).toContainText("Stays close to the play, so the sides of the picture never look stretched.");
+  await expect(choices).toContainText("The sides can look stretched, like a fisheye.");
+  await createMatch(page, "Wide view match", "Broadcast", "Wide");
+  expect((await mockState()).projects[0].widestView).toBe("wide");
+  await expect(page.locator(".facts dt:text-is('Widest view') + dd")).toHaveText("Wide", { timeout: 30_000 });
+  await expect(page).toHaveURL(/#\/edit\/\w+/, { timeout: 10_000 });
+  await expectPicture(page);
+  const editor = page.getByTestId("widest-view").getByRole("radiogroup", { name: "Widest view" });
+  await expect(editor.getByRole("radio", { name: /^Wide\b/ })).toBeChecked();
+  await expect(page.getByTestId("widest-note")).toBeEmpty();
+  await expect(page.getByTestId("natural-hint")).toHaveCount(0); // only for matches made before the setting
+  expect((await mockState()).projects[0].aiRun?.widestView).toBe("wide");
+});
+
+test("editor: an older match gets the Natural look tip; Try it keeps the camera closer at once and runs the AI again in seconds", async ({ page }) => {
+  const id = await openExample(page);
+  const camera = page.getByTestId("widest-view");
+  const choices = camera.getByRole("radiogroup", { name: "Widest view" });
+  await expect(choices.getByRole("radio")).toHaveCount(3);
+  // Made before the setting existed: it keeps the camera it had.
+  await expect(choices.getByRole("radio", { name: /^Widest\b/ })).toBeChecked();
+  await expect(camera).toContainText("How far the camera may zoom out");
+  const tip = page.getByTestId("natural-hint");
+  await expect(tip).toContainText("New: Natural look stops the camera zooming out so far that the edges stretch.");
+  await shot(page, "nl-01-tip");
+
+  // Zoomed right out, the camera goes as wide as the two pictures allow.
+  const view = page.getByTestId("camera-view");
+  await page.getByTestId("slider-zoom").fill("0.5");
+  await expect(page.locator(".slider").first()).toContainText("50%");
+  await page.getByRole("button", { name: "Export" }).click();
+  const drawer = page.getByRole("dialog", { name: "Export your video" });
+  await drawer.getByRole("button", { name: "Make video" }).click();
+  await expect(drawer.getByTestId("download")).toBeVisible({ timeout: 30_000 });
+  expect((await mockState()).lastExport!.path.maxFov).toBeGreaterThan(45);
+  await drawer.getByRole("button", { name: "Close" }).click();
+  await page.waitForTimeout(500); // the drawer has gone
+  const before = await view.screenshot();
+
+  // Try it: the editor keeps to Natural at once, and the AI runs again
+  // (slowly here, so the note can be seen).
+  await patchProject(id, { name: "Example match slow" });
+  const gets = (await mockState()).aiPathGets;
+  await tip.getByRole("button", { name: "Try it" }).click();
+  await expect(tip).toHaveCount(0);
+  await expect(choices.getByRole("radio", { name: /^Natural/ })).toBeChecked();
+  const note = page.getByTestId("widest-note");
+  await expect(note).toContainText("Updating the AI camera for “Natural (like Veo)”…");
+  await expect(choices.getByRole("radio", { name: /^Wide\b/ })).toBeDisabled();
+  await expect.poll(async () => (await view.screenshot()).equals(before)).toBe(false);
+  await camera.scrollIntoViewIfNeeded();
+  await shot(page, "nl-02-updating");
+  await expect(page.getByText("Done: the AI camera now uses “Natural (like Veo)”.")).toBeVisible({ timeout: 30_000 });
+  await expect(note).toBeEmpty();
+  await expect(choices.getByRole("radio", { name: /^Wide\b/ })).toBeEnabled();
+  const state = await mockState();
+  expect(state.projects[0].widestView).toBe("natural");
+  expect(state.projects[0].aiRun?.widestView).toBe("natural");
+  expect(state.aiPathGets).toBe(gets + 1); // the new AI path, without leaving the editor
+  await expect(page).toHaveURL(new RegExp(`#/edit/${id}$`));
+  await camera.scrollIntoViewIfNeeded();
+  await shot(page, "nl-03-natural");
+
+  // The Zoom slider (still 50%) and a fix zoomed right out can't go past 34 degrees.
+  await view.hover();
+  for (let i = 0; i < 6; i++) await page.mouse.wheel(0, 400);
+  await expect(page.locator(".fixes li")).toHaveCount(1, { timeout: 5000 });
+  await page.getByRole("button", { name: "Export" }).click();
+  await drawer.getByRole("button", { name: "Make video" }).click();
+  await expect(drawer.getByTestId("export-row")).toHaveCount(2);
+  const sent = (await mockState()).lastExport!.path;
+  expect(sent.finite).toBe(true);
+  expect(sent.maxFov).toBeLessThanOrEqual(34);
+  expect(sent.maxFov).toBeGreaterThan(33.9);
+  await drawer.getByRole("button", { name: "Close" }).click();
+
+  // Opened again: Natural, and no tip.
+  await page.reload();
+  await expectPicture(page);
+  await expect(choices.getByRole("radio", { name: /^Natural/ })).toBeChecked();
+  await expect(page.getByTestId("natural-hint")).toHaveCount(0);
+});
+
+test("editor: when running the AI again for a widest view fails, the editor keeps to it and offers to try again", async ({ page }) => {
+  const id = await openExample(page);
+  await patchProject(id, { name: "Example match fail" }); // the mock fails its next run once
+  const choices = page.getByTestId("widest-view").getByRole("radiogroup", { name: "Widest view" });
+  await choices.getByText("Wide", { exact: true }).click();
+  await expect(page.getByText("The AI camera could not be updated.")).toBeVisible({ timeout: 30_000 });
+  const note = page.getByTestId("widest-note");
+  await expect(note).toContainText("The AI camera was made with “Widest”.");
+  await expect(page.getByTestId("editor-warnings")).toContainText("Processing it again did not work");
+  await expect(choices.getByRole("radio", { name: /^Wide\b/ })).toBeChecked();
+  expect((await mockState()).projects[0]).toMatchObject({ status: "ready", widestView: "wide" });
+  await note.getByRole("button", { name: "Run the AI again" }).click();
+  await expect(page.getByText("Done: the AI camera now uses “Wide”.")).toBeVisible({ timeout: 30_000 });
+  await expect(note).toBeEmpty();
+  expect((await mockState()).projects[0].aiRun?.widestView).toBe("wide");
+});
+
+test("editor: the Natural look tip can be hidden for good", async ({ page }) => {
+  const id = await openExample(page);
+  await page.getByTestId("natural-hint").getByRole("button", { name: "Hide this tip" }).click();
+  await expect(page.getByTestId("natural-hint")).toHaveCount(0);
+  await page.reload();
+  await expectPicture(page);
+  await expect(page.getByTestId("natural-hint")).toHaveCount(0);
+  const p = (await mockState()).projects.find((x) => x.id === id)!;
+  expect(p.widestView).toBeNull(); // nothing changed
+});
+
 async function clickPitch(page: Page, fx: number, fy: number) {
   const box = (await page.getByTestId("pitch-canvas").boundingBox())!;
   await page.mouse.click(box.x + box.width * fx, box.y + box.height * fy);

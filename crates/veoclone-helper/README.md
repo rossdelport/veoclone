@@ -19,7 +19,7 @@ dependencies, as in reco-gui).
 
 ```bash
 veoclone-helper [--port 47863] [--data-dir DIR] [--web-dir DIR] [--model FILE]
-                [--allow-origin ORIGIN]... [--no-open]
+                [--allow-origin ORIGIN]... [--no-open] [--minimized]
 ```
 
 - `ffmpeg`/`ffprobe` are taken from next to the program, then from PATH.
@@ -29,6 +29,15 @@ veoclone-helper [--port 47863] [--data-dir DIR] [--web-dir DIR] [--model FILE]
   `<Videos>/VeoClone`.
 - With `load-dynamic`, `onnxruntime.dll` must sit next to the program (or set
   `ORT_DYLIB_PATH`).
+- Updates (DESIGN.md 4.11): a build made with `VEOCLONE_BUILD_SHA` and
+  `VEOCLONE_BUILD_DATE` set (as CI does), running from a folder whose
+  `version.json` names that build, updates itself from
+  `https://github.com/rossdelport/veoclone/releases/download/helper-latest`
+  (`VEOCLONE_UPDATE_URL` overrides it: `https://`, or `http://` on
+  127.0.0.1/localhost). Any other build is a development build and never
+  updates itself. `--minimized` minimises the window (Start with Windows);
+  `--updated-from BUILD` (hidden) is what an update starts the new version
+  with.
 
 ## Test
 
@@ -42,6 +51,10 @@ cargo test -p veoclone-helper -- --ignored export_frame_alignment
 python3 crates/veoclone-helper/scripts/e2e.py --helper target/release/veoclone-helper \
   --left left.mp4 --right right.mp4 --model yolo26n_640.onnx --work /tmp/veoclone-e2e
 # (--only chapters: just the videos split into chapter files and sent as parts.)
+# Updating itself: builds the helper twice (an old and a new build), serves a
+# pretend release on 127.0.0.1 and checks download, checks, swap, restart,
+# clean-up, a damaged zip, waiting while busy and undoing a broken version:
+python3 crates/veoclone-helper/scripts/update_e2e.py --work /tmp/veoclone-update-e2e
 ```
 
 ## API notes beyond DESIGN.md

@@ -21,6 +21,7 @@ use crate::media::{
 };
 use crate::seen::{
     BALL_CONFIDENCE, Classes, RECORD_CONFIDENCE, RepanSettings, RepanStats, SeenMeta, SeenWriter,
+    WidestView,
 };
 use crate::store::{
     AiRun, CalibSummary, DERIVED_FILES, Fps, ProbeInfo, ProjectMeta, Status, Step, matched_file,
@@ -301,6 +302,8 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     cancelled(cancel)?;
 
     // 4. AI tracking: quick when what the AI saw last time can be used.
+    let settings = repan_settings(&meta);
+    tracing::info!("Widest view: {}", settings.widest.describe());
     let path = match usable_recording(ctx, &dir, &meta, summary.sync_offset_frames) {
         Some(seen) => {
             progress.step(Step::Track, 3, "Using what the AI saw last time");
@@ -351,6 +354,7 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
         style: meta.style,
         ai_accuracy: meta.ai_accuracy,
         pitch_id: meta.pitch.as_ref().map(|p| p.id.clone()),
+        widest_view: Some(settings.widest),
     };
     store.update(id, |m| {
         m.frame_count = Some(frame_count);
@@ -752,6 +756,7 @@ fn repan_settings(meta: &ProjectMeta) -> RepanSettings {
         style: meta.style,
         every: meta.ai_accuracy.interval(),
         roi: meta.pitch.as_ref().map(|p| p.field_roi()),
+        widest: WidestView::effective(meta.widest_view),
     }
 }
 
@@ -864,6 +869,19 @@ fn track(
     let preset = meta.style.preset();
     let mode = meta.style.tracking_mode();
     let interval = meta.ai_accuracy.interval();
+    // "Mark the pitch" and the widest view (the same settings as a re-run).
+    let settings = repan_settings(meta);
+    // The style's preset with the widest view's zoom limit; repan uses the
+    // same config, so a recording replays to exactly this path.
+    let panner = crate::seen::panner_config(meta.style, settings.widest);
+    if let Some(c) = &panner {
+        tracing::info!(
+            "AI camera zoom: {:.0} to {:.0} deg tall, starting at {:.0} deg",
+            c.fov_tight,
+            c.fov_wide,
+            c.fov_default
+        );
+    }
     tracing::info!(
         "Camera style: {:?} (Reco {mode:?} tracking, {preset} preset); AI accuracy {:?} (the AI \
          looks at every {})",
@@ -882,7 +900,6 @@ fn track(
     let classes = Classes::from_names(&names);
     let (model_name, model_bytes) = crate::seen::model_identity(&model);
     // "Mark the pitch": people and balls outside it are ignored.
-    let settings = repan_settings(meta);
     let field_roi = match &settings.roi {
         Some(roi) => {
             tracing::info!(
@@ -940,8 +957,7 @@ fn track(
             .with_tracking_mode(mode)
             .with_detection_interval(interval)
             .with_10bit(is_10bit);
-        config.field_panner_config =
-            reco_autocam::panners::FieldPannerConfig::from_preset_name(preset);
+        config.field_panner_config = panner;
         config.confidence_threshold = Some(RECORD_CONFIDENCE);
         let min_confidence = (mode == reco_autocam::TrackingMode::Ball).then_some(BALL_CONFIDENCE);
         let roi = field_roi.map(|r| (r, classes.roi_person));

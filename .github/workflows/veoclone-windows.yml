@@ -101,9 +101,23 @@ jobs:
         with:
           key: veoclone-windows
 
+      # The build's identity (DESIGN.md 4.11): VeoClone.exe embeds the commit
+      # and its date, and updates itself when the release's latest.json
+      # names a newer one. Builds without these are development builds and
+      # never update themselves.
+      - name: Build identity
+        shell: pwsh
+        run: |
+          $seconds = [long](git show -s --format=%ct HEAD)
+          $date = [DateTimeOffset]::FromUnixTimeSeconds($seconds).UtcDateTime.ToString(
+            "yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+          echo "VEOCLONE_BUILD_SHA=$env:GITHUB_SHA" >> $env:GITHUB_ENV
+          echo "VEOCLONE_BUILD_DATE=$date" >> $env:GITHUB_ENV
+          echo "Build $env:GITHUB_SHA of $date"
+
       # load-dynamic: onnxruntime.dll is loaded at run time from next to the
       # exe (as in release.yml). DirectML support is switched on for Windows
-      # in the helper's Cargo.toml.
+      # in the helper's Cargo.toml. VEOCLONE_BUILD_SHA/DATE come from above.
       - name: Build the helper
         run: cargo build --locked --release -p veoclone-helper --features load-dynamic
 
@@ -179,19 +193,34 @@ jobs:
           Copy-Item "$env:RUNNER_TEMP\directml\LICENSE*", "$env:RUNNER_TEMP\directml\ThirdPartyNotices*" "$lic\DirectML"
           Copy-Item THIRD_PARTY_NOTICES.md "$lic\Reco-THIRD_PARTY_NOTICES.md"
 
+          # What this folder is (DESIGN.md 4.11): its build, and every file in
+          # it, so that an update knows which files are VeoClone's own (and
+          # removes those a newer version no longer has, nothing else).
+          $root = (Resolve-Path $out).Path
+          $files = @(Get-ChildItem $out -Recurse -File | ForEach-Object {
+            $_.FullName.Substring($root.Length + 1).Replace('\', '/')
+          }) + "version.json" | Sort-Object
+          [ordered]@{ sha = $env:VEOCLONE_BUILD_SHA; date = $env:VEOCLONE_BUILD_DATE; files = @($files) } |
+            ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8NoBOM "$out\version.json"
+
           Get-ChildItem $out -Recurse -File | Select-Object Length, FullName | Format-Table -AutoSize | Out-String -Width 300
 
       # Start VeoClone.exe like a user would (without opening a browser) and
-      # check that it finds FFmpeg, loads the AI and serves the editor.
+      # check that it finds FFmpeg, loads the AI, serves the editor, knows
+      # its build and can reach the release to update itself (automatic
+      # updates are off here, so the folder is never changed).
       - name: Smoke test
         shell: pwsh
         run: |
           $exe = (Resolve-Path "out\VeoClone\VeoClone.exe").Path
-          & $exe --version
+          $version = & $exe --version
           if ($LASTEXITCODE -ne 0) { throw "VeoClone.exe --version failed (exit code $LASTEXITCODE)" }
+          echo $version
+          if ("$version" -notmatch $env:VEOCLONE_BUILD_SHA.Substring(0, 7)) { throw "VeoClone.exe --version does not name build $env:VEOCLONE_BUILD_SHA" }
 
           $tmp = "$env:RUNNER_TEMP\smoke"
-          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          New-Item -ItemType Directory -Force -Path "$tmp\data" | Out-Null
+          '{"autoUpdate": false}' | Set-Content -Encoding utf8NoBOM "$tmp\data\settings.json"
           $p = Start-Process -FilePath $exe -ArgumentList "--no-open", "--data-dir", "$tmp\data" `
             -NoNewWindow -PassThru -RedirectStandardOutput "$tmp\out.txt" -RedirectStandardError "$tmp\err.txt"
           $null = $p.Handle  # keeps ExitCode readable after the process ends
@@ -214,6 +243,21 @@ jobs:
             }
             $page = Invoke-WebRequest -Uri "http://127.0.0.1:47863/" -TimeoutSec 10
             if ($page.Content -notmatch "<html") { throw "The editor is not served at http://127.0.0.1:47863/" }
+
+            if ($health.version.sha -ne $env:VEOCLONE_BUILD_SHA) { throw "VeoClone reports build $($health.version.sha), not $env:VEOCLONE_BUILD_SHA" }
+            if (-not $health.update.canUpdate) { throw "VeoClone says it cannot update itself: $($health.update.message)" }
+            # Fetch latest.json over HTTPS (only checks: automatic updates are off).
+            $null = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:47863/api/update/check" -TimeoutSec 10
+            for ($i = 0; $i -lt 90; $i++) {
+              Start-Sleep -Seconds 1
+              $update = (Invoke-RestMethod -Uri "http://127.0.0.1:47863/api/health" -TimeoutSec 5).update
+              if ($update.state -notin "checking", "downloading") { break }
+            }
+            $update | ConvertTo-Json -Depth 5
+            if ($update.state -eq "failed") {
+              # Expected once: before the first release that has a latest.json.
+              echo "::warning::The update check failed: $($update.message) ($($update.detail))"
+            }
             echo "Smoke test passed"
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
@@ -250,12 +294,22 @@ jobs:
           name: VeoClone-windows
           path: out
 
+      # latest.json is what VeoClone.exe reads to update itself
+      # (DESIGN.md 4.11): the build (from the folder's version.json) and the
+      # zip's size and SHA-256.
       - name: Zip the VeoClone folder
         working-directory: out
         run: |
           test -f VeoClone/VeoClone.exe
+          test -f VeoClone/version.json
           zip -q -r -9 ../VeoClone-windows.zip VeoClone
           ls -l ../VeoClone-windows.zip
+          jq -n --slurpfile v VeoClone/version.json \
+            --argjson size "$(stat -c %s ../VeoClone-windows.zip)" \
+            --arg hash "$(sha256sum ../VeoClone-windows.zip | cut -d ' ' -f 1)" \
+            '{sha: $v[0].sha, date: $v[0].date, zipSize: $size, zipSha256: $hash}' > ../latest.json
+          cat ../latest.json
+          test "$(jq -r .sha ../latest.json)" = "$GITHUB_SHA"
 
       - name: Update the "helper-latest" pre-release
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
@@ -279,10 +333,14 @@ jobs:
             new=$(asset_id VeoClone-windows-new.zip)
             if [ -n "$old" ]; then gh api --method DELETE "repos/$GH_REPO/releases/assets/$old"; fi
             gh api --method PATCH "repos/$GH_REPO/releases/assets/$new" -f name=VeoClone-windows.zip > /dev/null
+            # Only now: an installed VeoClone that reads the new latest.json
+            # finds the new zip. (One that read the old one just before gets
+            # a zip that does not match, refuses it and tries again later.)
+            gh release upload helper-latest latest.json --clobber
             gh release edit helper-latest --title "$title" --notes "$notes"
           else
             # First build: create the release (and its tag) with the zip.
-            gh release create helper-latest VeoClone-windows.zip --target "$GITHUB_SHA" --prerelease \
+            gh release create helper-latest VeoClone-windows.zip latest.json --target "$GITHUB_SHA" --prerelease \
               --title "$title" --notes "$notes"
           fi
 
@@ -296,8 +354,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/veoclone-v')
         run: |
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" VeoClone-windows.zip --clobber
+            gh release upload "$GITHUB_REF_NAME" VeoClone-windows.zip latest.json --clobber
           else
-            gh release create "$GITHUB_REF_NAME" VeoClone-windows.zip --verify-tag \
+            gh release create "$GITHUB_REF_NAME" VeoClone-windows.zip latest.json --verify-tag \
               --title "VeoClone ${GITHUB_REF_NAME#veoclone-}" --generate-notes
           fi

@@ -66,6 +66,8 @@ struct Running {
 struct State {
     queue: VecDeque<Job>,
     running: Option<Running>,
+    /// No new job starts (an update is being installed, DESIGN.md 4.11).
+    paused: bool,
 }
 
 pub struct Jobs {
@@ -94,6 +96,29 @@ impl Jobs {
 
     pub fn submit(&self, job: Job) {
         self.lock().queue.push_back(job);
+        self.wake.notify_all();
+    }
+
+    /// No job runs or waits.
+    pub fn idle(&self) -> bool {
+        let s = self.lock();
+        s.running.is_none() && s.queue.is_empty()
+    }
+
+    /// If no job runs or waits, stop new jobs from starting until
+    /// [`Jobs::resume`] (they still queue up) and return true.
+    pub fn pause_if_idle(&self) -> bool {
+        let mut s = self.lock();
+        let idle = s.running.is_none() && s.queue.is_empty();
+        if idle {
+            s.paused = true;
+        }
+        idle
+    }
+
+    /// Let queued jobs start again.
+    pub fn resume(&self) {
+        self.lock().paused = false;
         self.wake.notify_all();
     }
 
@@ -151,7 +176,9 @@ impl Jobs {
     fn next(&self) -> (Job, Arc<AtomicBool>) {
         let mut s = self.lock();
         loop {
-            if let Some(job) = s.queue.pop_front() {
+            if !s.paused
+                && let Some(job) = s.queue.pop_front()
+            {
                 let cancel = Arc::new(AtomicBool::new(false));
                 s.running = Some(Running {
                     job: job.clone(),
@@ -417,5 +444,47 @@ impl<'a> Progress<'a> {
                 ex.progress = overall;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_for(what: &str, f: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !f() {
+            assert!(
+                start.elapsed().as_secs() < 10,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// An update pauses the queue only when it is idle; a job submitted
+    /// meanwhile waits (and shows as not idle) until the queue resumes.
+    #[test]
+    fn pause_only_when_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jobs = Jobs::start(Context {
+            store: Arc::new(Store::open(tmp.path()).unwrap()),
+            tools: Tools::default(),
+            model: None,
+        });
+        assert!(jobs.idle());
+        assert!(jobs.pause_if_idle());
+        // A match that does not exist: the job ends at once when it runs.
+        jobs.submit(Job::Process {
+            project: "nothere".into(),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!jobs.idle());
+        assert!(jobs.busy("nothere") && !jobs.running("nothere"));
+        assert!(!jobs.pause_if_idle());
+        jobs.resume();
+        wait_for("the job to run", || jobs.idle());
+        assert!(jobs.pause_if_idle());
+        jobs.resume();
     }
 }

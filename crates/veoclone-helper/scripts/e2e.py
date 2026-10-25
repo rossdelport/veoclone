@@ -7,8 +7,10 @@ frame by frame), and exercises cancel, delete, restart recovery, re-runs
 that keep the earlier result, lens choices, swapping left and right, the
 single-instance check, CORS and the Host check. Then the same videos split
 into GoPro-style chapter files, sent as parts, against the one-file match
-frame for frame. Python 3 standard library only; needs ffmpeg and ffprobe
-on PATH.
+frame for frame, and the "Widest view" zoom limit (the AI pass, a quick
+re-run and the editor's final path). Python 3 standard library only; needs
+ffmpeg and ffprobe on PATH (and node with web/node_modules for the editor's
+final path check).
 
 Usage:
   e2e.py --helper target/release/veoclone-helper --left L.mp4 --right R.mp4 \
@@ -151,9 +153,10 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--web-dir")
-    ap.add_argument("--only", choices=["quickwins", "chapters"],
-                    help="run only these checks (quickwins: ball style, AI accuracy, pitch "
-                         "outline, fast re-runs; chapters: videos in several files)")
+    ap.add_argument("--only", choices=["main", "quickwins", "chapters", "natural"],
+                    help="run only these checks (main: processing, exports, recovery, lenses; "
+                         "quickwins: ball style, AI accuracy, pitch outline, fast re-runs; "
+                         "chapters: videos in several files; natural: the widest view)")
     args = ap.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.work)
@@ -162,12 +165,14 @@ def main():
     helper = Helper(args)
     helper.start()
     try:
-        if args.only is None:
+        if args.only in (None, "main"):
             run(args, helper)
         if args.only in (None, "quickwins"):
             quickwins(args)
         if args.only in (None, "chapters"):
             chapters(args)
+        if args.only in (None, "natural"):
+            natural_look(args)
     finally:
         helper.stop()
     log("ALL CHECKS PASSED")
@@ -468,10 +473,12 @@ def quickwins(args):
     log(f"ball style: yaw {min(yaws):.3f}..{max(yaws):.3f}, fov {sorted(fovs)[:5]}, "
         f"AI pass {secs:.0f} s")
     # The synthetic ball crosses the pitch and back; with no player cluster
-    # Reco's ball mode keeps its starting zoom (FieldPanner fov_default 40).
+    # Reco's ball mode keeps its starting zoom (FieldPanner fov_default: 40
+    # in the broadcast preset, 34 with the Natural widest view new matches
+    # have).
     check(max(yaws) - min(yaws) > 0.5, f"the camera follows the ball across the pitch "
           f"({max(yaws) - min(yaws):.2f} rad)")
-    check(fovs == {40.0}, "ball mode keeps a fixed zoom")
+    check(fovs == {34.0}, "ball mode keeps a fixed zoom (Natural: 34 deg)")
     request("PATCH", f"/api/projects/{pid}", {"style": "broadcast"})
     p, secs, _ = process(pid)
     broadcast = ai_path(pid, n)
@@ -716,6 +723,161 @@ def export_video(args, pid, body, name):
     out = os.path.join(args.work, f"export-{name}.mp4")
     open(out, "wb").write(video)
     return out
+
+
+WEB_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                       "..", "web"))
+
+# The editor's computeFinalPath (web/src/engine/path.ts) on a match's real
+# calibration and AI path: the widest frame for each widest view and zoom,
+# with a fix zoomed right out (80 deg) in the middle ("+fix") or without.
+FINAL_PATH_TS = """
+import { readFileSync } from "node:fs";
+import { computeFinalPath, normalizeEdits, straightenOfMatch, widestViewMaxFov } from "@ENGINE@";
+const [calibFile, aiFile] = process.argv.slice(2);
+const calib = JSON.parse(readFileSync(calibFile, "utf8"));
+const bytes = readFileSync(aiFile);
+const ai = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length));
+const n = calib.frameCount;
+const out: Record<string, unknown> = { coverageMaxFov: calib.coverage.maxFovDeg };
+for (const [zoom, fix] of [[0.5, true], [1, true], [2, true], [2, false]] as const) {
+  const raw = { zoom, keyframes: fix ? [{ frame: Math.floor(n / 2), yaw: 0, pitch: 0, fov: 80 }] : [] };
+  const edits = normalizeEdits(raw, n, straightenOfMatch(calib.match));
+  const free = computeFinalPath(ai, calib, edits);
+  for (const w of ["natural", "wide", "widest", null]) {
+    const path = computeFinalPath(ai, calib, edits, widestViewMaxFov(w as never));
+    let max = 0;
+    let same = true;
+    for (let i = 0; i < path.length; i++) {
+      if (i % 3 === 2) max = Math.max(max, path[i]);
+      if (!Object.is(path[i], free[i])) same = false;
+    }
+    out[`${w ?? "unset"}@${zoom}${fix ? "+fix" : ""}`] = { maxFov: max, sameAsNoLimit: same };
+  }
+}
+console.log(JSON.stringify(out));
+"""
+
+
+def editor_final_path(args, pid, n):
+    """Run the editor's own computeFinalPath on this match (bundled with
+    esbuild from web/node_modules). None when node or esbuild is missing."""
+    esbuild = os.path.join(WEB_DIR, "node_modules", ".bin", "esbuild")
+    if not shutil.which("node") or not os.path.exists(esbuild):
+        return None
+    folder = os.path.join(args.work, "final-path")
+    os.makedirs(folder, exist_ok=True)
+    _, cal = request("GET", f"/api/projects/{pid}/calibration")
+    _, _, ai = request("GET", f"/api/projects/{pid}/ai-path.bin", raw=True)
+    check(len(ai) == n * 12, "AI path for the editor check")
+    calib_file, ai_file = os.path.join(folder, "calib.json"), os.path.join(folder, "ai.bin")
+    with open(calib_file, "w") as f:
+        json.dump(cal, f)
+    with open(ai_file, "wb") as f:
+        f.write(ai)
+    entry, bundle = os.path.join(folder, "final.ts"), os.path.join(folder, "final.mjs")
+    with open(entry, "w") as f:
+        engine = os.path.join(WEB_DIR, "src", "engine", "path.ts").replace("\\", "/")
+        f.write(FINAL_PATH_TS.replace("@ENGINE@", engine))
+    subprocess.run([esbuild, entry, "--bundle", "--platform=node", "--format=esm",
+                    f"--outfile={bundle}", "--log-level=warning"], check=True)
+    out = subprocess.run(["node", bundle, calib_file, ai_file], capture_output=True, text=True,
+                         check=True).stdout
+    return json.loads(out)
+
+
+def natural_look(args):
+    """The "Widest view" (DESIGN.md 4.12): new matches are Natural (like Veo);
+    the AI pass keeps to the limit; changing it re-runs in seconds from what
+    the AI saw, exactly like a full AI pass; the editor's final path keeps to
+    it whatever the zoom and the fixes."""
+    import re
+    cap = {"natural": 34.0, "wide": 44.0}
+    status, p = request("POST", "/api/projects", {"name": "Natural look", "style": "broadcast"})
+    check(status == 201 and p["widestView"] == "natural", "a new match is Natural (like Veo)")
+    pid = p["id"]
+    for side, path in (("left", args.left), ("right", args.right)):
+        status, p = upload(pid, side, path)
+        check(status == 200, f"{side} uploaded")
+    status, p = request("PATCH", f"/api/projects/{pid}", {"widestView": "fisheye"})
+    check(status == 400 and p["error"] == "Unknown widest view.", "an unknown widest view is refused")
+
+    # 1. Widest (Reco's preset, as before the setting): a full AI pass.
+    status, p = request("PATCH", f"/api/projects/{pid}", {"widestView": "widest"})
+    check(status == 200 and p["widestView"] == "widest", "Widest chosen")
+    p, widest_secs, text = run_timed(args, pid, quick=False)
+    n = p["frameCount"]
+    widest = ai_path(pid, n)
+    check("Widest view: Widest" in text and "AI camera zoom: 22 to 58 deg tall, starting at 40" in text,
+          "the AI pass used Reco's broadcast preset as it is")
+    check(p["aiRun"]["widestView"] == "widest", "aiRun says Widest")
+    max_widest = max(f for _, _, f in widest)
+    log(f"Widest: fov {min(f for _, _, f in widest):.1f}..{max_widest:.1f} deg")
+    check(max_widest > cap["natural"] + 0.5, f"Widest zooms out past 34 deg ({max_widest:.1f})")
+
+    # 2. Natural from the Widest run's recording: seconds, and never wider than 34 deg.
+    request("PATCH", f"/api/projects/{pid}", {"widestView": "natural"})
+    p, natural_quick_secs, text = run_timed(args, pid, quick=True)
+    check("Widest view: Natural: the AI camera zooms out to at most 34 deg tall (57 deg across)"
+          in text, "the job log names the widest view")
+    natural_quick = ai_path(pid, n)
+    max_natural = max(f for _, _, f in natural_quick)
+    log(f"Natural (quick re-run, {natural_quick_secs:.1f} s): fov "
+        f"{min(f for _, _, f in natural_quick):.1f}..{max_natural:.4f} deg")
+    check(max_natural <= cap["natural"] + 1e-3, f"Natural never wider than 34 deg ({max_natural:.4f})")
+    check(p["aiRun"]["widestView"] == "natural", "aiRun says Natural")
+    d = max_diff(natural_quick, widest)
+    log(f"Natural vs Widest: yaw {d[0]}, pitch {d[1]}, fov {d[2]:.2f}")
+    check(d[0] == 0.0 and d[1] == 0.0 and d[2] > 1.0, "only the zoom changed, not where it looks")
+
+    # 3. A full AI pass with Natural: its own recording replays to it, and it
+    # is the quick re-run's path (parity).
+    forget_seen(args, pid)
+    p, natural_full_secs, text = run_timed(args, pid, quick=False)
+    check("AI camera zoom: 22 to 34 deg tall, starting at 34" in text,
+          "the AI pass gave Reco the Natural zoom range")
+    m = re.search(r"largest difference: yaw ([\d.e+-]+) rad, pitch ([\d.e+-]+) rad, zoom "
+                  r"([\d.e+-]+) deg", text)
+    check(m is not None and float(m[1]) == float(m[2]) == float(m[3]) == 0.0,
+          "the Natural AI pass replays its own recording exactly")
+    log(f"PARITY live Natural AI pass vs replay of its recording: yaw {m[1]}, pitch {m[2]}, fov {m[3]}")
+    natural_full = ai_path(pid, n)
+    d = max_diff(natural_quick, natural_full)
+    log(f"PARITY quick Natural (from the Widest run's recording) vs full Natural AI pass: {d}")
+    check(max(d) == 0.0, "quick Natural = full Natural AI pass, bit for bit")
+
+    # 4. Wide, and Follow the ball (its fixed zoom), from the recording.
+    request("PATCH", f"/api/projects/{pid}", {"widestView": "wide"})
+    p, wide_secs, _ = run_timed(args, pid, quick=True)
+    wide = ai_path(pid, n)
+    max_wide = max(f for _, _, f in wide)
+    check(max_natural <= max_wide <= cap["wide"] + 1e-3, f"Wide: at most 44 deg ({max_wide:.2f})")
+    request("PATCH", f"/api/projects/{pid}", {"widestView": "natural", "style": "ball"})
+    p, _, _ = run_timed(args, pid, quick=True)
+    check({round(f, 3) for _, _, f in ai_path(pid, n)} == {34.0}, "Follow the ball: fixed at 34 deg")
+    request("PATCH", f"/api/projects/{pid}", {"style": "broadcast"})
+    p, _, _ = run_timed(args, pid, quick=True)
+    check(max(max_diff(ai_path(pid, n), natural_full)) == 0.0, "back to broadcast: the same path")
+
+    # 5. The editor's final path: the Zoom slider and a fix can't go wider.
+    res = editor_final_path(args, pid, n)
+    if res is None:
+        log("SKIPPED the editor's final path check: needs node and web/node_modules (npm ci)")
+    else:
+        log(f"editor final path, widest frame (deg): " + ", ".join(
+            f"{k} {v['maxFov']:.2f}" for k, v in res.items() if isinstance(v, dict)))
+        for case in ("0.5+fix", "1+fix", "2+fix", "2"):
+            for w, limit in (("natural", 34.0), ("wide", 44.0)):
+                got = res[f"{w}@{case}"]["maxFov"]
+                check(got <= limit, f"editor, {w}, zoom {case}: at most {limit:.0f} deg ({got:.2f})")
+            check(res[f"widest@{case}"]["sameAsNoLimit"] and res[f"unset@{case}"]["sameAsNoLimit"],
+                  f"editor, widest / not set, zoom {case}: exactly the path without a limit")
+        check(res["natural@0.5+fix"]["maxFov"] == 34.0 and res["widest@0.5+fix"]["maxFov"] > 34.5,
+              "zoomed out: Natural stops at 34 deg, Widest goes wider")
+        check(res["natural@2"]["sameAsNoLimit"], "zooming in is not limited")
+    log(f"TIMINGS widest view: full AI pass {widest_secs:.1f} s / {natural_full_secs:.1f} s, "
+        f"quick re-runs {natural_quick_secs:.1f} s (Natural), {wide_secs:.1f} s (Wide)")
+    request("DELETE", f"/api/projects/{pid}")
 
 
 def chapters(args):

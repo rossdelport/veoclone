@@ -1,5 +1,5 @@
 // New match: name, iPhone model, camera style, the two videos, filming tips.
-import { api, ApiError, uploadFile, type AiAccuracy, type FileInfo, type ProjectMeta, type Side, type Style, type Upload } from "../api";
+import { api, ApiError, uploadFile, type AiAccuracy, type FileInfo, type ProjectMeta, type Side, type Style, type Upload, type WidestView } from "../api";
 import { button, describeError, errorBox, notice, toast } from "./common";
 import { formatBytes, h, icon, setChildren } from "./dom";
 import { assignFiles, dropZone, type DropZone } from "./dropzone";
@@ -56,6 +56,32 @@ export function accuracyPicker(value: AiAccuracy | undefined, onChange: (a: AiAc
         { class: "choice" },
         h("input", { type: "radio", name, value: a.id, checked: a.id === current, onChange: () => onChange(a.id) }),
         h("span", { class: "choice-body" }, h("strong", null, a.name), h("span", { class: "muted small" }, a.text)),
+      ),
+    ),
+  );
+}
+
+/** "Widest view" (DESIGN.md 4.12): how far the camera may zoom out. */
+export const WIDEST: { id: WidestView; name: string; text: string }[] = [
+  { id: "natural", name: "Natural (like Veo)", text: "Stays close to the play, so the sides of the picture never look stretched." },
+  { id: "wide", name: "Wide", text: "Zooms out a bit more when the play spreads out. The sides stretch a little." },
+  { id: "widest", name: "Widest", text: "Zooms out as far as it needs to. The sides can look stretched, like a fisheye." },
+];
+
+/** What "Widest view" means, in one line. */
+export const WIDEST_HELP = "How far the camera may zoom out, for example when the play goes to the far corner.";
+
+/** "Widest view": Natural (default), Wide or Widest. `compact`: one per row, for the editor's side panel. */
+export function widestPicker(value: WidestView, onChange: (w: WidestView) => void, name = "widest", compact = false): HTMLElement {
+  return h(
+    "div",
+    { class: `choice-grid${compact ? " choice-grid-compact choice-grid-tight" : ""}`, role: "radiogroup", "aria-label": "Widest view" },
+    WIDEST.map((w) =>
+      h(
+        "label",
+        { class: "choice" },
+        h("input", { type: "radio", name, value: w.id, checked: w.id === value, onChange: () => onChange(w.id) }),
+        h("span", { class: "choice-body" }, h("strong", null, w.name), h("span", { class: "muted small" }, w.text)),
       ),
     ),
   );
@@ -150,6 +176,7 @@ export function newMatchPage(ctx: PageContext): Page {
   ctx.setTitle("New match");
   let style: Style = "broadcast";
   let aiAccuracy: AiAccuracy = "best";
+  let widestView: WidestView = "natural";
   let lensId: string | null = DEFAULT_LENS;
   let rightLensId: string | null = null; // the right phone is another model
   let lensesLoaded = false;
@@ -218,6 +245,9 @@ export function newMatchPage(ctx: PageContext): Page {
             h("h2", null, "Camera style"),
             h("p", { class: "muted small" }, "How the AI camera should move. You can fine-tune everything in the editor afterwards."),
             stylePicker(style, (s) => (style = s)),
+            h("h3", { class: "rerun-head" }, "Widest view"),
+            h("p", { class: "muted small" }, WIDEST_HELP),
+            widestPicker(widestView, (w) => (widestView = w)),
           ),
           h(
             "section",
@@ -301,8 +331,8 @@ export function newMatchPage(ctx: PageContext): Page {
     setChildren(status, h("p", { class: "small" }, "Sending your videos to VeoClone. Keep this page open."));
     try {
       await stopping; // a Stop that is still tidying up
-      if (projectId) await api.updateProject(projectId, { name, lensId, rightLensId, style, aiAccuracy });
-      else projectId = (await api.createProject({ name, lensId, rightLensId, style, aiAccuracy })).id;
+      if (projectId) await api.updateProject(projectId, { name, lensId, rightLensId, style, aiAccuracy, widestView });
+      else projectId = (await api.createProject({ name, lensId, rightLensId, style, aiAccuracy, widestView })).id;
       await sendVideos(projectId, zones, (u) => (upload = u));
       await api.process(projectId);
       busy = false;

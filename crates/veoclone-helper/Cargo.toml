@@ -43,6 +43,12 @@ fs4 = "0.13"
 log = "0.4"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Self-update (DESIGN.md 4.11): HTTPS client and SHA-256. All already in
+# Cargo.lock (reco-gui uses ureq; ring is rustls' crypto), so nothing new is
+# downloaded or built.
+ureq = "3"
+ring = "0.17"
+http-body = "1"
 
 # DirectML for AI tracking on Windows (any DX12 GPU, incl. AMD). Copied
 # from reco-gui: without the `directml` feature on ort the provider
@@ -54,9 +60,18 @@ reco-autocam = { path = "../reco-autocam", default-features = false, features = 
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Power",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Start menu and "Start with Windows" shortcuts (.lnk via the shell's
+# IShellLinkW). The same version wgpu already uses.
+windows = { version = "0.62", features = [
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Stop ffmpeg when VeoClone stops (parent-death signal).

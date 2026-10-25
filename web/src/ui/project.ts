@@ -1,13 +1,13 @@
 // Processing view (#/project/:id): steps with progress, warnings, errors,
 // cancel / try again, and adding missing videos.
-import { api, hasVideo, rerunTime, watchProject, type AiAccuracy, type ApiError, type JobInfo, type JobStep, type ProjectMeta, type Side, type Style, type Upload } from "../api";
+import { api, hasVideo, rerunTime, watchProject, widestViewOf, type AiAccuracy, type ApiError, type JobInfo, type JobStep, type ProjectMeta, type Side, type Style, type Upload, type WidestView } from "../api";
 import { button, confirmDialog, describeError, errorBox, notice, progressBar, setProgress, toast } from "./common";
 import { formatBytes, formatTimeLeft, h, icon, setChildren } from "./dom";
 import { dropZone, assignFiles, type DropZone } from "./dropzone";
 import { currentHealth } from "./health";
 import { I } from "./icons";
 import { changeLens, lensOptions, lensUnavailable, phonesPicker } from "./lens";
-import { ACCURACY, accuracyPicker, sendVideos, slowAiNotice, stylePicker, STYLES } from "./newMatch";
+import { ACCURACY, accuracyPicker, sendVideos, slowAiNotice, stylePicker, STYLES, WIDEST, WIDEST_HELP, widestPicker } from "./newMatch";
 import type { Page, PageContext } from "./page";
 
 const STEPS: { step: JobStep; name: string; text: string }[] = [
@@ -106,6 +106,7 @@ export function projectPage(ctx: PageContext, id: string): Page {
   let restyleOpen = false;
   let newStyle: Style | null = null;
   let newAccuracy: AiAccuracy | null = null;
+  let newWidest: WidestView | null = null;
   const stepClock = { key: "", start: 0 };
 
   // Re-built only when the kind of view changes, so inputs keep their state.
@@ -144,11 +145,12 @@ export function projectPage(ctx: PageContext, id: string): Page {
       restyleOpen = false;
       newStyle = null;
       newAccuracy = null;
+      newWidest = null;
     }
     if (uploading) return;
     // Rebuild only when something on the page changes, so open boxes, choices
     // and the button under the mouse survive the polls; progress moves in place.
-    const key = JSON.stringify([mode, p.status, p.job?.kind, p.job?.step, p.job?.startedAt, p.error, p.warnings, p.calibration, p.style, p.aiAccuracy, p.aiSeen, p.lensId, p.rightLensId, p.files, p.exports.map((e) => e.status), currentHealth()?.ai.provider]);
+    const key = JSON.stringify([mode, p.status, p.job?.kind, p.job?.step, p.job?.startedAt, p.error, p.warnings, p.calibration, p.style, p.aiAccuracy, p.widestView, p.aiSeen, p.lensId, p.rightLensId, p.files, p.exports.map((e) => e.status), currentHealth()?.ai.provider]);
     if (key === shown && !force) return live?.(p);
     shown = key;
     live = null;
@@ -257,9 +259,12 @@ export function projectPage(ctx: PageContext, id: string): Page {
     const rerun = h(
       "details",
       { class: "card rerun", open: restyleOpen, onToggle: () => (restyleOpen = rerun.open) },
-      h("summary", null, h("strong", null, "Change the camera style or AI accuracy"), h("span", { class: "muted small" }, " – runs the AI again")),
+      h("summary", null, h("strong", null, "Change the camera style, widest view or AI accuracy"), h("span", { class: "muted small" }, " – runs the AI again")),
       h("p", { class: "muted small" }, "Your trims and camera fixes are kept. ", rerunNote),
       stylePicker(newStyle ?? p.style, (s) => (newStyle = s), "restyle"),
+      h("h3", { class: "rerun-head" }, "Widest view"),
+      h("p", { class: "muted small" }, WIDEST_HELP),
+      widestPicker(newWidest ?? widestViewOf(p), (w) => (newWidest = w), "rewidest"),
       h("h3", { class: "rerun-head" }, "AI accuracy"),
       accuracyPicker(newAccuracy ?? p.aiAccuracy, (a) => {
         newAccuracy = a;
@@ -268,7 +273,7 @@ export function projectPage(ctx: PageContext, id: string): Page {
       h(
         "div",
         { class: "row" },
-        button("Run the AI again", () => void restyle(newStyle ?? p.style, newAccuracy ?? p.aiAccuracy ?? "best"), { variant: "secondary", icon: I.refresh }),
+        button("Run the AI again", () => void restyle(newStyle ?? p.style, newAccuracy ?? p.aiAccuracy ?? "best", newWidest ?? widestViewOf(p)), { variant: "secondary", icon: I.refresh }),
       ),
     );
     setChildren(
@@ -285,6 +290,8 @@ export function projectPage(ctx: PageContext, id: string): Page {
           c ? [h("dt", null, "Lining up"), h("dd", null, syncText), h("dt", null, "Join quality"), h("dd", null, quality), h("dt", null, "Lens"), h("dd", null, c.lens)] : null,
           h("dt", null, "Camera style"),
           h("dd", null, STYLES.find((s) => s.id === p.style)?.name ?? p.style),
+          h("dt", null, "Widest view"),
+          h("dd", null, WIDEST.find((w) => w.id === widestViewOf(p))?.name ?? widestViewOf(p)),
           h("dt", null, "AI accuracy"),
           h("dd", null, ACCURACY.find((a) => a.id === (p.aiAccuracy ?? "best"))?.name ?? p.aiAccuracy),
           h("dt", null, "Space used"),
@@ -367,7 +374,15 @@ export function projectPage(ctx: PageContext, id: string): Page {
         h("div", { class: "zones-foot" }, both ? button("Swap left and right", () => void swapSides(false), { variant: "ghost", class: "btn-small swap" }) : null),
       ),
       h("section", { class: "card form-section" }, h("h2", null, "Which camera and lens filmed this?"), lensHost),
-      h("section", { class: "card form-section" }, h("h2", null, "Camera style"), stylePicker(p.style, (style) => void api.updateProject(id, { style }).catch((e) => toast(describeError(e).message, "error")))),
+      h(
+        "section",
+        { class: "card form-section" },
+        h("h2", null, "Camera style"),
+        stylePicker(p.style, (style) => void api.updateProject(id, { style }).catch((e) => toast(describeError(e).message, "error"))),
+        h("h3", { class: "rerun-head" }, "Widest view"),
+        h("p", { class: "muted small" }, WIDEST_HELP),
+        widestPicker(widestViewOf(p), (widestView) => void api.updateProject(id, { widestView }).catch((e) => toast(describeError(e).message, "error")), "setup-widest"),
+      ),
       h(
         "section",
         { class: "card form-section" },
@@ -420,9 +435,13 @@ export function projectPage(ctx: PageContext, id: string): Page {
     }
   }
 
-  async function restyle(style: Style, aiAccuracy: AiAccuracy) {
+  async function restyle(style: Style, aiAccuracy: AiAccuracy, widestView: WidestView) {
     try {
-      if (style !== project?.style || aiAccuracy !== (project?.aiAccuracy ?? "best")) await api.updateProject(id, { style, aiAccuracy });
+      const p = project;
+      if (!p || style !== p.style || aiAccuracy !== (p.aiAccuracy ?? "best") || widestView !== widestViewOf(p)) {
+        // Sent only when changed: a match from before the setting keeps "not set".
+        await api.updateProject(id, { style, aiAccuracy, ...(p && widestView === widestViewOf(p) ? {} : { widestView }) });
+      }
       await start();
     } catch (e) {
       toast(describeError(e).message, "error", 6000);

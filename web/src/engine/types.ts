@@ -86,6 +86,14 @@ export interface Segment {
 
 export type ExportQuality = "fast" | "balanced" | "high";
 
+/**
+ * "Widest view" (DESIGN.md 4.12): how far the camera may zoom out. A match
+ * setting kept by the helper (ProjectMeta.widestView), not an edit: the AI
+ * pass uses it too. natural = like Veo, at most 34° tall (about 57° across);
+ * wide = at most 44° (about 71°); widest = no extra limit.
+ */
+export type WidestView = "natural" | "wide" | "widest";
+
 export type OverlayKind = "title" | "player" | "text";
 export type OverlayPosition =
   | "top-left"

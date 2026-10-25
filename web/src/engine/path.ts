@@ -3,7 +3,7 @@ import { clampInto, maxFovOf } from "./clamp";
 import { MAX_OVERLAY_TEXT, MAX_OVERLAYS, OVERLAY_KINDS, OVERLAY_POSITIONS, OVERLAY_SIZES } from "./overlay";
 import { buildRig, type Rig } from "./projection";
 import { aimOfWorld, aimsToRenderPoses, renderOfAim, renderPosesToWorld, tiltFrame, worldPosesToRender } from "./rigtilt";
-import type { CalibInfo, Edits, ExportQuality, Keyframe, MatchCalibration, Overlay, Pose, Segment, Straighten } from "./types";
+import type { CalibInfo, Edits, ExportQuality, Keyframe, MatchCalibration, Overlay, Pose, Segment, Straighten, WidestView } from "./types";
 
 const EXPORT_SIZES: [number, number][] = [
   [1920, 1080],
@@ -11,6 +11,21 @@ const EXPORT_SIZES: [number, number][] = [
   [3840, 2160],
 ];
 const QUALITIES: ExportQuality[] = ["fast", "balanced", "high"];
+
+/**
+ * "Widest view": the widest vertical fov (degrees) the camera may show,
+ * Infinity for no limit. The same numbers as the helper's AI pass
+ * (crates/veoclone-helper/src/seen.rs `WidestView::max_fov_deg`).
+ */
+export const WIDEST_VIEW_MAX_FOV: Readonly<Record<WidestView, number>> = { natural: 34, wide: 44, widest: Infinity };
+
+/**
+ * The fov limit of a match's widest view. Not set (a match from before the
+ * setting existed) behaves as "widest": no limit, the camera as before.
+ */
+export function widestViewMaxFov(w: WidestView | null | undefined): number {
+  return w === "natural" || w === "wide" ? WIDEST_VIEW_MAX_FOV[w] : Infinity;
+}
 
 /** Slider ranges of "Straighten picture" (degrees). */
 export const STRAIGHTEN_LIMITS = { tiltDeg: [-35, 35], rollDeg: [-25, 25] } as const;
@@ -228,11 +243,14 @@ function chainKeyframes(keyframes: Keyframe[], join: number): Keyframe[][] {
 
 /**
  * The final camera path (DESIGN.md section 5.3): AI path + smoothing +
- * keyframe fixes + zoom + clamp, straightened with `edits.straighten`.
+ * keyframe fixes + zoom + widest-view limit + clamp, straightened with
+ * `edits.straighten`. `maxFovDeg` is the match's widest view
+ * (widestViewMaxFov): after the zoom no frame is wider than it, so neither
+ * the Zoom slider nor a fix can zoom out past it (zooming in is not limited).
  * Returns frameCount*3 floats [yaw,pitch,fov] of world poses: what a Reco
  * Panner returns for an export with that rig tilt/roll.
  */
-export function computeFinalPath(ai: Float32Array, calib: CalibInfo, edits: Edits): Float32Array {
+export function computeFinalPath(ai: Float32Array, calib: CalibInfo, edits: Edits, maxFovDeg = Infinity): Float32Array {
   const n = wholeFrames(calib.frameCount);
   const fpsValue = calib.fps.num / calib.fps.den;
   const fps = Number.isFinite(fpsValue) && fpsValue > 0 ? fpsValue : 30;
@@ -322,11 +340,14 @@ export function computeFinalPath(ai: Float32Array, calib: CalibInfo, edits: Edit
     fov[f] += (mf - fov[f]) * w;
   }
 
-  // 4-5. Back to world poses, zoom, then the export's FOV cap and coverage clamp.
+  // 4-5. Back to world poses, zoom, the widest view, then the export's FOV cap
+  // and coverage clamp.
   renderPosesToWorld(yaw, pitch, basis, view);
+  const limit = maxFovDeg > 0 ? maxFovDeg : Infinity; // NaN, 0 or less: no limit
   const out = new Float32Array(n * 3);
   for (let f = 0; f < n; f++) {
-    clampInto(yaw[f], pitch[f], fov[f] / zoom, cov, aspect, out, f * 3);
+    const v = fov[f] / zoom;
+    clampInto(yaw[f], pitch[f], v <= limit ? v : limit, cov, aspect, out, f * 3);
   }
   return out;
 }

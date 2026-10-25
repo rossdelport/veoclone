@@ -72,8 +72,32 @@ internet, not even when you use the online editor.
    your network or this computer**, click **Allow**. VeoClone only talks to
    your own PC.
 
-Tip: to start VeoClone more easily next time, right-click VeoClone.exe,
-choose **Show more options › Send to › Desktop (create shortcut)**.
+Next time, start VeoClone from the **Start menu** (VeoClone adds itself
+there the first time it runs), or double-click VeoClone.exe again. You can
+also have it start by itself: see [Updates and starting with Windows](#updates-and-starting-with-windows).
+
+## Updates and starting with Windows
+
+**VeoClone updates itself.** You only download the zip once. When a new
+version comes out, VeoClone downloads it in the background, checks it, and
+installs it when it is not busy: never while it processes a match, makes a
+video or receives a video. It then restarts by itself in a few seconds, in
+the same black window; the editor in your browser waits and carries on.
+Your matches are not touched.
+
+- The home page of the editor has a **VeoClone on this PC** box at the
+  bottom. It says "VeoClone is up to date", or "Update ready — it installs
+  when nothing is processing" with an **Install now** button, or explains
+  in plain words what went wrong (VeoClone then keeps the version you have
+  and tries again later).
+- Don't want automatic updates? Untick **Update VeoClone automatically**
+  there. **Check for updates** then updates it when you choose.
+- **Start VeoClone when Windows starts**: tick it in the same box. VeoClone
+  then starts by itself in a minimised window when you sign in to Windows,
+  without opening the browser, so it is always ready (and keeps itself up
+  to date). Untick it to stop that.
+- Keep the VeoClone folder somewhere you can change files, such as
+  Documents (not Program Files), so VeoClone can update itself there.
 
 ## How to film
 
@@ -189,6 +213,11 @@ rename them: VeoClone reads the order from the names.
    players in the picture) or **Follow the ball** (keeps the ball itself in
    the middle at a fixed zoom; try it when the camera keeps drifting back to
    the middle of the pitch or to people next to it). You can change it later.
+   **Widest view**: how far the camera may zoom out, for example when the
+   play goes to the far corner. **Natural (like Veo)** (the default) stays
+   close to the play, so the sides of the picture never look stretched;
+   **Wide** zooms out a bit more; **Widest** zooms out as far as it needs to,
+   and then players at the sides can look stretched, like a fisheye.
    **AI accuracy**: **Best** (the AI looks at every frame; recommended) or
    **Faster** (every 3rd frame: the AI step takes about a third of the time,
    but the camera reacts a little later).
@@ -224,6 +253,13 @@ rename them: VeoClone reads the order from the names.
   removes a part, for example half-time.
 - **Zoom** makes the whole video wider or closer. **Smoothness** calms down
   quick camera moves.
+- **Widest view** (under **Camera**): **Natural (like Veo)**, **Wide** or
+  **Widest**. Neither the Zoom slider nor a fix zooms out further than it
+  allows (zooming in is not limited). Changing it shows at once and runs the
+  AI camera again, usually in a few seconds (VeoClone asks first when it
+  would take longer); your trims, fixes and text are kept.
+  Matches made with an older VeoClone keep the widest camera they had until
+  you pick one; a tip at the top right offers **Natural**.
 - A **Good to know** box at the top right lists anything VeoClone noticed
   while processing. Click **×** to hide it.
 - Picture **leans more and more when the camera turns** left or right (the
@@ -243,10 +279,10 @@ rename them: VeoClone reads the order from the names.
   click **Run the AI again**: the AI camera then ignores everyone outside the
   pitch (substitutes, parents, a game on the next pitch). This takes a few
   seconds, because VeoClone reuses what the AI saw the first time.
-- To try another **camera style** or **AI accuracy**, open the match page
-  (Change, under **Camera**) and click **Run the AI again**. This also takes
-  only a few seconds, except when switching from **Faster** to **Best** (the
-  AI then has to look at every frame of the video again).
+- To try another **camera style**, **widest view** or **AI accuracy**, open
+  the match page (Change, under **Camera**) and click **Run the AI again**.
+  This also takes only a few seconds, except when switching from **Faster**
+  to **Best** (the AI then has to look at every frame of the video again).
 - Picture bent, or the two halves don't join? Click **Change phone or lens**
   (under **Camera** on the right). See
   [If something goes wrong](#if-something-goes-wrong).
@@ -376,6 +412,15 @@ rename them: VeoClone reads the order from the names.
   know**). Set it to **Off** before the next match (Settings › Camera ›
   Record Video).
 
+**The picture looks like a fisheye: players at the sides look stretched when play goes to the far side**
+- The camera zoomed out a long way. A flat picture that wide stretches
+  whatever is at its sides (at the widest, a player at the edge can look
+  about twice as wide as in the middle). Set **Widest view** to **Natural
+  (like Veo)** under **Camera** in the editor: the camera then stays at most
+  about 57° wide, like Veo's, and it takes a few seconds.
+- If the camera then misses play at the far side, try **Wide**, or add a
+  fix there (drag the picture).
+
 **The camera keeps going back to the middle (the halfway line), or to people next to the pitch**
 - **Mark the pitch** in the editor and run the AI again, so people outside
   the pitch don't pull the camera away.
@@ -408,6 +453,19 @@ rename them: VeoClone reads the order from the names.
   open the match and press **Try again**.
 - If the match was ready before (for example you were changing the camera
   style), VeoClone keeps the earlier result, so you can go on editing.
+
+**"VeoClone couldn't update itself"** (on the home page, in the **VeoClone
+on this PC** box)
+- Nothing is broken: VeoClone keeps the version you have and tries again
+  later. **Try again** checks at once.
+- "Is this PC connected to the internet?": updates need the internet once
+  in a while; everything else works without it.
+- "VeoClone can't update itself because some of its files are missing from
+  its folder": VeoClone.exe was moved out of its folder. Download VeoClone
+  again (your matches are kept).
+- If the update keeps failing, download VeoClone again and unzip it over
+  your old VeoClone folder (your matches are kept: they are in a different
+  folder).
 
 **Still stuck?** The black VeoClone window shows what it is doing, and each
 match folder (see [Where your files are kept](#where-your-files-are-kept))
@@ -454,26 +512,32 @@ npm run mock   # a pretend helper for editor work (see web/dev/README.md)
 The AI models come from Reco's
 [v0.5.2 release](https://github.com/reco-project/video-stitcher/releases/tag/v0.5.2).
 Helper options: `--port`, `--data-dir`, `--web-dir`, `--model`,
-`--allow-origin`, `--no-open`, `--version`.
+`--allow-origin`, `--no-open`, `--minimized`, `--version`.
+Builds made by CI carry their commit and date (`VEOCLONE_BUILD_SHA`,
+`VEOCLONE_BUILD_DATE`) and update themselves from the `helper-latest`
+release's `latest.json`; local builds are development builds and never do
+(design: [DESIGN.md 4.11](docs/veoclone/DESIGN.md#411-veoclone-updates-itself)).
 
 **Tests:**
 
 ```bash
 cargo test -p veoclone-helper
 cargo test -p veoclone-helper -- --ignored export_frame_alignment   # needs ffmpeg and a GPU (llvmpipe works)
+python3 crates/veoclone-helper/scripts/update_e2e.py   # self-update: two builds, a pretend release, a real restart (Linux)
 cd web && npm run typecheck && npm test && npm run test:ui
 ```
 
 **CI, downloads and hosting** (details in
 [docs/veoclone/hosting.md](docs/veoclone/hosting.md)):
 
-- `veoclone-ci.yml`: editor typecheck, tests and build; helper fmt, clippy
-  and tests (every push and pull request).
+- `veoclone-ci.yml`: editor typecheck, tests and build; helper fmt, clippy,
+  tests and the self-update test (every push and pull request).
 - `veoclone-windows.yml`: builds the Windows folder (VeoClone.exe, FFmpeg,
   ONNX Runtime + DirectML, models, editor) and smoke-tests it. Pushes to the
   repository's default branch (whatever it is called; today
   `claude/happy-einstein-iqtkqs`) update the `helper-latest` pre-release in
-  place; a `veoclone-v*` tag makes a normal release.
+  place (the zip, then `latest.json`, which installed copies read to update
+  themselves); a `veoclone-v*` tag makes a normal release.
 - `veoclone-pages.yml`: publishes the editor to GitHub Pages on pushes to
   the default branch. One-time click first: Settings › Pages › Source:
   **GitHub Actions**.

@@ -239,32 +239,38 @@ rename them: VeoClone reads the order from the names.
 **In the editor:**
 
 - The big picture is the **camera view**: what your video will look like.
-- On the right, the **Whole pitch** picture shows the whole pitch (on a small
-  screen it is below the timeline). The blue box shows where the camera is pointing.
-  Click or drag in it to point the camera somewhere else.
+  Below it are the play buttons and the **timeline**.
+- The tools are on the left: **Camera**, **Fixes**, **Straighten**, **Pitch**,
+  **Text**, **Trim** and **Tips**. Click one and its settings show next to it.
+  The first time you open a match, **Tips** shows what is worth doing first.
+- The small **Whole pitch** map in the corner of the picture shows the whole
+  pitch. The green box shows where the camera is pointing. Click or drag in
+  it to point the camera somewhere else. Make it bigger, or put it away, with
+  the buttons on the map.
 - You can also drag inside the camera view to move the camera, and scroll
   the mouse wheel there to zoom in or out at that moment.
 - Each time you move the camera, VeoClone adds a **fix**: the camera keeps your
   view around that moment, then eases back to the AI. **How long a fix lasts**
-  sets how long it stays.
-- The **timeline** shows the whole match. Click the fix markers to jump to
-  them; press **Delete** to remove the selected fix.
-- **Set start here** and **Set end here** trim the video. **Cut out a section**
-  removes a part, for example half-time.
-- **Zoom** makes the whole video wider or closer. **Smoothness** calms down
-  quick camera moves.
+  (under **Fixes**) sets how long it stays.
+- The **timeline** shows the whole match in three rows: **Video** (the parts
+  you keep; cut parts are striped), **Fixes** and **Text**. Click a fix marker
+  to jump to it; press **Delete** to remove the selected fix.
+- Under **Trim**, **Set start here** and **Set end here** trim the video.
+  **Cut out a section** removes a part, for example half-time.
+- **Zoom** (under **Camera**) makes the whole video wider or closer.
+  **Smoothness** calms down quick camera moves.
 - **Widest view** (under **Camera**): **Natural (like Veo)**, **Wide** or
   **Widest**. Neither the Zoom slider nor a fix zooms out further than it
   allows (zooming in is not limited). Changing it shows at once and runs the
   AI camera again, usually in a few seconds (VeoClone asks first when it
   would take longer); your trims, fixes and text are kept.
   Matches made with an older VeoClone keep the widest camera they had until
-  you pick one; a tip at the top right offers **Natural**.
-- A **Good to know** box at the top right lists anything VeoClone noticed
+  you pick one; a tip under **Tips** offers **Natural**.
+- A **Good to know** box under **Tips** lists anything VeoClone noticed
   while processing. Click **×** to hide it.
 - Picture **leans more and more when the camera turns** left or right (the
-  phones pointed down), or the far side slopes? Use **Straighten picture** on
-  the right: click **Look left**, **Look centre** and **Look right** to point
+  phones pointed down), or the far side slopes? Use **Straighten** on the
+  left: click **Look left**, **Look centre** and **Look right** to point
   the preview across the pitch (this is not saved as a fix), then move
   **Tilt** (how much the phones pointed down) and **Level** (lean left or
   right) until the far side of the pitch looks level everywhere and goal
@@ -272,7 +278,7 @@ rename them: VeoClone reads the order from the names.
   the sliders. Your fixes keep looking at the same place, and the export uses
   the same setting. GoPro footage usually needs nothing: the camera measures
   its own level and VeoClone starts from that (**Reset** goes back to it).
-- **Mark the pitch** (under **Whole pitch** on the right, also offered the
+- **Mark the pitch** (under **Pitch**, also offered under **Tips** the
   first time you open a match): click the corners of the pitch on the big
   picture, going round it, plus a few points along any edge that looks
   curved. **Undo last point** and **Start again** fix mistakes. Save it and
@@ -284,7 +290,7 @@ rename them: VeoClone reads the order from the names.
   This also takes only a few seconds, except when switching from **Faster**
   to **Best** (the AI then has to look at every frame of the video again).
 - Picture bent, or the two halves don't join? Click **Change phone or lens**
-  (under **Camera** on the right). See
+  (under **Camera**). See
   [If something goes wrong](#if-something-goes-wrong).
 - Keyboard: **Space** play/pause, **← →** one frame, **Shift + ← →** five
   seconds, **K** add a fix with the current view, **Ctrl + Z** undo.
@@ -292,7 +298,7 @@ rename them: VeoClone reads the order from the names.
 
 **Adding text** (team names, the date, a player's name, anything):
 
-- Under **Text** on the right, click **Match title**, **Player name** or
+- Under **Text** on the left, click **Match title**, **Player name** or
   **Text**. A match title ("Home team vs Away team" and today's date) is
   shown at the top for the whole video; a player name or text is shown for
   5 seconds from the playhead.
@@ -300,8 +306,8 @@ rename them: VeoClone reads the order from the names.
   view shows the text straight away.
 - Pick where it goes on the picture (**Place**) and how big it is (**Size**).
 - To change when it is shown, move the playhead and click **Show from here**
-  or **Hide from here**. The purple bars on the timeline show when each text
-  is on screen; click a bar to change that text.
+  or **Hide from here**. The bars in the timeline's **Text** row show when
+  each text is on screen; click a bar to change that text.
 - Click the bin next to a text to delete it (**Undo** brings it back).
 - Your text is added to the video when you export it, looking just like it
   does in the camera view.

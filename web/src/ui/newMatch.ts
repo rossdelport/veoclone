@@ -106,7 +106,7 @@ export function filmingTips(): HTMLElement {
   return h(
     "aside",
     { class: "tips card", "aria-label": "Filming tips" },
-    h("h2", null, icon(I.info, 20), "Filming tips"),
+    h("h2", null, icon(I.tips, 20), "Filming tips"),
     h(
       "ol",
       { class: "tip-list" },
@@ -168,6 +168,11 @@ export function slowAiNotice(): HTMLElement {
   );
 }
 
+/** A numbered step heading for a section of the form. */
+function sectionHead(n: number, title: string, text: string, textClass = "muted"): HTMLElement {
+  return h("div", { class: "section-head" }, h("span", { class: "step-num", "aria-hidden": "true" }, String(n)), h("h2", null, title), h("p", { class: textClass }, text));
+}
+
 function defaultName(): string {
   return `Match ${new Date().toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}`;
 }
@@ -211,7 +216,7 @@ export function newMatchPage(ctx: PageContext): Page {
       "div",
       { class: "page page-new" },
       h("a", { class: "back-link", href: "#/" }, icon(I.back, 18), "Your matches"),
-      h("h1", null, "New match"),
+      h("div", { class: "page-head" }, h("div", null, h("h1", null, "New match"), h("p", { class: "muted" }, "Add the two videos, check a few choices, then press Start."))),
       h(
         "div",
         { class: "new-grid" },
@@ -221,29 +226,31 @@ export function newMatchPage(ctx: PageContext): Page {
           h(
             "section",
             { class: "card form-section" },
-            h("label", { class: "field-label", for: "match-name" }, "Name of the match"),
+            h("label", { class: "field-label", for: "match-name" }, h("span", { class: "step-num", "aria-hidden": "true" }, "1"), "Name of the match"),
             nameInput,
           ),
           h(
             "section",
             { class: "card form-section" },
-            h("h2", null, "The two videos"),
-            h("p", { class: "muted" }, "Stand behind the phones, facing the pitch: the left phone films the left half, the right phone the right half."),
+            sectionHead(2, "The two videos", "Stand behind the phones, facing the pitch: the left phone films the left half, the right phone the right half."),
             h("div", { class: "zones" }, zones.left.el, zones.right.el),
             h("div", { class: "zones-foot" }, swap, space),
           ),
           h(
             "section",
             { class: "card form-section" },
-            h("h2", null, "Which camera and lens filmed this?"),
-            h("p", { class: "muted small" }, "Two identical phones work best, but different iPhones are fine: tick the box and choose each phone. Not sure which iPhone? Leave it on Not sure. Filmed with GoPros? Choose “GoPro or other action camera – detect automatically”."),
+            sectionHead(
+              3,
+              "Which camera and lens filmed this?",
+              "Two identical phones work best, but different iPhones are fine: tick the box and choose each phone. Not sure which iPhone? Leave it on Not sure. Filmed with GoPros? Choose “GoPro or other action camera – detect automatically”.",
+              "muted small",
+            ),
             lensHost,
           ),
           h(
             "section",
             { class: "card form-section" },
-            h("h2", null, "Camera style"),
-            h("p", { class: "muted small" }, "How the AI camera should move. You can fine-tune everything in the editor afterwards."),
+            sectionHead(4, "Camera style", "How the AI camera should move. You can fine-tune everything in the editor afterwards.", "muted small"),
             stylePicker(style, (s) => (style = s)),
             h("h3", { class: "rerun-head" }, "Widest view"),
             h("p", { class: "muted small" }, WIDEST_HELP),
@@ -252,8 +259,7 @@ export function newMatchPage(ctx: PageContext): Page {
           h(
             "section",
             { class: "card form-section" },
-            h("h2", null, "AI accuracy"),
-            h("p", { class: "muted small" }, "How often the AI looks at the picture to find the ball and the players."),
+            sectionHead(5, "AI accuracy", "How often the AI looks at the picture to find the ball and the players.", "muted small"),
             accuracyPicker(aiAccuracy, (a) => (aiAccuracy = a)),
           ),
           aiNote,

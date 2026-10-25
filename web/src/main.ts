@@ -18,6 +18,7 @@ if (window.top !== window.self) {
 
 const pageHost = document.getElementById("page")!;
 const slot = document.getElementById("appbar-slot")!;
+const actions = document.getElementById("appbar-actions")!;
 const pill = document.getElementById("helper-pill")!;
 const banner = document.getElementById("helper-banner")!;
 
@@ -43,11 +44,13 @@ function render(): void {
   current = null;
   pageHost.replaceChildren();
   slot.replaceChildren();
+  actions.replaceChildren();
   document.body.className = "";
   currentHash = location.hash;
   const ctx: PageContext = {
     root: pageHost,
     slot,
+    actions,
     setTitle: (t) => (document.title = t ? `${t} – VeoClone` : "VeoClone"),
   };
   ctx.setTitle("");

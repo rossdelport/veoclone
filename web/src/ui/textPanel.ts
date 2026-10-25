@@ -1,4 +1,4 @@
-// The editor's "Text" section (DESIGN.md 5.4): add a match title, a player
+// The editor's "Text" tool (DESIGN.md 5.4): add a match title, a player
 // name or any text, then change its words, place, size and when it shows.
 import {
   formatFrameTime,
@@ -16,10 +16,11 @@ import { h, setChildren } from "./dom";
 import type { EditStore } from "./editStore";
 import { I } from "./icons";
 
-const ADD: { kind: OverlayKind; label: string; title: string }[] = [
-  { kind: "title", label: "Match title", title: "Team names and today's date at the top, for the whole video" },
-  { kind: "player", label: "Player name", title: "A player's number and name for 5 seconds from the playhead" },
-  { kind: "text", label: "Text", title: "Your own words for 5 seconds from the playhead" },
+/** `sample`: words in the tile's little picture (the title and player tiles draw lines where the text goes). */
+const ADD: { kind: OverlayKind; label: string; title: string; sample: string }[] = [
+  { kind: "title", label: "Match title", title: "Team names and today's date at the top, for the whole video", sample: "" },
+  { kind: "player", label: "Player name", title: "A player's number and name for 5 seconds from the playhead", sample: "" },
+  { kind: "text", label: "Text", title: "Your own words for 5 seconds from the playhead", sample: "Aa" },
 ];
 
 /** The 3×3 place picker; the middle row only has the centre. */
@@ -85,7 +86,15 @@ export class TextPanel {
     private readonly store: EditStore,
     private readonly host: TextPanelHost,
   ) {
-    this.addButtons = ADD.map((a) => button(a.label, () => this.add(a.kind), { icon: I.plus, title: a.title, class: "btn-small" }));
+    // Tiles: a little picture of where the text goes, and what it adds.
+    this.addButtons = ADD.map((a) =>
+      h(
+        "button",
+        { type: "button", class: `text-tile text-tile-${a.kind}`, title: a.title, onClick: () => this.add(a.kind) },
+        h("span", { class: "text-tile-sample", "aria-hidden": "true" }, a.sample),
+        h("span", { class: "text-tile-label" }, a.label),
+      ),
+    );
     this.words = h("textarea", {
       class: "input text-words",
       rows: 3,
@@ -149,10 +158,10 @@ export class TextPanel {
       ),
     );
     this.el = h(
-      "section",
-      { class: "side-section", "data-testid": "text-section" },
-      h("h2", null, "Text"),
-      h("div", { class: "row text-add" }, this.addButtons),
+      "div",
+      { class: "text-tool", "data-testid": "text-section" },
+      h("p", { class: "group-title", id: "text-add-label" }, "Add to your video"),
+      h("div", { class: "text-add", role: "group", "aria-labelledby": "text-add-label" }, this.addButtons),
       this.list,
       this.form,
     );
@@ -261,14 +270,14 @@ export class TextPanel {
           ? h("p", { class: "muted small empty-small" }, "Add the team names and the date, a player's name, or your own words. They show on your video.")
           : h(
               "ul",
-              { class: "texts" },
+              { class: "item-list texts" },
               overlays.map((o) =>
                 h(
                   "li",
                   { class: o.id === this.selected ? "selected" : "" },
                   h(
                     "button",
-                    { type: "button", class: "text-go", "aria-pressed": String(o.id === this.selected), onClick: () => this.select(o.id) },
+                    { type: "button", class: "item-go text-go", "aria-pressed": String(o.id === this.selected), onClick: () => this.select(o.id) },
                     h("span", { class: "text-dot" }),
                     h("span", { class: textName(o) ? "text-name" : "text-name muted" }, textName(o) || "Empty text"),
                     h("span", { class: "muted small nowrap" }, this.range(o)),

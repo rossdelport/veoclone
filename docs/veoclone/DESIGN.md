@@ -43,9 +43,15 @@ browser to the helper on the same PC.
    Cancel button. Warnings (HDR footage, videos in different formats,
    generic lens, low calibration confidence) are shown in plain words. On failure: plain-language error +
    "Try again".
-4. Editor (opens when processing is done):
+4. Editor (opens when processing is done). Layout: a rail of tools on the
+   left (Camera, Fixes, Straighten, Pitch, Text, Trim, Tips), each showing
+   its own panel next to it; the camera view in the middle; play controls
+   and the timeline (lanes: Video, Fixes, Text) at the bottom; undo/redo,
+   save state and **Export** in the top bar. Tips opens first while there
+   are tips or warnings to read.
    - Big **camera view**: what the final video will look like at the playhead.
-   - **Whole-pitch overview** strip: the full stitched view with a rectangle
+   - **Whole-pitch map** in the corner of the camera view (bigger on request,
+     or put away): the full stitched view with a rectangle
      showing where the camera is pointing. Click/drag on it to point the
      camera there (adds a fix/keyframe at the playhead).
    - Drag inside the camera view to pan, mouse wheel to zoom (adds a

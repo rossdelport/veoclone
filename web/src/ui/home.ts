@@ -90,7 +90,7 @@ export function homePage(ctx: PageContext): Page {
         h(
           "div",
           { class: "empty" },
-          h("div", { class: "empty-art" }, icon(I.film, 40)),
+          h("div", { class: "empty-art" }, icon(I.video, 30)),
           h("h2", null, "No matches yet"),
           h("p", { class: "muted" }, "Film a match with two phones side by side, then press New match to turn the two videos into one."),
           button("New match", () => (location.hash = "#/new"), { variant: "primary", icon: I.plus, big: true }),
@@ -137,7 +137,7 @@ export function homePage(ctx: PageContext): Page {
       h(
         "div",
         { class: "match-actions" },
-        h("a", { class: `btn ${p.status === "ready" ? "btn-primary" : "btn-secondary"}`, href: openHref(p) }, h("span", null, open)),
+        h("a", { class: "btn btn-secondary", href: openHref(p) }, h("span", null, open)),
         h(
           "button",
           { type: "button", class: "btn btn-icon btn-ghost", title: `Delete ${p.name}`, "aria-label": `Delete ${p.name}`, onClick: () => remove(p) },

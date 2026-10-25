@@ -196,6 +196,11 @@ async function savedEdits(id: string) {
   return (await mockState()).edits[id];
 }
 
+/** Open one of the editor's tools from the rail on the left; only its panel is shown. */
+async function tool(page: Page, name: "Camera" | "Fixes" | "Straighten" | "Pitch" | "Text" | "Trim" | "Tips") {
+  await page.getByRole("tab", { name, exact: true }).click();
+}
+
 /** Click the timeline at a fraction of its width. */
 async function clickTimeline(page: Page, fraction: number) {
   const box = (await page.getByTestId("timeline").boundingBox())!;
@@ -216,6 +221,7 @@ test("widest view: Natural (like Veo) for a new match, Wide when chosen, shown o
   await expect(page.locator(".facts dt:text-is('Widest view') + dd")).toHaveText("Wide", { timeout: 30_000 });
   await expect(page).toHaveURL(/#\/edit\/\w+/, { timeout: 10_000 });
   await expectPicture(page);
+  await tool(page, "Camera");
   const editor = page.getByTestId("widest-view").getByRole("radiogroup", { name: "Widest view" });
   await expect(editor.getByRole("radio", { name: /^Wide\b/ })).toBeChecked();
   await expect(page.getByTestId("widest-note")).toBeEmpty();
@@ -225,6 +231,9 @@ test("widest view: Natural (like Veo) for a new match, Wide when chosen, shown o
 
 test("editor: an older match gets the Natural look tip; Try it keeps the camera closer at once and runs the AI again in seconds", async ({ page }) => {
   const id = await openExample(page);
+  // The tips show first; the choice is under Camera.
+  await expect(page.getByRole("tab", { name: "Tips" })).toHaveAttribute("aria-selected", "true");
+  await tool(page, "Camera");
   const camera = page.getByTestId("widest-view");
   const choices = camera.getByRole("radiogroup", { name: "Widest view" });
   await expect(choices.getByRole("radio")).toHaveCount(3);
@@ -252,8 +261,11 @@ test("editor: an older match gets the Natural look tip; Try it keeps the camera 
   // (slowly here, so the note can be seen).
   await patchProject(id, { name: "Example match slow" });
   const gets = (await mockState()).aiPathGets;
+  await tool(page, "Tips");
   await tip.getByRole("button", { name: "Try it" }).click();
   await expect(tip).toHaveCount(0);
+  // Try it shows Camera, where the AI camera's update shows.
+  await expect(page.getByRole("tab", { name: "Camera" })).toHaveAttribute("aria-selected", "true");
   await expect(choices.getByRole("radio", { name: /^Natural/ })).toBeChecked();
   const note = page.getByTestId("widest-note");
   await expect(note).toContainText("Updating the AI camera for “Natural (like Veo)”…");
@@ -288,6 +300,7 @@ test("editor: an older match gets the Natural look tip; Try it keeps the camera 
   // Opened again: Natural, and no tip.
   await page.reload();
   await expectPicture(page);
+  await tool(page, "Camera");
   await expect(choices.getByRole("radio", { name: /^Natural/ })).toBeChecked();
   await expect(page.getByTestId("natural-hint")).toHaveCount(0);
 });
@@ -295,6 +308,7 @@ test("editor: an older match gets the Natural look tip; Try it keeps the camera 
 test("editor: when running the AI again for a widest view fails, the editor keeps to it and offers to try again", async ({ page }) => {
   const id = await openExample(page);
   await patchProject(id, { name: "Example match fail" }); // the mock fails its next run once
+  await tool(page, "Camera");
   const choices = page.getByTestId("widest-view").getByRole("radiogroup", { name: "Widest view" });
   await choices.getByText("Wide", { exact: true }).click();
   await expect(page.getByText("The AI camera could not be updated.")).toBeVisible({ timeout: 30_000 });
@@ -376,6 +390,7 @@ test("editor: mark the pitch, undo a point, save, and run the AI again to use it
   await expect(page.getByTestId("pitch-hint")).toHaveCount(0);
 
   // Change it: the saved outline comes back, Start again clears it; Remove takes it away.
+  await tool(page, "Pitch");
   await page.getByRole("button", { name: "Change the pitch outline" }).click();
   await expect(dialog.locator(".pitch-status")).toContainText("4 points");
   await dialog.getByRole("button", { name: "Start again" }).click();
@@ -425,6 +440,7 @@ test("editor: add, select, remove and undo camera fixes", async ({ page }) => {
   const ov = (await page.getByTestId("overview").boundingBox())!;
   await page.mouse.click(ov.x + ov.width * 0.45, ov.y + ov.height * 0.5);
   await expect(page.locator(".fixes li")).toHaveCount(3);
+  await tool(page, "Fixes");
   await shot(page, "06-editor-fixes");
 
   // Delete removes the selected fix; Ctrl+Z brings it back.
@@ -441,6 +457,7 @@ test("editor: add, select, remove and undo camera fixes", async ({ page }) => {
 
 test("editor: trim the start and end and cut out a section", async ({ page }) => {
   const id = await openExample(page);
+  await tool(page, "Trim");
   const kept = page.getByTestId("kept-length");
   await expect(kept).toHaveText("0:20");
 
@@ -485,6 +502,7 @@ test("editor: playback, frame steps and sliders", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Play", exact: true })).toBeVisible();
 
   // Space plays even when a button has focus, without pressing that button again.
+  await tool(page, "Trim");
   await page.getByRole("button", { name: "Cut out a section" }).click();
   await page.keyboard.press("Space");
   await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
@@ -493,6 +511,7 @@ test("editor: playback, frame steps and sliders", async ({ page }) => {
   await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: "Cut out a section" })).toBeVisible();
 
+  await tool(page, "Camera");
   const zoom = page.getByTestId("slider-zoom");
   await zoom.fill("1.5");
   await expect(page.locator(".slider").first()).toContainText("150%");
@@ -520,6 +539,7 @@ test("editor: straighten the picture, look left / centre / right, undo, autosave
   await expect(tip).toContainText("Picture leaning when the camera turns? Use Straighten picture.");
 
   // Look left: a preview of the left edge, not a fix.
+  await tool(page, "Straighten");
   await expect(badge).toHaveText("AI camera");
   const ai = await view.screenshot();
   await section.getByRole("button", { name: "Look left" }).click();
@@ -629,6 +649,7 @@ test("editor: a camera that measured its own level (GoPro) starts straightened, 
   const reset = page.getByTestId("reset-tiltDeg");
   await expect(reset).toBeDisabled();
   await expect(reset).toHaveAttribute("aria-label", "Reset tilt to the camera's own level (6.9° down)");
+  await tool(page, "Straighten");
   await page.getByTestId("straighten-tiltDeg").fill("15");
   await expect(tiltValue).toHaveText("15.0° down");
   await reset.click();
@@ -646,6 +667,7 @@ test("editor: a camera that measured its own level (GoPro) starts straightened, 
 
 test("export: make a video, download it, show it in the folder, delete it", async ({ page }) => {
   const id = await openExample(page);
+  await tool(page, "Trim");
   await clickTimeline(page, 0.25);
   await page.getByRole("button", { name: "Set start here" }).click();
 
@@ -904,6 +926,7 @@ test("warnings show on the home card and in the editor, and can be hidden", asyn
 
 test("change phone or lens from the editor: two choices, then everything is processed again", async ({ page }) => {
   const id = await openExample(page);
+  await tool(page, "Camera");
   await page.getByRole("link", { name: "Change phone or lens" }).click();
   const dialog = page.getByRole("dialog", { name: "Change phone or lens" });
   await expect(dialog).toContainText("does all the processing again");
@@ -951,6 +974,7 @@ test("two different iPhones: a phone and lens for each, also when changing them 
 
   // "Change phone or lens" shows both phones; one phone for both again.
   await expect(page).toHaveURL(new RegExp(`#/edit/${id}$`), { timeout: 10_000 });
+  await tool(page, "Camera");
   await page.getByRole("link", { name: "Change phone or lens" }).click();
   const dialog = page.getByRole("dialog", { name: "Change phone or lens" });
   await expect(dialog.getByLabel("The two phones are different models")).toBeChecked();
@@ -991,12 +1015,14 @@ test("a re-run that fails keeps the match ready, and the editor still opens", as
 test("editor: arrow keys and Space still step and play after using a slider or a tick box", async ({ page }) => {
   const id = await openExample(page);
   const time = page.locator(".time-label");
+  await tool(page, "Camera");
   await page.getByTestId("slider-smoothSeconds").click();
   const smooth = await page.getByTestId("slider-smoothSeconds").inputValue();
   await page.keyboard.press("Shift+ArrowRight");
   await expect(time).toHaveText("0:05 / 0:20");
   expect(await page.getByTestId("slider-smoothSeconds").inputValue()).toBe(smooth);
 
+  await tool(page, "Trim");
   const skip = page.getByRole("checkbox", { name: "Skip cut parts when playing" });
   await skip.click();
   await expect(skip).not.toBeChecked();
@@ -1073,6 +1099,7 @@ test("text: add a match title and a player name, change them, and export with th
   await expect(page.locator(".fixes li")).toHaveCount(1);
 
   // Match title: team names and today's date at the top, the first line ready to type over.
+  await tool(page, "Text");
   await section.getByRole("button", { name: "Match title" }).click();
   await expect(items).toHaveCount(1);
   await expect(words).toBeFocused();
@@ -1118,9 +1145,10 @@ test("text: add a match title and a player name, change them, and export with th
   await expect(page.getByTestId("text-when")).toHaveText("Shows from 0:10 to 0:12.");
   await expect(section).toContainText("Not on screen at the playhead");
 
-  // Clicking a bar on the timeline picks that text.
+  // Clicking a bar on the timeline's Text lane picks that text.
   const tl = (await page.getByTestId("timeline").boundingBox())!;
-  await page.mouse.click(tl.x + tl.width * 0.1, tl.y + tl.height - 22 - 18 + 5);
+  const lane = (await page.locator(".lane-label.lane-text").boundingBox())!;
+  await page.mouse.click(tl.x + tl.width * 0.1, lane.y + 5);
   await expect(words).toHaveValue(`Kickers vs Rovers\n${date}`);
   await expect(time).toHaveText("0:02 / 0:20");
 

@@ -1,42 +1,83 @@
-// 24x24 stroke icons (inner SVG markup for dom.ts icon()).
-const p = (d: string) => `<path d="${d}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`;
+// 24x24 line icons (inner SVG markup for dom.ts icon()), 1.75 px stroke.
+// Most are Lucide icons (https://lucide.dev, ISC licence, see
+// THIRD_PARTY_NOTICES.md); `play`, `level` and `pitch` are drawn for VeoClone
+// in the same style.
+const STROKE = `fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"`;
+const g = (inner: string) => `<g ${STROKE}>${inner}</g>`;
+const solid = (inner: string) => `<g fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">${inner}</g>`;
 
 export const I = {
-  play: `<path d="M7 4.5v15a1 1 0 0 0 1.5.86l12-7.5a1 1 0 0 0 0-1.72l-12-7.5A1 1 0 0 0 7 4.5z" fill="currentColor"/>`,
-  pause: `<rect x="6" y="4" width="4" height="16" rx="1" fill="currentColor"/><rect x="14" y="4" width="4" height="16" rx="1" fill="currentColor"/>`,
-  frameBack: p("M18 6l-8 6 8 6V6z") + p("M6 6v12"),
-  frameForward: p("M6 6l8 6-8 6V6z") + p("M18 6v12"),
-  back5: p("M11 18l-7-6 7-6v12z") + p("M20 18l-7-6 7-6v12z"),
-  forward5: p("M13 6l7 6-7 6V6z") + p("M4 6l7 6-7 6V6z"),
-  undo: p("M9 14L4 9l5-5") + p("M4 9h10.5a5.5 5.5 0 0 1 0 11H11"),
-  redo: p("M15 14l5-5-5-5") + p("M20 9H9.5a5.5 5.5 0 0 0 0 11H13"),
-  download: p("M12 3v12") + p("M7 10l5 5 5-5") + p("M5 21h14"),
-  folder: p("M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"),
-  trash: p("M4 7h16") + p("M10 11v6") + p("M14 11v6") + p("M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12") + p("M9 7V4h6v3"),
-  plus: p("M12 5v14") + p("M5 12h14"),
-  minus: p("M5 12h14"),
-  check: p("M5 12.5l4.5 4.5L19 7.5"),
-  alert: p("M12 3l9.5 17h-19L12 3z") + p("M12 10v4") + p("M12 17.5v.01"),
-  info: p("M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z") + p("M12 11v5") + p("M12 7.5v.01"),
-  x: p("M6 6l12 12") + p("M18 6L6 18"),
-  upload: p("M12 16V4") + p("M7 9l5-5 5 5") + p("M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"),
-  phone: p("M7 2.5h10a1.5 1.5 0 0 1 1.5 1.5v16a1.5 1.5 0 0 1-1.5 1.5H7A1.5 1.5 0 0 1 5.5 20V4A1.5 1.5 0 0 1 7 2.5z") + p("M11 18.5h2"),
-  back: p("M15 18l-6-6 6-6"),
-  scissors: p("M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z") + p("M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z") + p("M20 4L8.1 15.9") + p("M14.5 14.5L20 20") + p("M8.1 8.1L12 12"),
-  start: p("M5 4v16") + p("M9 12h10") + p("M15 8l4 4-4 4"),
-  end: p("M19 4v16") + p("M5 12h10") + p("M11 8l4 4-4 4"),
-  zoomIn: p("M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z") + p("M20 20l-4-4") + p("M11 8v6") + p("M8 11h6"),
-  zoomOut: p("M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z") + p("M20 20l-4-4") + p("M8 11h6"),
-  fit: p("M4 9V5a1 1 0 0 1 1-1h4") + p("M15 4h4a1 1 0 0 1 1 1v4") + p("M20 15v4a1 1 0 0 1-1 1h-4") + p("M9 20H5a1 1 0 0 1-1-1v-4"),
-  pin: p("M12 3l2.2 5.6L20 9.3l-4.4 3.9 1.3 5.8L12 16l-4.9 3 1.3-5.8L4 9.3l5.8-.7L12 3z"),
-  refresh: p("M20 11a8 8 0 1 0-2.3 5.7") + p("M20 4v7h-7"),
-  sparkle: p("M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z") + p("M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16z"),
-  pencil: p("M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z") + p("M13.5 6.5l4 4"),
-  volume: p("M4 9v6h4l5 4V5L8 9H4z") + p("M16.5 8.5a5 5 0 0 1 0 7") + p("M19 6a8.5 8.5 0 0 1 0 12"),
-  mute: p("M4 9v6h4l5 4V5L8 9H4z") + p("M17 9l5 5") + p("M22 9l-5 5"),
-  film: p("M4 4h16v16H4z") + p("M8 4v16") + p("M16 4v16") + p("M4 8h4") + p("M4 16h4") + p("M16 8h4") + p("M16 16h4") + p("M4 12h16"),
-  export: p("M12 3v12") + p("M7 8l5-5 5 5") + p("M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"),
-  cpu: p("M7 7h10v10H7z") + p("M10 3v4") + p("M14 3v4") + p("M10 17v4") + p("M14 17v4") + p("M3 10h4") + p("M3 14h4") + p("M17 10h4") + p("M17 14h4"),
-  level: p("M3 9h18v6H3z") + p("M10.5 9v6") + p("M13.5 9v6") + p("M12 4v2") + p("M12 18v2"),
-  keyboard: p("M3 6h18v12H3z") + p("M7 10h.01") + p("M11 10h.01") + p("M15 10h.01") + p("M8 14h8"),
+  // Playback (filled, so they read as buttons at a glance).
+  play: solid(`<path d="M7 4.6v14.8a1 1 0 0 0 1.53.85l11.8-7.4a1 1 0 0 0 0-1.7L8.53 3.75A1 1 0 0 0 7 4.6z"/>`),
+  pause: solid(`<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>`),
+  frameBack: g(`<line x1="18" x2="18" y1="20" y2="4"/><polygon points="14,20 4,12 14,4"/>`),
+  frameForward: g(`<line x1="6" x2="6" y1="4" y2="20"/><polygon points="10,4 20,12 10,20"/>`),
+  back5: g(`<polygon points="11 19 2 12 11 5 11 19"/><polygon points="22 19 13 12 22 5 22 19"/>`),
+  forward5: g(`<polygon points="13 19 22 12 13 5 13 19"/><polygon points="2 19 11 12 2 5 2 19"/>`),
+  volume: g(
+    `<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/>`,
+  ),
+  mute: g(
+    `<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><line x1="22" x2="16" y1="9" y2="15"/><line x1="16" x2="22" y1="9" y2="15"/>`,
+  ),
+
+  // Actions.
+  undo: g(`<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/>`),
+  redo: g(`<path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13"/>`),
+  download: g(`<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>`),
+  upload: g(`<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>`),
+  export: g(`<path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" x2="12" y1="2" y2="15"/>`),
+  folder: g(
+    `<path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/>`,
+  ),
+  trash: g(
+    `<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>`,
+  ),
+  plus: g(`<path d="M5 12h14"/><path d="M12 5v14"/>`),
+  minus: g(`<path d="M5 12h14"/>`),
+  check: g(`<path d="M20 6 9 17l-5-5"/>`),
+  x: g(`<path d="M18 6 6 18"/><path d="m6 6 12 12"/>`),
+  back: g(`<path d="m15 18-6-6 6-6"/>`),
+  pencil: g(
+    `<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>`,
+  ),
+  refresh: g(`<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>`),
+  sparkle: g(
+    `<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/>`,
+  ),
+  scissors: g(`<circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/>`),
+  start: g(`<path d="M3 5v14"/><path d="M21 12H7"/><path d="m15 18 6-6-6-6"/>`),
+  end: g(`<path d="M17 12H3"/><path d="m11 18 6-6-6-6"/><path d="M21 5v14"/>`),
+  zoomIn: g(`<circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/><line x1="11" x2="11" y1="8" y2="14"/><line x1="8" x2="14" y1="11" y2="11"/>`),
+  zoomOut: g(`<circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/><line x1="8" x2="14" y1="11" y2="11"/>`),
+  fit: g(`<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/>`),
+  maximize: g(`<polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" x2="14" y1="3" y2="10"/><line x1="3" x2="10" y1="21" y2="14"/>`),
+  minimize: g(`<polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" x2="21" y1="10" y2="3"/><line x1="3" x2="10" y1="21" y2="14"/>`),
+
+  // Status.
+  alert: g(`<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>`),
+  info: g(`<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>`),
+  checkCircle: g(`<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>`),
+  cpu: g(
+    `<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/>`,
+  ),
+
+  // Things.
+  phone: g(`<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>`),
+  film: g(`<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/>`),
+  video: g(`<path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/>`),
+  type: g(`<polyline points="4 7 4 4 20 4 20 7"/><line x1="9" x2="15" y1="20" y2="20"/><line x1="12" x2="12" y1="4" y2="20"/>`),
+  tips: g(`<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/>`),
+  keyboard: g(
+    `<path d="M10 8h.01"/><path d="M12 12h.01"/><path d="M14 8h.01"/><path d="M16 12h.01"/><path d="M18 8h.01"/><path d="M6 8h.01"/><path d="M7 16h10"/><path d="M8 12h.01"/><rect width="20" height="16" x="2" y="4" rx="2"/>`,
+  ),
+  map: g(
+    `<path d="M14.106 5.553a2 2 0 0 0 1.788 0l3.659-1.83A1 1 0 0 1 21 4.619v12.764a1 1 0 0 1-.553.894l-4.553 2.277a2 2 0 0 1-1.788 0l-4.212-2.106a2 2 0 0 0-1.788 0l-3.659 1.83A1 1 0 0 1 3 19.381V6.618a1 1 0 0 1 .553-.894l4.553-2.277a2 2 0 0 1 1.788 0z"/><path d="M15 5.764v15"/><path d="M9 3.236v15"/>`,
+  ),
+  /** Camera fix: a crosshair on the spot the camera keeps (Lucide locate-fixed). */
+  fix: g(`<line x1="2" x2="5" y1="12" y2="12"/><line x1="19" x2="22" y1="12" y2="12"/><line x1="12" x2="12" y1="2" y2="5"/><line x1="12" x2="12" y1="19" y2="22"/><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/>`),
+  /** Straighten picture: a spirit level. */
+  level: g(`<rect x="2" y="8" width="20" height="8" rx="2"/><path d="M9.5 8v8"/><path d="M14.5 8v8"/><circle cx="12" cy="12" r="1"/>`),
+  /** The pitch: halfway line, centre circle and the two boxes. */
+  pitch: g(`<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M12 5v14"/><circle cx="12" cy="12" r="2.5"/><path d="M2 9h3v6H2"/><path d="M22 9h-3v6h3"/>`),
 };

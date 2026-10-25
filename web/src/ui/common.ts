@@ -34,6 +34,14 @@ export function iconButton(iconPaths: string, label: string, onClick: (e: MouseE
   );
 }
 
+/** A range input paints the part left of its thumb (styles.css reads --fill). Call after setting its value. */
+export function rangeFill(input: HTMLInputElement): void {
+  const min = Number(input.min || 0);
+  const max = Number(input.max || 100);
+  const pct = max > min ? ((Number(input.value) - min) / (max - min)) * 100 : 0;
+  input.style.setProperty("--fill", `${Math.min(100, Math.max(0, pct)).toFixed(2)}%`);
+}
+
 export function progressBar(fraction: number, label: string): HTMLDivElement {
   const bar = h("div", {
     class: "progress",

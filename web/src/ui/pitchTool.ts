@@ -117,11 +117,11 @@ export function markPitchDialog(opts: PitchToolOptions): Promise<PitchPolygons |
         const dim = new Path2D();
         dim.rect(0, 0, w, hh);
         dim.addPath(outline);
-        g.fillStyle = "rgba(4, 7, 11, 0.55)";
+        g.fillStyle = "rgba(17, 18, 20, 0.55)";
         g.fill(dim, "evenodd");
       }
       if (pts.length >= 2) {
-        g.strokeStyle = "#34d399";
+        g.strokeStyle = "#c2f24a";
         g.lineWidth = 2;
         g.beginPath();
         pts.forEach((p, i) => (i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y)));
@@ -129,8 +129,9 @@ export function markPitchDialog(opts: PitchToolOptions): Promise<PitchPolygons |
         g.stroke();
       }
       pts.forEach((p, i) => {
-        g.fillStyle = i === 0 ? "#fbbf24" : "#34d399";
-        g.strokeStyle = "#04070b";
+        // The first point white, so it is clear where the outline closes.
+        g.fillStyle = i === 0 ? "#ffffff" : "#c2f24a";
+        g.strokeStyle = "#111214";
         g.lineWidth = 1.5;
         g.beginPath();
         g.arc(p.x, p.y, i === 0 ? 6 : 5, 0, Math.PI * 2);

@@ -29,7 +29,7 @@ browser to the helper on the same PC.
 2. New match: name, "Which iPhone?" + "Which lens?" (4.6; once for both
    phones, or once per phone with "The two phones are different models"
    ticked; GoPros and "detect automatically" in the same list), camera style
-   (Broadcast / Action / Wide / Follow the ball), AI accuracy (Best: every
+   (Follow the ball, default (4.13) / Broadcast / Action / Wide), AI accuracy (Best: every
    frame, default / Faster: every 3rd frame), and two drop boxes: **Left phone** and
    **Right phone**, each taking one file or all the files of a recording the
    camera split into parts (GoPro chapters, 4.10). Under the camera style,
@@ -279,9 +279,9 @@ log.txt           human-readable log of jobs for this project
    exactly like reco-gui's export (`crates/reco-gui/src/export.rs`), a video
    in parts given as `InputPath::Chained` (4.10): the
    style's tracking mode and preset (`broadcast`/`action`/`frame_all`
-   field mode; `ball` = `TrackingMode::Ball` with the broadcast preset,
-   which Reco turns into `ball_weight` 1.0, `BallTracker` max jump 0.5 and
-   no player tracker) with the widest view's zoom limit
+   field mode; `ball`, "Follow the ball", runs Reco's `broadcast` camera
+   here (`Style::reco`): its path is made afterwards by VeoClone's tracking
+   brain from the recording of what the AI saw, 4.13) with the widest view's zoom limit
    (`seen::panner_config`, 4.12), detection interval from `aiAccuracy` (1 or 3),
    lookahead 1.5 s, the pitch outline as `field_roi` (4.8), output to a
    throwaway 640x360 MKV with audio disabled (deleted afterwards). Instead
@@ -301,6 +301,8 @@ log.txt           human-readable log of jobs for this project
    ball path is bit-identical to `confidence_threshold = 0.25`).
    When a usable recording exists (4.9), this step instead rebuilds the
    path from it in about a second ("Using what the AI saw last time").
+   Either way it also works out the ball numbers (4.13) from the recording
+   and stores them in `aiRun.ball`.
 5. Write `calib.json`, status `ready`.
 
 Progress: each step reports `progress` 0..1 and, where known,
@@ -410,6 +412,7 @@ keeps to the widest view it was made with, 4.12).
 | `GET /api/projects/:id/calibration` | `CalibInfo` |
 | `GET /api/projects/:id/proxy.mp4` | video with HTTP Range support |
 | `GET /api/projects/:id/ai-path.bin` | binary path |
+| `GET /api/projects/:id/ai-report` | the AI report zip (4.13), `Content-Disposition: attachment; filename="veoclone-ai-report-<date>.zip"`; 404 without a record of what the AI saw, 409 while busy |
 | `GET/PUT /api/projects/:id/edits` | editor state JSON (≤ 10 MB), `{}` if none |
 | `PUT /api/projects/:id/pitch` | `{ points, left, right }` (4.8) → `ProjectMeta` |
 | `DELETE /api/projects/:id/pitch` | remove the pitch outline → `ProjectMeta` |
@@ -430,7 +433,8 @@ keeps to the widest view it was made with, 4.12).
   aiAccuracy: "best" | "faster";   // detection interval 1 / 3; missing in older files: best
   widestView: null | "natural" | "wide" | "widest";  // 4.12; null (older files): behaves as widest
   pitch: null | { id: string; points: [number, number][]; left: [number, number][]; right: [number, number][] }; // 4.8
-  aiRun: null | { style; aiAccuracy; pitchId: string | null; widestView? };  // what ai_path.bin was made with (widestView null/missing: widest)
+  aiRun: null | { style; aiAccuracy; pitchId: string | null; widestView?;  // what ai_path.bin was made with (widestView null/missing: widest)
+                  ball?: BallStats };  // the ball numbers, 4.13 (missing: no recording, or an older VeoClone)
   aiSeen: null | { every: number };  // a recording for quick re-runs exists (4.9); filled in when read
   status: "new" | "uploaded" | "queued" | "processing" | "ready" | "failed" | "cancelled";
   files: { left?: FileInfo; right?: FileInfo };  // FileInfo = { name, sizeBytes, probe?: {...}, parts? } (4.10)
@@ -455,7 +459,7 @@ with no or a `null` lensId store `"generic:ultra"`; only the ids from
 `GET /api/lenses` are accepted. `rightLensId` (missing in older
 `project.json` files: `null`) accepts those ids or `null`; changing either
 id clears `calibration` so the next `process` calibrates again. `widestView`:
-`POST` without one stores `"natural"`; `PATCH` takes the three names
+`POST` without one stores `"natural"` (and without a `style`, `"ball"`); `PATCH` takes the three names
 ("Unknown widest view." otherwise) and, like `style` and `aiAccuracy`, is
 refused (409) while the match is busy. `swap` also works with only one video
 uploaded (it moves sides; status `new`) and refuses while busy (409).
@@ -605,7 +609,9 @@ recording of every frame, and with a pitch outline; a re-run takes 0.5 s
 against 70 s for the AI pass.
 
 The panner config comes from `seen::panner_config(style, widestView)` in
-both, so a widest view (4.12) replays as exactly as a style.
+both, so a widest view (4.12) replays as exactly as a style. "Follow the
+ball" is not a Reco camera: `brain::follow` makes its path from the
+recording (4.13), after the AI pass as well as in a re-run.
 
 `process` uses the recording when the model is the same, the sync offset
 matches and the new detection interval is a multiple of the recorded one
@@ -804,7 +810,7 @@ date (`update.rs`, `swap.rs`, `unzip.rs`, `settings.rs`, `shortcuts.rs`).
 ### 4.12 Widest view (how far the camera may zoom out)
 
 Reco's FieldPanner presets let the AI camera zoom out to `fov_wide` = 58°
-of vertical view (broadcast, also Follow the ball), 48° (action) or 70°
+of vertical view (broadcast), 48° (action) or 70°
 (frame-all): about 89°, 77° and 102° across at 16:9. The output is a flat
 (rectilinear) view, so something at an angle θ from the centre is drawn
 `1/cos²θ` times wider along the radius than in the middle: at 89° across a
@@ -830,12 +836,14 @@ for example for a small pitch filmed from close by.
 
 - **Helper** (`seen.rs` `WidestView`): `limit` overlays the preset:
   `fov_wide = min(preset, cap)`, then `fov_default = min(fov_default,
-  fov_wide)` (where the zoom starts, and Follow the ball's fixed zoom) and
+  fov_wide)` (where the zoom starts, and Reco's ball mode's fixed zoom) and
   `fov_tight = min(fov_tight, fov_default)`, so `tight ≤ default ≤ wide` and
   Reco's `sanitized()` changes nothing (unit-tested for every style).
   Natural: broadcast 22/34/34 (tight/start/wide), action 20/34/34,
-  frame-all 22/34/34, Follow the ball fixed at 34; Wide: 22/40/44, 20/34/44,
-  22/40/44, ball 40. `seen::panner_config(style, widest)` is the config both
+  frame-all 22/34/34, Reco's ball mode fixed at 34; Wide: 22/40/44, 20/34/44,
+  22/40/44, ball mode 40. Follow the ball's brain (4.13) has its own zoom
+  range (22–58°) and caps it the same way, also at the coverage's widest.
+  `seen::panner_config(style, widest)` is the config both
   the AI pass (given to `setup_autocam`) and `repan` (4.9) use, so a change
   is a quick re-run and replays exactly. FieldPanner aims without looking at
   its zoom, so only the fov changes: yaw and pitch stay bit-identical. A
@@ -879,11 +887,189 @@ for example for a small pitch filmed from close by.
   a Widest AI pass (fov up to 51.4°), Natural from its recording in 0.5 s
   (fov ≤ 34.0000°, yaw/pitch unchanged, fov up to 17.4° less), a full
   Natural AI pass whose own replay differs by 0 and which equals the quick
-  re-run bit for bit, Wide ≤ 44° and Follow the ball fixed at 34° in 0.5 s
-  each, and the editor's own `computeFinalPath` (bundled with esbuild) on
+  re-run bit for bit, Wide ≤ 44° and Follow the ball (then Reco's ball
+  mode) fixed at 34° in 0.5 s each (now: the brain's path ≤ 34° / ≤ 44°), and the editor's own `computeFinalPath` (bundled with esbuild) on
   that match: Natural at most 34.00° at Zoom 50/100/200 % with an 80° fix,
   Wide at most 44°, Widest / not set identical to no limit, zoom in
   unchanged.
+
+### 4.13 "Follow the ball": VeoClone's tracking brain
+
+A user filmed a night match (iPhone 0.5×, 1920x1080, AI accuracy Best,
+style Follow the ball, which was then Reco's `TrackingMode::Ball`): "it lost
+the ball 90% of the time" and "it's just looking at the ground". Reco's ball
+mode follows whatever its `BallTracker` holds on to, frame by frame: the
+first ball-like detection at confidence ≥ 0.25, then the nearest within
+0.5 rad, so a static bright spot, a line marking or a boot keeps it for good;
+it centres the ball vertically at a fixed 34° zoom, so a ball near the camera
+fills the picture with grass; it stands still while the ball is lost; and the
+nano model on downscaled night frames rarely sees the real ball at 0.25.
+
+The style id stays `ball` ("Follow the ball"), now the default for new
+matches (`Style::NEW_MATCH`, the editor's `NEW_MATCH_STYLE`, first in the
+list), but its camera is made by `brain.rs` from the recording of what the
+AI saw (4.9), for the whole match at once. Nothing new is detected, so it
+applies to matches already processed: choosing Follow the ball again is a
+quick re-run (0.5 s on the synthetic footage, about 2 s of brain for 90
+minutes). The AI pass for this style runs Reco's broadcast camera
+(`Style::reco`; that path is verified against its recording as for every
+style, 4.9, and is the fallback, with a warning, if the recording could not
+be kept), then the brain makes the path from the recording.
+
+**The ball track** (`candidates`, `mark_static`, `best_track`):
+
+1. *Sightings*: every ball detection of the detection frames the AI accuracy
+   asks for, at confidence ≥ `minConfidence` (0.10, the recording's floor:
+   more of the dim ball than Reco's 0.25), inside the pitch outline (Reco's
+   `RoiFilteredDetector` via `seen::PitchFilter`, as the AI pass applies
+   it), in world yaw/pitch (`camera_to_panorama`); sightings of one frame
+   closer than `sameSpotDeg` (0.5°) count once (the overlap, double boxes);
+   at most 8 per frame.
+2. *Not the ball*: sightings within 0.5° of a spot's first sighting, each at
+   most `gapSecs` (2.5 s) after the previous one, form a stay; a stay of
+   `staticSecs` (1.5 s) or more is dropped (`rejectedStatic`) unless at
+   least as many other sightings were seen within 2° of it meanwhile (a ball
+   moving about at a player's feet keeps coming back to the same spots, but
+   is seen all around them; a mark on the grass is not).
+3. *One track*: the best single path through the remaining sightings by
+   dynamic programming over the frames (Viterbi-like, O(sightings × sightings
+   within the gap)). A sighting earns `confidence × rewardPerSec` (3) per
+   second of the frames it stands for, half that (`lonelyReward`) with no
+   player within `nearPlayersDeg` (20°). Linking sighting a to a later b
+   (at most `gapSecs` apart) is impossible when the angle, less
+   `noiseDeg` (0.3°), needs more than the fastest kick, and otherwise costs
+   `speedCost` (2) × (speed / fastest)² × seconds. The fastest kick is
+   `maxBallSpeed` (30 m/s) at the distance there, from how tall players
+   look there: `playerHeight` (1.8 m) / their angular height, a straight line
+   fitted to the median height per degree of feet pitch (measured about
+   twice a second from box centre to feet; a constant 3.4° without data).
+   Starting a new piece costs `newTrackCost` (1), so a lone flicker (a
+   confident false ball for one frame earns about 0.07) is never worth it,
+   and a ball 40° away a frame later is impossible. Sightings not on the
+   track are `rejectedOther`. Between the sightings of a piece the ball is
+   interpolated in a straight line (gaps ≤ 2.5 s); a frame is "followed"
+   from a piece's first sighting to its last.
+
+**Where to look** (`Framer`, all angles from the world poses):
+
+- *With the ball*: yaw = the ball's. The zoom fits the players within 20° of
+  the ball: the 75th percentile of their horizontal offset plus
+  `frameMarginDeg` (5°) is half the picture's width, clamped to
+  [`fovTightDeg` 22°, the widest allowed]. The ball sits `ballHeight` (0.38)
+  up from the bottom of the picture (`atan((1 − 2h)·tan(v/2))` below the
+  centre), then the aim moves `playerPull` (0.35) of the way to the middle
+  (box centres) of those players; never more than `grassBelow` (0.30) of the
+  picture below the lowest of the ball and their feet; and the ball stays at
+  least `ballMarginDeg` (3°) inside the picture. So the camera never pitches
+  down to a picture of grass: the players around the ball stay in it.
+- *Without the ball*: Reco's density cluster (`FieldPanner::densest_cluster`,
+  private there, so re-implemented: the players within `clusterBandwidthDeg`
+  (17.2°, Reco's 0.30 rad) of the one with the most neighbours), its
+  confidence-weighted centre, `clusterPitchBiasDeg` (2.9°, Reco's 0.05 rad)
+  higher, the zoom fitted to it the same way, the same grass rule; a frame
+  without a group holds the last one.
+- *Change-over*: the share of "ball" in the aim is the following flag
+  (1 inside a piece, 0 outside) averaged over `blendSecs` (1 s), so the
+  camera eases from the ball to the players and back; outside pieces the
+  ball part aims at where the ball was last (or will be next).
+- The widest allowed is the smallest of `fovWideDeg` (58°), the widest
+  view's limit (4.12) and the coverage's `max_fov_degrees`; every target is
+  clamped like the editor clamps (`safe_clamp`, 16:9) before smoothing.
+
+**How it moves** (`smooth`, per channel): a zero-lag dead zone (the average
+of a forward and a backward run that moves only when the target is more than
+`deadZonePanDeg` 1.5° / `deadZoneTiltDeg` 1° / `deadZoneZoomDeg` 2° away),
+then a speed limit (`maxPanDegPerSec` 35, `maxTiltDegPerSec` 12,
+`maxZoomDegPerSec` 6) also run forwards and backwards and averaged (so a big
+move starts before the ball's and ends after it: it looks ahead), then a
+centred average over `smoothSecs` (1 s; `zoomSmoothSecs` 2 s) twice, with
+the ends repeated. The speed limit is the last step that is not an average,
+so the speed stays below the limit and the acceleration below `2 × limit /
+window` (about 70°/s² pan, 24°/s² tilt): no jitter, no jerks. The path is
+`ai_path.bin` as before (world poses, before the editor's zoom and clamp).
+
+**Ball numbers** (`BallStats`, `aiRun.ball`, worked out for every style from
+the recording, for the editor and the log): `detected` (share of the frames
+with any ball detection on the pitch), `seen` (with a sighting on the
+track), `followed` (covered by the track: Follow the ball follows the ball
+there), `sightings`, `rejectedStatic`, `rejectedOther`. The editor
+(`ballWords.ts`) says, under Camera and on the match page: "The AI saw the
+ball in 23% of the match. VeoClone filled short gaps, so the camera follows
+the ball for 61% of it; the rest follows the players." (another style: "This
+camera style follows the players; “Follow the ball” would follow the ball
+for 61% of it."), how many sightings were ignored and how many of them never
+moved, and below 15 % a filming tip. Without numbers: "Run the AI again to
+see how often it saw the ball." A match whose Follow the ball path is still
+Reco's ball mode (an older VeoClone: `aiRun.style` `ball`, no `aiRun.ball`)
+gets a tip under Tips, "New: Follow the ball is smarter." with **Update the
+camera**: a quick re-run in the editor (like a widest view change, 4.12;
+the long way through the match page when the recording can't be used),
+then the new AI path is swapped in; × hides it for that match
+(`veoclone.hint.ballbrain.<id>`).
+
+**Broadcast and the brain's ball**: measured with the dev tool on the
+synthetic footage, Reco's broadcast camera given the brain's ball track
+instead of its own `BallTracker` (`seen::repan_with_ball`) keeps the ball in
+the picture 29.7 % of the time instead of 24.7 % (it blends the ball at
+weight 0.2, and only near the player group). Not a clear gain, and it would
+end the exact replay of the live pass, so Broadcast, Action and Wide stay
+Reco's cameras.
+
+**AI report** (`report.rs`, `GET /api/projects/:id/ai-report`): one zip,
+`veoclone-ai-report/` with `ai_seen.bin.gz`, `ai_seen.json`, `match.json`,
+`calib.json` (if there), `ai_path.bin`, `settings.json` (`ReportSettings`:
+report and brain version, the helper build, style, AI accuracy, the widest
+view in effect, the pitch outline, `straighten` from `edits.json`, fps,
+frame count, `aiRun` with the ball numbers) and a `README.txt`. No video, no
+match name, no file names (the recording only holds boxes and numbers). The
+`.gz` is stored, the rest deflated; about 430 bytes per frame (256 KB for
+the 20 s synthetic match, about 70 MB for 90 minutes, nearly all of it the
+recording). The editor's **Save AI report** (Camera panel and match page,
+`aiReport.ts`) fetches it and saves it as
+`veoclone-ai-report-<date>.zip` (a failure is a message, the page stays).
+
+**Dev tool**: `veoclone-helper --ai-report <zip> [--csv out.csv]
+[--brain-config tune.json] [--truth truth.csv] [--style s]` (no server)
+unpacks a report, runs the same code as the helper's AI step and prints JSON:
+the ball numbers, the time, `sameAsReport.maxDifference` against the
+report's path (0 with the same style and default settings), and with a truth
+CSV (`frame,camera,x,y`: synced frame, `left`/`right`, 0..1 in that camera's
+picture) the share of frames whose picture (after the widest view's limit
+and the clamp, as the editor shows it) contains the ball and the yaw error,
+for this camera, Reco's ball mode (`RecoBallMode`, `seen::repan` still
+replays it), Reco's broadcast camera and broadcast with the brain's ball.
+`--csv` writes `frame,yaw,pitch,fov,ball_yaw,ball_pitch,ball_weight,
+truth_yaw,truth_pitch`. `scripts/ai_report.py` wraps it (summary of the
+recording, `--set name=value` for `BrainConfig` fields, `--json`).
+
+**Verified**: unit tests (`brain::tests`: a moving ball with a more confident
+static false ball in every frame — followed, never the static one, 600
+sightings rejected; a ball lost for 8 s — the camera on the players in the
+gap and back on the ball after; a 2 s gap filled; a confident random false
+ball every 4th frame — ignored, track within 3° always and 1.1° for 98 % of
+frames, ball in the picture > 98 %; framing — a ball near the camera with the
+players farther up keeps them in the picture and the ball in the lower part,
+a ball among players sits 30–50 % up the picture, never wider than 34°;
+smoothness — speed and acceleration bounds hold, a wobbling ball does not
+shake the camera, it moves before a pass; the height fit; the helpers; config
+checks; and `observe` from camera coordinates with a pitch outline and every
+3rd frame), `report::tests` (zip round trip; a report has no match name and
+the dev tool makes exactly its path, scores it against a truth and refuses
+an unknown setting), the API test (404 without a recording, then the zip),
+UI tests (wording unit tests; Follow the ball the default; the numbers in the
+Camera panel and on the match page; Save AI report downloads a zip without
+the match name; the tip for an old Follow the ball path updates it in place;
+no report, a message), and `e2e.py --only ball` with the
+release helper on the synthetic footage (moving white ball, players in the
+picture, a static false "ball" the AI sees in every frame at about 0.14) and
+its true path: the ball in the picture 100 % of 600 frames (Reco's ball mode
+on the same recording 93.8 %, broadcast 24.7 %); camera yaw against the true
+ball median 0.4° (Reco's ball mode 3.8°, broadcast 32.2°; the mean 3.6° and
+largest 16.7° are at the far ends, where the coverage stops the camera
+turning further while the ball stays in the picture); 600 static sightings
+and 41 others ignored, seen 79 %, followed 100 %; the AI pass 86 s, re-runs
+from the recording 0.5 s, the dev script's path identical. `e2e.py --only
+quickwins` and `--only natural` still find every replay exact.
 
 ## 5. Editor engine (`web/src/engine/`) — pure TS, unit tested
 
@@ -1165,9 +1351,17 @@ VeoClone/
   the end of a recording (only gaps and the first part), and a part
   missing in one camera puts the two cameras out of step from there on.
   Not tried with real GoPro chapter files here (no sample files).
-- "Follow the ball" keeps a fixed zoom (Reco's ball mode has no player
-  cluster to size it: 34° with Natural, 40° with Wide or Widest) and holds
-  still when the ball is lost.
+- "Follow the ball" (4.13) can only follow a ball the AI sees: at night or
+  far away the nano model at 640 px finds it in a fraction of the frames, and
+  VeoClone fills gaps of up to 2.5 s only; the rest of the time the camera
+  follows the players. A ball lying still for 1.5 s or more with nothing
+  else seen around it (a free kick, a corner) is treated like a mark on the
+  grass, so the camera frames the players around it. A white boot or sock
+  that the AI takes for a ball and that moves like one can be followed for a
+  moment. The brain was tuned on synthetic streams and the synthetic footage
+  only (its static players and bobbing ball are not a real match); the knobs
+  are in `BrainConfig`, and AI reports from real matches are the way to tune
+  them.
 - With the Natural widest view (4.12) the camera cannot show all the players
   when they spread over more than about 57° across, also with the Wide
   (frame-all) camera style; Widest gives Reco's own range back. The edge

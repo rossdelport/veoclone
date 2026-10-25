@@ -80,6 +80,25 @@ export interface PitchOutline {
   right: [number, number][];
 }
 
+/**
+ * How the AI's sightings of the ball turned out in one AI run (DESIGN.md
+ * 4.13). Shares are of the whole match, 0..1.
+ */
+export interface BallStats {
+  frames: number;
+  /** Frames where the AI found anything it took for a ball on the pitch. */
+  detected: number;
+  /** Frames with a sighting on VeoClone's ball track. */
+  seen: number;
+  /** Frames the ball track covers (short gaps filled in): "Follow the ball" follows the ball here, the players elsewhere. */
+  followed: number;
+  sightings: number;
+  /** Sightings of spots that never moved (a mark or a light on the grass). */
+  rejectedStatic: number;
+  /** Other sightings that were not the ball (jumps no ball can make, lone flickers). */
+  rejectedOther: number;
+}
+
 /** The settings the current AI camera path was made with. */
 export interface AiRun {
   style: Style;
@@ -88,6 +107,8 @@ export interface AiRun {
   pitchId: string | null;
   /** The widest view the AI used; null (or missing): made before the setting existed, i.e. "widest". */
   widestView?: WidestView | null;
+  /** The ball numbers (missing: no record of what the AI saw, or an older VeoClone). */
+  ball?: BallStats | null;
 }
 
 export interface ProbeInfo {
@@ -388,6 +409,11 @@ export const api = {
   openFolder: (id: string, exportId?: string) =>
     request("POST", `${project(id)}/open-folder${exportId ? `?export=${enc(exportId)}` : ""}`).then(() => undefined),
   exportFileUrl: (id: string, exportId: string) => helperUrl(`${project(id)}/exports/${enc(exportId)}/file`),
+  /** The AI report (a zip, DESIGN.md 4.13). */
+  aiReport: async (id: string): Promise<Blob> => {
+    const res = await request("GET", `${project(id)}/ai-report`, undefined, 300_000);
+    return await res.blob();
+  },
 };
 
 // ---------------------------------------------------------------------------

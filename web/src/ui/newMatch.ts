@@ -9,11 +9,18 @@ import { DEFAULT_LENS, initialLens, lensOptions, lensUnavailable, phonesPicker }
 import type { Page, PageContext } from "./page";
 
 export const STYLES: { id: Style; name: string; text: string }[] = [
-  { id: "broadcast", name: "Broadcast", text: "Calm, TV-style camera that follows the play. Best for most matches." },
+  {
+    id: "ball",
+    name: "Follow the ball",
+    text: "Follows the ball like a TV camera, with the players around it in the picture, and the players when the ball can't be seen. Best for most matches.",
+  },
+  { id: "broadcast", name: "Broadcast", text: "Calm camera that follows the main group of players." },
   { id: "action", name: "Action", text: "Follows the ball more closely and zooms in tighter on the action." },
   { id: "frame_all", name: "Wide", text: "Keeps all the players in the picture. Wider and steadier." },
-  { id: "ball", name: "Follow the ball", text: "Keeps the ball in the middle, at a fixed zoom. Try it when the camera wanders off to people next to the pitch." },
 ];
+
+/** New matches (the helper's default too). */
+export const NEW_MATCH_STYLE: Style = "ball";
 
 /** Style picker: four big radio cards. */
 export function stylePicker(value: Style, onChange: (s: Style) => void, name = "style"): HTMLElement {
@@ -179,7 +186,7 @@ function defaultName(): string {
 
 export function newMatchPage(ctx: PageContext): Page {
   ctx.setTitle("New match");
-  let style: Style = "broadcast";
+  let style: Style = NEW_MATCH_STYLE;
   let aiAccuracy: AiAccuracy = "best";
   let widestView: WidestView = "natural";
   let lensId: string | null = DEFAULT_LENS;

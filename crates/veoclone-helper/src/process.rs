@@ -13,6 +13,7 @@ use reco_core::calibration::MatchCalibration;
 use serde::{Deserialize, Serialize};
 
 use crate::ai::{PoseSink, encode_path, fill_path};
+use crate::brain::{self, BallStats, BrainConfig};
 use crate::calib::{BLEND_WIDTH, LensChoice, calib_info, choose_lens};
 use crate::jobs::{Context, JobError, Progress, check_free_space};
 use crate::media::{
@@ -304,10 +305,10 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
     // 4. AI tracking: quick when what the AI saw last time can be used.
     let settings = repan_settings(&meta);
     tracing::info!("Widest view: {}", settings.widest.describe());
-    let path = match usable_recording(ctx, &dir, &meta, summary.sync_offset_frames) {
+    let (path, ball) = match usable_recording(ctx, &dir, &meta, summary.sync_offset_frames) {
         Some(seen) => {
             progress.step(Step::Track, 3, "Using what the AI saw last time");
-            repan_recorded(&dir, &match_path, &meta, &seen, &progress)?
+            repan_recorded(&dir, &match_path, &meta, &seen, &progress, true)?
         }
         None => {
             progress.step(Step::Track, 3, "AI ball tracking");
@@ -319,7 +320,7 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
                 );
                 set_warnings(ctx, id, &warnings);
             }
-            track(
+            let (live, kept) = track(
                 ctx,
                 &dir,
                 &left,
@@ -330,7 +331,27 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
                 frame_count,
                 &progress,
                 cancel,
-            )?
+            )?;
+            // "Follow the ball" is made from what the AI saw; the other
+            // styles only take the ball numbers from it.
+            match kept.then(|| crate::seen::read_meta(&dir)).flatten() {
+                Some(seen) if meta.style.uses_brain() => {
+                    progress.fraction(0.95, Some("Following the ball"));
+                    repan_recorded(&dir, &match_path, &meta, &seen, &progress, false)?
+                }
+                Some(seen) => (live, recorded_ball_stats(&dir, &match_path, &meta, &seen)),
+                None if meta.style.uses_brain() => {
+                    warnings.push(
+                        "VeoClone couldn't keep what the AI saw, so this time the camera \
+                         follows the players instead of the ball. Run the AI again to try once \
+                         more."
+                            .into(),
+                    );
+                    set_warnings(ctx, id, &warnings);
+                    (live, None)
+                }
+                None => (live, None),
+            }
         }
     };
     // Reco's own pairing decides the true length; trust it over the probe.
@@ -355,6 +376,7 @@ pub fn run(ctx: &Context, id: &str, cancel: &AtomicBool) -> Result<(), JobError>
         ai_accuracy: meta.ai_accuracy,
         pitch_id: meta.pitch.as_ref().map(|p| p.id.clone()),
         widest_view: Some(settings.widest),
+        ball,
     };
     store.update(id, |m| {
         m.frame_count = Some(frame_count);
@@ -786,14 +808,17 @@ fn usable_recording(
     ok.then_some(seen)
 }
 
-/// The quick re-run: the AI path from the recording of an earlier AI pass.
+/// The AI path from a recording of what the AI saw (a `quick` re-run, or
+/// "Follow the ball" right after the AI pass): Reco's camera for its
+/// styles, the brain's for "Follow the ball"; and the ball numbers.
 fn repan_recorded(
     dir: &Path,
     match_path: &Path,
     meta: &ProjectMeta,
     seen: &SeenMeta,
     progress: &Progress,
-) -> Result<Vec<[f32; 3]>, JobError> {
+    quick: bool,
+) -> Result<(Vec<[f32; 3]>, Option<BallStats>), JobError> {
     let started = std::time::Instant::now();
     let fail = |e: String| {
         JobError::failed(
@@ -808,19 +833,75 @@ fn repan_recorded(
         crate::seen::remove(dir);
         fail(e.to_string())
     })?;
-    progress.fraction(0.4, Some("Steering the camera again"));
     let settings = repan_settings(meta);
-    let (poses, stats) = crate::seen::repan(&cal, seen, &frames, &settings).map_err(|e| {
-        crate::seen::remove(dir);
-        fail(e)
-    })?;
-    log_stats(&settings, &stats);
+    let (path, ball) = if meta.style.uses_brain() {
+        progress.fraction(0.4, Some("Following the ball"));
+        let (plan, stats) = brain::follow(&cal, seen, &frames, &settings, &BrainConfig::default())
+            .map_err(|e| {
+                crate::seen::remove(dir);
+                fail(e)
+            })?;
+        log_stats(&settings, &stats);
+        (plan.path, Some(plan.stats))
+    } else {
+        progress.fraction(0.4, Some("Steering the camera again"));
+        let (poses, stats) = crate::seen::repan(&cal, seen, &frames, &settings).map_err(|e| {
+            crate::seen::remove(dir);
+            fail(e)
+        })?;
+        log_stats(&settings, &stats);
+        let ball = ball_stats(&cal, seen, &frames, &settings);
+        (fill_path(&poses, seen.frames as usize), ball)
+    };
+    if let Some(b) = &ball {
+        tracing::info!("{}", brain::describe(b));
+    }
     tracing::info!(
-        "Quick re-run: AI path for {} frames made in {:.2} s from what the AI saw",
-        poses.len(),
-        started.elapsed().as_secs_f64()
+        "{}: AI path for {} frames made in {:.2} s from what the AI saw ({})",
+        if quick {
+            "Quick re-run"
+        } else {
+            "Follow the ball"
+        },
+        path.len(),
+        started.elapsed().as_secs_f64(),
+        if meta.style.uses_brain() {
+            "VeoClone's ball tracking"
+        } else {
+            "Reco's camera"
+        }
     );
-    Ok(fill_path(&poses, seen.frames as usize))
+    Ok((path, ball))
+}
+
+/// The ball numbers of a recording, for a style whose camera Reco makes.
+fn ball_stats(
+    cal: &MatchCalibration,
+    seen: &SeenMeta,
+    frames: &[Vec<reco_core::detect::detector::Detection>],
+    settings: &RepanSettings,
+) -> Option<BallStats> {
+    match brain::follow(cal, seen, frames, settings, &BrainConfig::default()) {
+        Ok((plan, _)) => Some(plan.stats),
+        Err(e) => {
+            tracing::warn!("No ball numbers: {e}");
+            None
+        }
+    }
+}
+
+/// [`ball_stats`] of the recording in `dir`, logged.
+fn recorded_ball_stats(
+    dir: &Path,
+    match_path: &Path,
+    meta: &ProjectMeta,
+    seen: &SeenMeta,
+) -> Option<BallStats> {
+    let cal = MatchCalibration::from_file(match_path).ok()?;
+    let frames = crate::seen::read_frames(&dir.join(crate::seen::SEEN_DATA)).ok()?;
+    let stats = ball_stats(&cal, seen, &frames, &repan_settings(meta))?;
+    tracing::info!("{}", brain::describe(&stats));
+    Some(stats)
 }
 
 fn log_stats(settings: &RepanSettings, stats: &RepanStats) {
@@ -848,7 +929,7 @@ fn track(
     frame_count: u64,
     progress: &Progress,
     cancel: &AtomicBool,
-) -> Result<Vec<[f32; 3]>, JobError> {
+) -> Result<(Vec<[f32; 3]>, bool), JobError> {
     let cal = MatchCalibration::from_file(match_path)
         .map_err(|e| JobError::failed("The calibration could not be read.", e))?;
     let model = ctx
@@ -866,14 +947,20 @@ fn track(
         poses: poses.clone(),
         max_frames: frame_count as usize * 2 + 10_000,
     };
-    let preset = meta.style.preset();
-    let mode = meta.style.tracking_mode();
+    // Reco's camera for the style ("Follow the ball": broadcast; VeoClone's
+    // brain then makes its camera from what the AI saw).
+    let reco_style = meta.style.reco();
+    let preset = reco_style.preset();
+    let mode = reco_style.tracking_mode();
     let interval = meta.ai_accuracy.interval();
     // "Mark the pitch" and the widest view (the same settings as a re-run).
-    let settings = repan_settings(meta);
+    let settings = RepanSettings {
+        style: reco_style,
+        ..repan_settings(meta)
+    };
     // The style's preset with the widest view's zoom limit; repan uses the
     // same config, so a recording replays to exactly this path.
-    let panner = crate::seen::panner_config(meta.style, settings.widest);
+    let panner = crate::seen::panner_config(reco_style, settings.widest);
     if let Some(c) = &panner {
         tracing::info!(
             "AI camera zoom: {:.0} to {:.0} deg tall, starting at {:.0} deg",
@@ -883,9 +970,14 @@ fn track(
         );
     }
     tracing::info!(
-        "Camera style: {:?} (Reco {mode:?} tracking, {preset} preset); AI accuracy {:?} (the AI \
-         looks at every {})",
+        "Camera style: {:?} (AI pass with Reco {mode:?} tracking, {preset} preset{}); AI \
+         accuracy {:?} (the AI looks at every {})",
         meta.style,
+        if meta.style.uses_brain() {
+            ", then VeoClone's ball tracking from what the AI saw"
+        } else {
+            ""
+        },
         meta.ai_accuracy,
         if interval == 1 {
             "frame".to_string()
@@ -1089,19 +1181,21 @@ fn track(
         frames: frames as u64,
         sync_offset: cal.sync_offset,
     };
-    match recorded {
+    let kept = match recorded {
         Some(Ok(())) => keep_recording(dir, &cal, &recording, &seen_meta, &settings, &path),
         Some(Err(e)) => {
             tracing::warn!("What the AI saw could not be saved ({e}); re-runs take the long way");
             discard();
+            false
         }
-        None => {}
-    }
-    Ok(path)
+        None => false,
+    };
+    Ok((path, kept))
 }
 
 /// Check the recording against the AI pass (the same settings must give the
 /// same path) and keep it for quick re-runs, replacing the earlier one.
+/// Returns whether it was kept.
 fn keep_recording(
     dir: &Path,
     cal: &MatchCalibration,
@@ -1109,7 +1203,7 @@ fn keep_recording(
     seen: &SeenMeta,
     settings: &RepanSettings,
     live: &[[f32; 3]],
-) {
+) -> bool {
     let started = std::time::Instant::now();
     let checked = crate::seen::read_frames(recording)
         .map_err(|e| e.to_string())
@@ -1147,6 +1241,7 @@ fn keep_recording(
         let _ = std::fs::remove_file(recording);
         crate::seen::remove(dir);
     }
+    saved
 }
 
 /// Fewer frames than expected by more than two seconds' worth.

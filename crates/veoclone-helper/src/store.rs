@@ -25,11 +25,16 @@ pub enum Style {
     Broadcast,
     Action,
     FrameAll,
-    /// "Follow the ball": Reco's ball tracking mode (no player cluster).
+    /// "Follow the ball": VeoClone's own tracking brain (crate::brain),
+    /// made from what the AI saw; the AI pass itself runs Reco's broadcast
+    /// camera ([`Style::reco`]).
     Ball,
 }
 
 impl Style {
+    /// New matches (DESIGN.md 4.13).
+    pub const NEW_MATCH: Style = Style::Ball;
+
     /// Reco FieldPanner preset name. Ball mode starts from the broadcast
     /// preset like reco-gui does; Reco then forces `ball_weight` to 1.0.
     pub fn preset(self) -> &'static str {
@@ -41,10 +46,29 @@ impl Style {
     }
 
     /// Reco's tracking mode: the ball alone, or the players and the ball.
+    /// (`Ball` is Reco's own ball mode, which VeoClone's AI pass no longer
+    /// uses: see [`Style::reco`]; `seen::repan` still replays it, for
+    /// comparisons.)
     pub fn tracking_mode(self) -> reco_autocam::TrackingMode {
         match self {
             Style::Ball => reco_autocam::TrackingMode::Ball,
             _ => reco_autocam::TrackingMode::Field,
+        }
+    }
+
+    /// The camera made by VeoClone's brain from what the AI saw, not by
+    /// Reco.
+    pub fn uses_brain(self) -> bool {
+        self == Style::Ball
+    }
+
+    /// The Reco camera the AI pass runs for this style: its own, or
+    /// broadcast for the brain's style (the path used if what the AI saw
+    /// could not be kept).
+    pub fn reco(self) -> Style {
+        match self {
+            Style::Ball => Style::Broadcast,
+            s => s,
         }
     }
 }
@@ -118,6 +142,10 @@ pub struct AiRun {
     /// The widest view used (none: made before the setting, i.e. Widest).
     #[serde(default)]
     pub widest_view: Option<crate::seen::WidestView>,
+    /// How often the AI saw the ball and how much of the match the ball
+    /// track covers (none: no record of what the AI saw, or an older run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ball: Option<crate::brain::BallStats>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

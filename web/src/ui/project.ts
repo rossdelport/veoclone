@@ -1,6 +1,8 @@
 // Processing view (#/project/:id): steps with progress, warnings, errors,
 // cancel / try again, and adding missing videos.
 import { api, hasVideo, rerunTime, watchProject, widestViewOf, type AiAccuracy, type ApiError, type JobInfo, type JobStep, type ProjectMeta, type Side, type Style, type Upload, type WidestView } from "../api";
+import { aiReportButton } from "./aiReport";
+import { AI_REPORT_HELP, ballWords } from "./ballWords";
 import { button, confirmDialog, describeError, errorBox, notice, progressBar, setProgress, toast } from "./common";
 import { formatBytes, formatTimeLeft, h, icon, setChildren } from "./dom";
 import { dropZone, assignFiles, type DropZone } from "./dropzone";
@@ -310,6 +312,14 @@ export function projectPage(ctx: PageContext, id: string): Page {
           button("Change phone or lens", () => void lensChange(p), { icon: I.pencil }),
           hasVideo(p.files.left) && hasVideo(p.files.right) ? button("Swap left and right", () => void swapSides(true), { variant: "ghost" }) : null,
         ),
+      ),
+      h(
+        "section",
+        { class: "card ai-ball", "data-testid": "ready-ball" },
+        h("h2", null, "The ball"),
+        ballWords(p.aiRun).map((w) => h("p", { class: "small" }, w)),
+        h("p", { class: "muted small" }, AI_REPORT_HELP),
+        h("div", { class: "row" }, aiReportButton(() => p)),
       ),
       rerun,
     );

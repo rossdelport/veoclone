@@ -208,11 +208,12 @@ rename them: VeoClone reads the order from the names.
    sure**. Two different iPhones? Tick **The two phones are different
    models** and choose the iPhone and lens for the **Left phone** and the
    **Right phone**. You can change this later.
-5. **Camera style**: **Broadcast** (calm, like TV; best for most matches),
-   **Action** (follows the ball more closely), **Wide** (keeps all the
-   players in the picture) or **Follow the ball** (keeps the ball itself in
-   the middle at a fixed zoom; try it when the camera keeps drifting back to
-   the middle of the pitch or to people next to it). You can change it later.
+5. **Camera style**: **Follow the ball** (the default and best for most
+   matches: follows the ball like a TV camera, with the players around it in
+   the picture, and follows the players when the ball can't be seen),
+   **Broadcast** (a calm camera that follows the main group of players),
+   **Action** (follows the ball more closely and zooms in tighter) or
+   **Wide** (keeps all the players in the picture). You can change it later.
    **Widest view**: how far the camera may zoom out, for example when the
    play goes to the far corner. **Natural (like Veo)** (the default) stays
    close to the play, so the sides of the picture never look stretched;
@@ -259,6 +260,15 @@ rename them: VeoClone reads the order from the names.
   **Cut out a section** removes a part, for example half-time.
 - **Zoom** (under **Camera**) makes the whole video wider or closer.
   **Smoothness** calms down quick camera moves.
+- Under **Camera** VeoClone also says how often the AI saw the ball, for
+  example: "The AI saw the ball in 23% of the match. VeoClone filled short
+  gaps, so the camera follows the ball for 61% of it; the rest follows the
+  players." It also says how many things it ignored because they weren't the
+  ball (a white mark or a light on the grass that never moves, a spare ball).
+- **Save AI report** (under **Camera**, and on the match page): saves one
+  small file with what the AI saw in this match: boxes and numbers, no video,
+  no match name, no file names. If the camera lost the ball, send it to the
+  VeoClone developers so they can make the camera better.
 - **Widest view** (under **Camera**): **Natural (like Veo)**, **Wide** or
   **Widest**. Neither the Zoom slider nor a fix zooms out further than it
   allows (zooming in is not limited). Changing it shows at once and runs the
@@ -430,11 +440,28 @@ rename them: VeoClone reads the order from the names.
 **The camera keeps going back to the middle (the halfway line), or to people next to the pitch**
 - **Mark the pitch** in the editor and run the AI again, so people outside
   the pitch don't pull the camera away.
-- Try the **Follow the ball** camera style. It follows the ball itself
-  rather than the group of players. If the ball is hard to see (small, far
-  away, against a crowd), the camera may stop when it loses the ball.
+- Use the **Follow the ball** camera style (the default for new matches).
+  It follows the ball itself, and the main group of players while the ball
+  can't be seen.
 - Use **AI accuracy: Best** so the AI looks at every frame.
 - For moments it still gets wrong, add a fix (drag the picture).
+
+**The camera loses the ball, or looks at the grass (for example at night)**
+- Look under **Camera** in the editor: it says how often the AI saw the
+  ball. In the dark, or far away, the ball is small and dim, and the AI
+  finds it in only part of the match. VeoClone fills short gaps (up to about
+  2½ seconds) and follows the players for the rest, so the camera stays on
+  the play.
+- Things on the grass that look like a ball but never move (a white mark, a
+  light, a spare ball by the goal) are ignored, and the camera keeps the
+  players around the ball in the picture instead of looking down at the
+  grass. A match made with an older VeoClone shows a tip under **Tips**
+  ("New: Follow the ball is smarter"): click **Update the camera** and it
+  takes a few seconds; your trims, fixes and text are kept.
+- Use **AI accuracy: Best**, film in good light, and put the phones up high
+  and not too far from the pitch.
+- Still wrong? Click **Save AI report** and send the file to the VeoClone
+  developers, and add fixes (drag the picture) where it matters.
 
 **GoPro: "A part seems to be missing" or "These files seem to come from different recordings"**
 - All the files of one GoPro recording end in the same four numbers
@@ -518,7 +545,8 @@ npm run mock   # a pretend helper for editor work (see web/dev/README.md)
 The AI models come from Reco's
 [v0.5.2 release](https://github.com/reco-project/video-stitcher/releases/tag/v0.5.2).
 Helper options: `--port`, `--data-dir`, `--web-dir`, `--model`,
-`--allow-origin`, `--no-open`, `--minimized`, `--version`.
+`--allow-origin`, `--no-open`, `--minimized`, `--version`; for developers,
+`--ai-report <zip>` runs the AI camera again from an AI report (see below).
 Builds made by CI carry their commit and date (`VEOCLONE_BUILD_SHA`,
 `VEOCLONE_BUILD_DATE`) and update themselves from the `helper-latest`
 release's `latest.json`; local builds are development builds and never do
@@ -531,6 +559,21 @@ cargo test -p veoclone-helper
 cargo test -p veoclone-helper -- --ignored export_frame_alignment   # needs ffmpeg and a GPU (llvmpipe works)
 python3 crates/veoclone-helper/scripts/update_e2e.py   # self-update: two builds, a pretend release, a real restart (Linux)
 cd web && npm run typecheck && npm test && npm run test:ui
+```
+
+**Tuning the camera with real matches**: users save an **AI report** (a zip
+with what the AI saw, the calibration, the settings and the camera path; no
+video). `crates/veoclone-helper/scripts/ai_report.py` opens one and runs the
+"Follow the ball" brain again with the helper's own code: it prints the ball
+numbers, checks the path is exactly the report's, writes the path as CSV, and
+with `--set name=value` tries other brain settings (the `BrainConfig` names in
+[brain.rs](crates/veoclone-helper/src/brain.rs)). With `--truth` (a CSV of
+where the ball really was) it scores this camera against Reco's ball mode and
+broadcast camera:
+
+```bash
+python3 crates/veoclone-helper/scripts/ai_report.py report.zip --csv path.csv
+python3 crates/veoclone-helper/scripts/ai_report.py report.zip --set gapSecs=3.5 --set staticSecs=2
 ```
 
 **CI, downloads and hosting** (details in

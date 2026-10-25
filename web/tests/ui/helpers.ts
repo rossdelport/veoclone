@@ -34,7 +34,8 @@ export interface MockState {
     aiAccuracy?: string;
     widestView?: string | null;
     pitch?: { id: string; points: [number, number][]; left: [number, number][]; right: [number, number][] } | null;
-    aiRun?: { style: string; aiAccuracy: string; pitchId: string | null; widestView?: string | null } | null;
+    aiRun?: { style: string; aiAccuracy: string; pitchId: string | null; widestView?: string | null; ball?: Record<string, number> | null } | null;
+    aiSeen?: { every: number } | null;
     warnings: string[];
     files: { left?: MockFile; right?: MockFile };
     exports: { id: string; status: string }[];
@@ -51,6 +52,7 @@ export interface MockState {
       export: { width: number };
     }
   >;
+  aiReports: number;
   lastExport: null | {
     segments: { startFrame: number; endFrame: number }[];
     width: number;

@@ -28,6 +28,7 @@
 // settings the editor sent.
 import { createReadStream, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
+import { crc32 } from "node:zlib";
 import { dirname, extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -57,7 +58,7 @@ const PROXY = join(FIX, "proxy.mp4");
 let projects = new Map();
 /** @type {Map<string, any>} */
 let edits = new Map();
-let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [], aiPathGets: 0 };
+let mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [], aiPathGets: 0, aiReports: 0 };
 const timers = new Map(); // project id -> interval
 const uploads = new Map(); // project id -> uploads in progress
 const previous = new Map(); // project id -> the ready result a re-run started from
@@ -83,7 +84,43 @@ function probe(name) {
   };
 }
 
-function newProject({ name, lensId = null, rightLensId = null, style = "broadcast", aiAccuracy = "best", widestView = "natural" }) {
+/** The ball numbers of an AI run (the real helper's brain::BallStats), the same for every match. */
+const BALL_STATS = { frames: FRAME_COUNT, detected: 0.31, seen: 0.23, followed: 0.61, sightings: 4210, rejectedStatic: 1890, rejectedOther: 312 };
+
+/** A zip of stored files (what the real helper's AI report holds, in miniature). */
+function zip(files) {
+  const local = [];
+  const central = [];
+  let offset = 0;
+  for (const [name, text] of files) {
+    const data = Buffer.from(text);
+    const nameBuf = Buffer.from(name);
+    const head = Buffer.alloc(26);
+    head.writeUInt16LE(20, 0); // version needed
+    head.writeUInt16LE(0x0800, 2); // UTF-8 names
+    head.writeUInt16LE(0, 4); // stored
+    head.writeUInt32LE(0, 6); // time, date
+    head.writeUInt32LE(crc32(data), 10);
+    head.writeUInt32LE(data.length, 14);
+    head.writeUInt32LE(data.length, 18);
+    head.writeUInt16LE(nameBuf.length, 22);
+    local.push(Buffer.from([0x50, 0x4b, 3, 4]), head, nameBuf, data);
+    const tail = Buffer.alloc(14); // comment, disk, internal, external, offset
+    tail.writeUInt32LE(offset, 10);
+    central.push(Buffer.from([0x50, 0x4b, 1, 2, 20, 0]), head, tail, nameBuf);
+    offset += 4 + head.length + nameBuf.length + data.length;
+  }
+  const dir = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(dir.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...local, dir, end]);
+}
+
+function newProject({ name, lensId = null, rightLensId = null, style = "ball", aiAccuracy = "best", widestView = "natural" }) {
   const t = now();
   return {
     id: newId(), name, createdAt: t, updatedAt: t, lensId, rightLensId, style, aiAccuracy, widestView, pitch: null, aiRun: null, aiSeen: null, status: "new",
@@ -206,7 +243,7 @@ function startProcess(p) {
     onDone: () => {
       previous.delete(p.id);
       madeWith.set(p.id, p.style);
-      p.aiRun = { style: p.style, aiAccuracy: p.aiAccuracy ?? "best", pitchId: p.pitch?.id ?? null, widestView: p.widestView ?? "widest" };
+      p.aiRun = { style: p.style, aiAccuracy: p.aiAccuracy ?? "best", pitchId: p.pitch?.id ?? null, widestView: p.widestView ?? "widest", ball: BALL_STATS };
       // Like the real helper: what the AI saw is kept for quick re-runs.
       p.aiSeen = { every: p.aiAccuracy === "faster" ? 3 : 1 };
       p.status = "ready";
@@ -491,7 +528,7 @@ async function handle(req, res) {
       timers.clear();
       projects = new Map();
       edits = new Map();
-      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [], aiPathGets: 0 };
+      mock = { lastExport: null, editsPuts: 0, openFolder: [], failedOnce: new Set(), swaps: 0, pitchPuts: 0, uploads: [], aiPathGets: 0, aiReports: 0 };
       uploads.clear();
       previous.clear();
       if (url.searchParams.has("seed")) seed();
@@ -535,7 +572,7 @@ async function handle(req, res) {
       if (body.aiAccuracy !== undefined && body.aiAccuracy !== null && !ACCURACY.includes(body.aiAccuracy)) return fail(res, 400, "Unknown AI accuracy.");
       if (body.widestView !== undefined && body.widestView !== null && !WIDEST.includes(body.widestView)) return fail(res, 400, "Unknown widest view.");
       if (body.lensId === undefined) body.lensId = null;
-      const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, rightLensId: body.rightLensId ?? null, style: body.style ?? "broadcast", aiAccuracy: body.aiAccuracy ?? "best", widestView: body.widestView ?? "natural" });
+      const p = newProject({ name: body.name.trim(), lensId: body.lensId ?? null, rightLensId: body.rightLensId ?? null, style: body.style ?? "ball", aiAccuracy: body.aiAccuracy ?? "best", widestView: body.widestView ?? "natural" });
       projects.set(p.id, p);
       return send(res, 201, p);
     }
@@ -559,6 +596,14 @@ async function handle(req, res) {
       if (body?.widestView && !WIDEST.includes(body.widestView)) return fail(res, 400, "Unknown widest view.");
       if ((body?.lensId !== undefined || body?.rightLensId !== undefined || body?.style || body?.aiAccuracy || body?.widestView) && busy(p)) return fail(res, 409, BUSY);
       if (typeof body?.name === "string") p.name = body.name.trim() || p.name;
+      // Test hook: the record of what the AI saw is gone (no AI report, no quick re-runs).
+      if (body?.mockNoSeen) p.aiSeen = null;
+      // Test hook: Follow the ball made by an older VeoClone (Reco's ball mode, no ball numbers).
+      if (body?.mockOldBallCamera && p.aiRun) {
+        p.style = "ball";
+        p.aiRun = { ...p.aiRun, style: "ball" };
+        delete p.aiRun.ball;
+      }
       if (body && "lensId" in body && body.lensId !== p.lensId) {
         p.lensId = body.lensId;
         delete p.calibration; // the next "process" lines the videos up again
@@ -673,6 +718,18 @@ async function handle(req, res) {
       if (p.status !== "ready") return fail(res, 404, "This match has not been processed yet.");
       mock.aiPathGets++;
       return send(res, 200, aiPathFor(p.aiRun?.widestView), { "Content-Type": "application/octet-stream" });
+    case "GET ai-report": {
+      // Like the real helper (report.rs): needs a record of what the AI saw.
+      if (!p.aiSeen) return fail(res, 404, "There is no AI report for this match yet: VeoClone has no record of what the AI saw. Run the AI again (Change the camera style, or Try again), then save the report.");
+      if (busy(p)) return fail(res, 409, BUSY);
+      mock.aiReports++;
+      const settings = { version: 1, helper: "mock", brain: 1, style: p.style, aiAccuracy: p.aiAccuracy ?? "best", widestView: p.widestView ?? "widest", pitch: p.pitch, aiRun: p.aiRun };
+      const day = new Date().toISOString().slice(0, 10);
+      return send(res, 200, zip([["veoclone-ai-report/settings.json", JSON.stringify(settings, null, 2)], ["veoclone-ai-report/README.txt", "VeoClone AI report (mock)\n"]]), {
+        "Content-Type": "application/zip",
+        "Content-Disposition": `attachment; filename="veoclone-ai-report-${day}.zip"`,
+      });
+    }
     case "GET edits":
       return send(res, 200, edits.get(p.id) ?? {});
     case "PUT edits": {

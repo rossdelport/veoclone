@@ -173,6 +173,7 @@ pub fn router(state: AppState, port: u16, origins: &[String], web_dir: &Path) ->
         .route("/projects/{id}/calibration", get(calibration))
         .route("/projects/{id}/proxy.mp4", get(proxy))
         .route("/projects/{id}/ai-path.bin", get(ai_path))
+        .route("/projects/{id}/ai-report", get(ai_report))
         .route("/projects/{id}/edits", get(get_edits).put(put_edits))
         .route("/projects/{id}/pitch", put(put_pitch).delete(delete_pitch))
         .route("/projects/{id}/exports", post(create_export))
@@ -396,7 +397,7 @@ async fn create_project(State(s): State<AppState>, body: Body) -> ApiResult<Resp
         updated_at: now,
         lens_id: Some(lens_id),
         right_lens_id: req.right_lens_id,
-        style: req.style.unwrap_or(Style::Broadcast),
+        style: req.style.unwrap_or(Style::NEW_MATCH),
         ai_accuracy: req.ai_accuracy.unwrap_or_default(),
         widest_view: Some(
             req.widest_view
@@ -941,6 +942,37 @@ async fn ai_path(
     Ok(res)
 }
 
+/// The AI report (DESIGN.md 4.13): one zip with what the AI saw, the
+/// calibration, the settings and the AI path, for tuning the camera.
+async fn ai_report(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiResult<Response> {
+    let meta = project(&s, &id)?;
+    if s.jobs.busy(&id) {
+        return Err(ApiError::conflict(BUSY));
+    }
+    let dir = s.store.project_dir(&id);
+    let helper = s.updater.build().to_json().to_string();
+    let built = tokio::task::spawn_blocking(move || crate::report::build(&dir, &meta, &helper))
+        .await
+        .map_err(|e| ApiError::internal("We couldn't make the AI report.", e))?;
+    match built {
+        Ok(bytes) => {
+            let mut res = Response::new(Body::from(bytes));
+            let h = res.headers_mut();
+            h.insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+            h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            if let Ok(v) = HeaderValue::from_str(&content_disposition(&crate::report::file_name()))
+            {
+                h.insert(CONTENT_DISPOSITION, v);
+            }
+            Ok(res)
+        }
+        Err(crate::report::ReportError::Missing(m)) => Err(ApiError::new(StatusCode::NOT_FOUND, m)),
+        Err(crate::report::ReportError::Failed(e)) => {
+            Err(ApiError::internal("We couldn't make the AI report.", e))
+        }
+    }
+}
+
 async fn get_edits(State(s): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiResult<Response> {
     project(&s, &id)?;
     let bytes = tokio::fs::read(s.store.project_dir(&id).join("edits.json"))
@@ -1439,7 +1471,7 @@ mod tests {
             assert!(v(&b)["diskBytes"].as_u64().unwrap() >= 100_010);
 
             // Not processed yet.
-            for path in ["calibration", "proxy.mp4", "ai-path.bin"] {
+            for path in ["calibration", "proxy.mp4", "ai-path.bin", "ai-report"] {
                 let (code, _, b) =
                     call(&app, "GET", &format!("/api/projects/{id}/{path}"), &[], "").await;
                 assert_eq!(code, StatusCode::NOT_FOUND, "{path}");
@@ -1544,6 +1576,31 @@ mod tests {
             .await;
             assert_eq!(h[CONTENT_TYPE], "application/json");
             assert_eq!(v(&b)["frameCount"], 2);
+
+            // The AI report, once there is a record of what the AI saw: a
+            // zip without the match's name.
+            let report = format!("/api/projects/{id}/ai-report");
+            let (code, _, b) = call(&app, "GET", &report, &[], "").await;
+            assert_eq!(code, StatusCode::NOT_FOUND);
+            assert!(v(&b)["error"].as_str().unwrap().contains("no AI report"));
+            std::fs::write(dir.join("ai_seen.bin.gz"), b"seen").unwrap();
+            std::fs::write(dir.join("ai_seen.json"), b"{}").unwrap();
+            std::fs::write(dir.join("match.json"), b"{}").unwrap();
+            let (code, h, b) = call(&app, "GET", &report, &[], "").await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(h[CONTENT_TYPE], "application/zip");
+            let cd = h[CONTENT_DISPOSITION].to_str().unwrap();
+            assert!(
+                cd.starts_with("attachment; filename=\"veoclone-ai-report-"),
+                "{cd}"
+            );
+            let zip = dir.join("../report-test.zip");
+            std::fs::write(&zip, &b).unwrap();
+            let out = dir.join("../report-test");
+            let names = crate::unzip::extract(&zip, crate::report::PREFIX, &out).unwrap();
+            assert!(names.contains(&"settings.json".to_string()), "{names:?}");
+            let settings = std::fs::read_to_string(out.join("settings.json")).unwrap();
+            assert!(!settings.contains(&st.store.get(&id).unwrap().name));
 
             // A finished export downloads as an attachment with ranges.
             let eid = "e1abc".to_string();

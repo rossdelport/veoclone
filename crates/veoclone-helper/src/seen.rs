@@ -266,7 +266,8 @@ impl SeenWriter {
         })
     }
 
-    fn record(&mut self, camera: CameraId, detections: &[Detection]) {
+    /// Record what one `detect()` call returned.
+    pub fn record(&mut self, camera: CameraId, detections: &[Detection]) {
         if camera == CameraId::Left {
             self.frames += 1;
         }
@@ -506,6 +507,58 @@ impl UnifiedDetector for Replay {
     }
 }
 
+/// The detector chain after the recorder ([`wrap_detector`]) on recorded
+/// detections: the pitch outline (Reco's `RoiFilteredDetector` with the
+/// person anchored at the feet, as `setup_autocam` installs it).
+pub struct PitchFilter {
+    shared: Arc<Mutex<Vec<Detection>>>,
+    filter: Box<dyn UnifiedDetector>,
+    width: u32,
+    height: u32,
+}
+
+impl PitchFilter {
+    /// `width`/`height`: the left camera's picture (what the session's
+    /// detector frames say; the filter does not look at the pixels).
+    pub fn new(roi: Option<FieldRoi>, roi_person: u16, width: u32, height: u32) -> PitchFilter {
+        let shared = Arc::new(Mutex::new(Vec::new()));
+        let mut filter: Box<dyn UnifiedDetector> = Box::new(Replay(shared.clone()));
+        if let Some(roi) = roi {
+            filter = Box::new(
+                reco_autocam::RoiFilteredDetector::new(filter, roi)
+                    .with_class_anchor(roi_person, reco_autocam::RoiAnchor::Bottom),
+            );
+        }
+        PitchFilter {
+            shared,
+            filter,
+            width,
+            height,
+        }
+    }
+
+    /// The detections on the pitch: the left camera's, then the right
+    /// camera's, in their recorded order.
+    pub fn apply(&mut self, found: Vec<Detection>) -> Result<Vec<Detection>, String> {
+        *self.shared.lock().unwrap_or_else(|e| e.into_inner()) = found;
+        let frame = DetectorFrame::Cpu(RawFrame {
+            y: &[],
+            chroma: ChromaFormat::Nv12 { uv: &[] },
+            width: self.width,
+            height: self.height,
+        });
+        let mut kept = Vec::new();
+        for camera in [CameraId::Left, CameraId::Right] {
+            kept.extend(
+                self.filter
+                    .detect(camera, &frame)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(kept)
+    }
+}
+
 /// One pose per frame (`[yaw, pitch, fov]`), as the AI pass records them.
 pub type Poses = Vec<Option<[f32; 3]>>;
 
@@ -516,6 +569,29 @@ pub fn repan(
     meta: &SeenMeta,
     frames: &[Vec<Detection>],
     settings: &RepanSettings,
+) -> Result<(Poses, RepanStats), String> {
+    repan_inner(cal, meta, frames, settings, None)
+}
+
+/// [`repan`] with the ball Reco's camera sees replaced by another ball
+/// track (per frame; `None`: no ball), for measuring what a better ball
+/// track would do to Reco's camera styles (the AI report tool).
+pub fn repan_with_ball(
+    cal: &MatchCalibration,
+    meta: &SeenMeta,
+    frames: &[Vec<Detection>],
+    settings: &RepanSettings,
+    ball: &[Option<[f32; 2]>],
+) -> Result<(Poses, RepanStats), String> {
+    repan_inner(cal, meta, frames, settings, Some(ball))
+}
+
+fn repan_inner(
+    cal: &MatchCalibration,
+    meta: &SeenMeta,
+    frames: &[Vec<Detection>],
+    settings: &RepanSettings,
+    track: Option<&[Option<[f32; 2]>]>,
 ) -> Result<(Poses, RepanStats), String> {
     let n = meta.frames as usize;
     if settings.every == 0 || !settings.every.is_multiple_of(meta.every) {
@@ -535,21 +611,12 @@ pub fn repan(
     let ball_mode = settings.style == Style::Ball;
 
     // The detector chain after the recorder (wrap_detector), on a replay.
-    let shared = Arc::new(Mutex::new(Vec::new()));
-    let mut filter: Box<dyn UnifiedDetector> = Box::new(Replay(shared.clone()));
-    if let Some(roi) = settings.roi.clone() {
-        filter = Box::new(
-            reco_autocam::RoiFilteredDetector::new(filter, roi)
-                .with_class_anchor(classes.roi_person, reco_autocam::RoiAnchor::Bottom),
-        );
-    }
-    let empty = RawFrame {
-        y: &[],
-        chroma: ChromaFormat::Nv12 { uv: &[] },
-        width: cal.left.width,
-        height: cal.left.height,
-    };
-    let frame = DetectorFrame::Cpu(empty);
+    let mut filter = PitchFilter::new(
+        settings.roi.clone(),
+        classes.roi_person,
+        cal.left.width,
+        cal.left.height,
+    );
 
     // The pipeline's scene (render/pipeline.rs StitchPipeline::with_gpu).
     let scene = SceneGeometry::from_layout_with_aspect(
@@ -600,18 +667,14 @@ pub fn repan(
     for i in 0..n as u64 {
         if i.is_multiple_of(settings.every) {
             let raw = &frames[(i / meta.every) as usize];
-            let mut found: Vec<Detection> = raw
+            let found: Vec<Detection> = raw
                 .iter()
                 .filter(|d| !ball_mode || d.confidence >= BALL_CONFIDENCE)
                 .cloned()
                 .collect();
             stats.seen += raw.len() as u64;
             let before = found.len() as u64;
-            *shared.lock().unwrap_or_else(|e| e.into_inner()) = found;
-            found = Vec::new();
-            for camera in [CameraId::Left, CameraId::Right] {
-                found.extend(filter.detect(camera, &frame).map_err(|e| e.to_string())?);
-            }
+            let found = filter.apply(found)?;
             stats.outside_pitch += before - found.len() as u64;
             stats.kept += found.len() as u64;
             last = found.iter().map(map).collect();
@@ -623,6 +686,20 @@ pub fn repan(
         }
         ball.observe_world(&world);
         world.ball = ball.update(&last, 0.0).into_iter().next();
+        if let Some(track) = track {
+            world.ball = track.get(i as usize).copied().flatten().map(|b| {
+                reco_core::detect::tracker::TrackedEntity {
+                    id: 0,
+                    class_id: classes.ball,
+                    yaw: b[0],
+                    pitch: b[1],
+                    confidence: 1.0,
+                    state: reco_core::detect::tracker::TrackState::Tracking,
+                    age_frames: 1,
+                    origin: CameraId::Left,
+                }
+            });
+        }
         worlds.push(world);
     }
 

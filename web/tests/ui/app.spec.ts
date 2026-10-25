@@ -83,9 +83,10 @@ test("camera style: Follow the ball, when creating a match and when running the 
   await open(page, "/new");
   const styles = page.getByRole("radiogroup", { name: "Camera style" });
   await expect(styles.getByRole("radio")).toHaveCount(4);
-  await expect(styles.getByRole("radio", { name: /Broadcast/ })).toBeChecked(); // still the default
-  await expect(styles.getByText("Follow the ball", { exact: true })).toBeVisible();
-  await expect(styles).toContainText("Keeps the ball in the middle");
+  // VeoClone's own ball tracking is the default, and first.
+  await expect(styles.getByRole("radio").first()).toHaveAttribute("value", "ball");
+  await expect(styles.getByRole("radio", { name: /Follow the ball/ })).toBeChecked();
+  await expect(styles).toContainText("Follows the ball like a TV camera");
   await createMatch(page, "Ball match", "Follow the ball");
   expect((await mockState()).projects[0].style).toBe("ball");
   await expect(page).toHaveURL(/#\/edit\/\w+/, { timeout: 30_000 });
@@ -97,6 +98,76 @@ test("camera style: Follow the ball, when creating a match and when running the 
   await page.getByRole("radiogroup", { name: "Camera style" }).getByText("Broadcast", { exact: true }).click();
   await page.getByRole("button", { name: "Run the AI again" }).click();
   await expect.poll(async () => (await mockState()).projects[0].style).toBe("broadcast");
+});
+
+test("the ball: how often the AI saw it, and the AI report", async ({ page }) => {
+  await resetMock(true);
+  // A match from an older VeoClone has no ball numbers yet.
+  const example = (await mockState()).projects[0].id;
+  await open(page, `/edit/${example}`);
+  await expectPicture(page);
+  await tool(page, "Camera");
+  await expect(page.getByTestId("ball-words")).toHaveText("Run the AI again to see how often it saw the ball.");
+
+  // A new match: Follow the ball, with the ball numbers in plain words.
+  await createMatch(page, "Night match", "Follow the ball");
+  await expect(page).toHaveURL(/#\/edit\/\w+/, { timeout: 30_000 });
+  const id = (await mockState()).projects.find((p) => p.name === "Night match")!.id;
+  await tool(page, "Camera");
+  const words = page.getByTestId("ball-words");
+  await expect(words).toContainText(
+    "The AI saw the ball in 23% of the match. VeoClone filled short gaps, so the camera follows the ball for 61% of it; the rest follows the players.",
+  );
+  await expect(words).toContainText("VeoClone ignored 2,202 sightings that weren't the ball, 1,890 of them spots that never moved");
+  await shot(page, "ball-01-camera-panel");
+
+  // "Save AI report" downloads one small zip, without the match name.
+  const [file] = await Promise.all([page.waitForEvent("download"), page.getByTestId("ai-report").click()]);
+  expect(file.suggestedFilename()).toMatch(/^veoclone-ai-report-\d{4}-\d{2}-\d{2}\.zip$/);
+  const zip = readFileSync((await file.path())!);
+  expect(zip.subarray(0, 2).toString()).toBe("PK");
+  expect(zip.includes(Buffer.from("veoclone-ai-report/settings.json"))).toBe(true);
+  expect(zip.includes(Buffer.from("Night match"))).toBe(false);
+  expect((await mockState()).aiReports).toBe(1);
+
+  // Another style: the numbers point to Follow the ball; and the match page has the report too.
+  await open(page, `/project/${id}`);
+  const ready = page.getByTestId("ready-ball");
+  await expect(ready).toContainText("The AI saw the ball in 23% of the match.");
+  const [again] = await Promise.all([page.waitForEvent("download"), ready.getByTestId("ai-report").click()]);
+  expect(again.suggestedFilename()).toMatch(/^veoclone-ai-report-.*\.zip$/);
+  await page.getByText("Change the camera style").click();
+  await page.getByRole("radiogroup", { name: "Camera style" }).getByText("Broadcast", { exact: true }).click();
+  await page.getByRole("button", { name: "Run the AI again" }).click();
+  await expect.poll(async () => (await mockState()).projects.find((p) => p.id === id)!.aiRun?.style, { timeout: 30_000 }).toBe("broadcast");
+  await open(page, `/project/${id}`);
+  await expect(page.getByTestId("ready-ball")).toContainText("This camera style follows the players; “Follow the ball” would follow the ball for 61% of it.");
+  await shot(page, "ball-02-match-page");
+
+  // Follow the ball made by an older VeoClone: a tip offers the new one, in seconds.
+  await patchProject(id, { mockOldBallCamera: true });
+  const gets = (await mockState()).aiPathGets;
+  await open(page, `/edit/${id}`);
+  await expectPicture(page);
+  const hint = page.getByTestId("ball-hint");
+  await expect(page.getByRole("tab", { name: "Tips" })).toHaveAttribute("aria-selected", "true");
+  await expect(hint).toContainText("New: Follow the ball is smarter.");
+  await expect(hint).toContainText("This takes a few seconds");
+  await shot(page, "ball-03-tip");
+  await hint.getByRole("button", { name: "Update the camera" }).click();
+  await expect(page.getByText("Done: the camera now follows the ball the new way.")).toBeVisible({ timeout: 30_000 });
+  await expect(hint).toHaveCount(0);
+  expect((await mockState()).aiPathGets).toBeGreaterThan(gets + 1); // the new AI path is in the editor
+  await expect(page).toHaveURL(new RegExp(`#/edit/${id}`)); // without leaving it
+  await tool(page, "Camera");
+  await expect(page.getByTestId("ball-words")).toContainText("the camera follows the ball for 61% of it");
+
+  // Without a record of what the AI saw there is no report: VeoClone says so and stays put.
+  await patchProject(id, { mockNoSeen: true });
+  await open(page, `/project/${id}`);
+  await page.getByTestId("ready-ball").getByTestId("ai-report").click();
+  await expect(page.locator(".toast-error")).toContainText("There is no AI report for this match yet");
+  await expect(page).toHaveURL(new RegExp(`#/project/${id}`));
 });
 
 test("AI accuracy: every frame by default, every 3rd frame when chosen, and changed later", async ({ page }) => {

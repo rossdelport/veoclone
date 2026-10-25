@@ -4,12 +4,14 @@
 
 mod ai;
 mod api;
+mod brain;
 mod calib;
 mod export;
 mod jobs;
 mod logging;
 mod media;
 mod process;
+mod report;
 mod seen;
 mod settings;
 mod shortcuts;
@@ -62,6 +64,53 @@ struct Args {
     /// Every future version must accept it (DESIGN.md 4.11).
     #[arg(long, hide = true, value_name = "BUILD")]
     updated_from: Option<String>,
+    /// Developers: run the AI camera again from an AI report (the zip the
+    /// editor saves), print what came out as JSON and exit (no server).
+    /// See scripts/ai_report.py.
+    #[arg(long, value_name = "ZIP")]
+    ai_report: Option<PathBuf>,
+    /// With --ai-report: write the camera path and the ball track as CSV.
+    #[arg(long, value_name = "CSV", requires = "ai_report")]
+    csv: Option<PathBuf>,
+    /// With --ai-report: a JSON file of brain settings to change.
+    #[arg(long, value_name = "JSON", requires = "ai_report")]
+    brain_config: Option<PathBuf>,
+    /// With --ai-report: where the ball really was (CSV frame,camera,x,y).
+    #[arg(long, value_name = "CSV", requires = "ai_report")]
+    truth: Option<PathBuf>,
+    /// With --ai-report: another camera style (broadcast, action, frame_all, ball).
+    #[arg(long, value_name = "STYLE", requires = "ai_report")]
+    style: Option<String>,
+}
+
+/// `--ai-report`: the developers' tool (crate::report::tool).
+fn ai_report_tool(args: &Args) -> ! {
+    let run = || -> Result<serde_json::Value, String> {
+        let style = match &args.style {
+            Some(s) => Some(
+                serde_json::from_value(serde_json::Value::String(s.clone()))
+                    .map_err(|_| format!("unknown style {s}"))?,
+            ),
+            None => None,
+        };
+        report::tool(&report::ToolArgs {
+            report: args.ai_report.clone().unwrap_or_default(),
+            csv: args.csv.clone(),
+            brain_config: args.brain_config.clone(),
+            truth: args.truth.clone(),
+            style,
+        })
+    };
+    match run() {
+        Ok(out) => {
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("veoclone-helper --ai-report: {e}");
+            std::process::exit(2)
+        }
+    }
 }
 
 /// `--version`: the version number and the build.
@@ -187,6 +236,9 @@ fn main() {
     let version: &'static str = Box::leak(version_text(&build).into_boxed_str());
     let args = Args::from_arg_matches(&Args::command().version(version).get_matches())
         .unwrap_or_else(|e| e.exit());
+    if args.ai_report.is_some() {
+        ai_report_tool(&args);
+    }
     if args.minimized {
         shortcuts::minimize_console();
     }

@@ -7,14 +7,22 @@ frame by frame), and exercises cancel, delete, restart recovery, re-runs
 that keep the earlier result, lens choices, swapping left and right, the
 single-instance check, CORS and the Host check. Then the same videos split
 into GoPro-style chapter files, sent as parts, against the one-file match
-frame for frame, and the "Widest view" zoom limit (the AI pass, a quick
-re-run and the editor's final path). Python 3 standard library only; needs
-ffmpeg and ffprobe on PATH (and node with web/node_modules for the editor's
-final path check).
+frame for frame, the "Widest view" zoom limit (the AI pass, a quick re-run
+and the editor's final path), and "Follow the ball" (VeoClone's tracking
+brain, DESIGN.md 4.13): its path against where the ball really was
+(--ball-truth), quick re-runs, the ball numbers and the AI report with
+scripts/ai_report.py making the same path from it. Python 3 standard library
+only; needs ffmpeg and ffprobe on PATH (and node with web/node_modules for
+the editor's final path check).
 
 Usage:
   e2e.py --helper target/release/veoclone-helper --left L.mp4 --right R.mp4 \
-         --model models/yolo26n_640.onnx --work /tmp/veoclone-e2e
+         --model models/yolo26n_640.onnx --work /tmp/veoclone-e2e \
+         [--ball-truth truth.csv] [--only main|quickwins|chapters|natural|ball]
+
+--ball-truth: CSV frame,camera,x,y (synced frame, left/right, 0..1 in that
+camera's picture) of the ball in the --left/--right videos, e.g. written from
+the generator of the synthetic footage.
 
 The helper needs ffmpeg/ffprobe next to it or on PATH and, for a
 dynamically linked ONNX Runtime, LD_LIBRARY_PATH / ORT_DYLIB_PATH set.
@@ -22,6 +30,8 @@ dynamically linked ONNX Runtime, LD_LIBRARY_PATH / ORT_DYLIB_PATH set.
 
 import argparse
 import base64
+import csv
+import math
 import http.client
 import json
 import os
@@ -153,10 +163,15 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--web-dir")
-    ap.add_argument("--only", choices=["main", "quickwins", "chapters", "natural"],
+    ap.add_argument("--ball-truth",
+                    help="where the ball really is in the --left/--right videos: CSV "
+                         "frame,camera,x,y (synced frame, left/right, 0..1 in that camera's "
+                         "picture); the ball checks then compare the camera with it")
+    ap.add_argument("--only", choices=["main", "quickwins", "chapters", "natural", "ball"],
                     help="run only these checks (main: processing, exports, recovery, lenses; "
                          "quickwins: ball style, AI accuracy, pitch outline, fast re-runs; "
-                         "chapters: videos in several files; natural: the widest view)")
+                         "chapters: videos in several files; natural: the widest view; "
+                         "ball: Follow the ball's tracking brain and the AI report)")
     args = ap.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.work)
@@ -173,6 +188,8 @@ def main():
             chapters(args)
         if args.only in (None, "natural"):
             natural_look(args)
+        if args.only in (None, "ball"):
+            ball_brain(args)
     finally:
         helper.stop()
     log("ALL CHECKS PASSED")
@@ -460,25 +477,26 @@ def ai_pass_seconds(text):
 def quickwins(args):
     """Ball tracking quick wins: the "Follow the ball" style, the AI
     accuracy option, the pitch outline and fast re-runs."""
-    # 1. "Follow the ball": Reco's ball tracking mode.
+    # 1. "Follow the ball": VeoClone's tracking brain, made from what the AI
+    # saw; the AI pass itself runs Reco's broadcast camera.
     pid = new_match(args, "Follow the ball", "ball")
     p, secs, _ = process(pid)
     n = p["frameCount"]
     ball = ai_path(pid, n)
     text = job_log(args, pid)
-    check("Reco Ball tracking" in text and "Tracking mode: ball-only" in text,
-          "the AI ran in Reco's ball mode")
+    check("then VeoClone's ball tracking from what the AI saw" in text
+          and "Follow the ball: AI path for" in text and "Tracking mode: ball-only" not in text,
+          "the AI pass ran Reco's broadcast camera, then VeoClone's ball tracking")
     yaws = [y for y, _, _ in ball]
-    fovs = {round(f, 3) for _, _, f in ball}
-    log(f"ball style: yaw {min(yaws):.3f}..{max(yaws):.3f}, fov {sorted(fovs)[:5]}, "
-        f"AI pass {secs:.0f} s")
-    # The synthetic ball crosses the pitch and back; with no player cluster
-    # Reco's ball mode keeps its starting zoom (FieldPanner fov_default: 40
-    # in the broadcast preset, 34 with the Natural widest view new matches
-    # have).
+    fovs = [f for _, _, f in ball]
+    log(f"ball style: yaw {min(yaws):.3f}..{max(yaws):.3f}, fov {min(fovs):.1f}..{max(fovs):.1f}, "
+        f"AI pass {secs:.0f} s; ball numbers {p['aiRun'].get('ball')}")
+    # The synthetic ball crosses the pitch and back; the zoom fits the
+    # players near the ball, within the Natural widest view.
     check(max(yaws) - min(yaws) > 0.5, f"the camera follows the ball across the pitch "
           f"({max(yaws) - min(yaws):.2f} rad)")
-    check(fovs == {34.0}, "ball mode keeps a fixed zoom (Natural: 34 deg)")
+    check(max(fovs) <= 34.0 + 1e-3, "never wider than the Natural widest view (34 deg)")
+    check(p["aiRun"]["ball"]["followed"] > 0.9, "the ball numbers are kept with the AI run")
     request("PATCH", f"/api/projects/{pid}", {"style": "broadcast"})
     p, secs, _ = process(pid)
     broadcast = ai_path(pid, n)
@@ -578,8 +596,8 @@ def fast_checks(args, pid, n, ball_live):
     check(len(frames) == n and p["aiSeen"] == {"every": 1}, "every frame recorded")
     ball_full = ai_path(pid, n)
     d = max_diff(ball_full, ball_live)
-    log(f"ball style, AI pass with recording vs Reco's plain ball mode setup: {d}")
-    check(max(d) == 0.0, "recording does not change the ball-mode path")
+    log(f"ball style, a second AI pass of every frame vs the first: {d}")
+    check(max(d) == 0.0, "the same AI pass gives the same Follow the ball path")
 
     # Style changes run again in seconds, and match a full AI pass.
     results = {}
@@ -655,6 +673,112 @@ def fast_checks(args, pid, n, ball_live):
     log(f"TIMINGS full AI pass (every frame): {full_secs:.1f} s ball, {broadcast_secs:.1f} s "
         f"broadcast, every 3rd frame {faster_full_secs:.1f} s; quick re-runs: "
         f"{min(quick):.1f}-{max(quick):.1f} s")
+
+
+def ball_brain(args):
+    """Follow the ball (DESIGN.md 4.13): VeoClone's tracking brain on the
+    synthetic footage against where the ball really was, quick re-runs from
+    the recording, the ball numbers, and the AI report (download, contents,
+    and the dev script making exactly the same path from it)."""
+    import re
+    import zipfile
+    work = os.path.join(args.work, "ball")
+    os.makedirs(work, exist_ok=True)
+    pid = new_match(args, "Saturday night final", "ball")
+    p, full_secs, text = run_timed(args, pid, quick=False)
+    n = p["frameCount"]
+    path = ai_path(pid, n)
+    stats = p["aiRun"]["ball"]
+    log(f"ball numbers: {stats}")
+    check(set(stats) == {"frames", "detected", "seen", "followed", "sightings", "rejectedStatic",
+                         "rejectedOther"} and stats["frames"] == n, "the AI run has the ball numbers")
+    check(re.search(r"Ball: the AI found something like a ball in \d+% of the frames", text),
+          "the job log says how often the AI saw the ball")
+
+    # Quick re-runs: another style and back, in seconds, the same path.
+    request("PATCH", f"/api/projects/{pid}", {"style": "broadcast"})
+    p, broadcast_secs, _ = run_timed(args, pid, quick=True)
+    check(p["aiRun"]["ball"] == stats, "the ball numbers do not depend on the style")
+    broadcast = ai_path(pid, n)
+    request("PATCH", f"/api/projects/{pid}", {"style": "ball"})
+    p, quick_secs, _ = run_timed(args, pid, quick=True)
+    check(max(max_diff(ai_path(pid, n), path)) == 0.0, "quick Follow the ball = after the AI pass")
+    check(quick_secs < 10, f"re-run from the recording in seconds ({quick_secs:.1f} s, AI pass "
+          f"{full_secs:.1f} s)")
+
+    # The AI report: one zip, nothing personal, and the dev script makes
+    # exactly the same path from it.
+    status, hdrs, data = request("GET", f"/api/projects/{pid}/ai-report", raw=True)
+    hdrs = {k.lower(): v for k, v in hdrs.items()}
+    check(status == 200 and hdrs["content-type"] == "application/zip"
+          and re.match(r'attachment; filename="veoclone-ai-report-\d{4}-\d\d-\d\d\.zip"',
+                       hdrs["content-disposition"]), "the AI report downloads as a zip")
+    report = os.path.join(work, "report.zip")
+    with open(report, "wb") as f:
+        f.write(data)
+    with zipfile.ZipFile(report) as z:
+        names = sorted(z.namelist())
+        check(z.testzip() is None, "the zip is not damaged")
+        settings = json.loads(z.read("veoclone-ai-report/settings.json"))
+        everything = b"".join(z.read(name) for name in names)
+    check(names == sorted(f"veoclone-ai-report/{x}" for x in [
+        "README.txt", "ai_path.bin", "ai_seen.bin.gz", "ai_seen.json", "calib.json", "match.json",
+        "settings.json"]), f"the report has what the AI saw, the calibration, the settings and "
+                           f"the path: {names}")
+    names_used = [b"Saturday night final", os.path.basename(args.left).encode(),
+                  os.path.basename(args.right).encode()]
+    check(not any(x in everything for x in names_used),
+          "no match name and no file names in the report")
+    check(settings["style"] == "ball" and settings["aiRun"]["ball"] == stats,
+          "the report has the settings and the ball numbers")
+    log(f"AI report: {len(data)} bytes for {n} frames ({len(data) / n:.0f} B/frame)")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_report.py")
+    csv_path = os.path.join(work, "path.csv")
+    cmd = [sys.executable, script, report, "--helper", args.helper, "--csv", csv_path, "--json"]
+    if args.ball_truth:
+        cmd += ["--truth", args.ball_truth]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    check(res.returncode == 0, f"the dev script runs: {res.stderr.strip()}")
+    out = json.loads(res.stdout)["run"]
+    check(out["sameAsReport"]["comparable"] and out["sameAsReport"]["maxDifference"] == [0, 0, 0],
+          f"the dev script makes exactly the report's path ({out['seconds']:.2f} s)")
+    same = lambda a, b: set(a) == set(b) and all(math.isclose(a[k], b[k], rel_tol=1e-6) for k in a)
+    check(same(out["ball"], stats) and same(out["reportBall"], stats), "and the same ball numbers")
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    as_f32 = lambda text: struct.unpack("<f", struct.pack("<f", float(text)))[0]
+    check(len(rows) == n and all(as_f32(r["yaw"]) == path[i][0] and as_f32(r["fov"]) == path[i][2]
+                                 for i, r in enumerate(rows)),
+          "the CSV has the path, one row per frame")
+
+    # Against where the ball really was.
+    if not args.ball_truth:
+        log("SKIPPED the comparison with the ball's true path: no --ball-truth")
+    else:
+        for name, s in out["truth"].items():
+            e = s["yawErrorDeg"]
+            log(f"TRUTH {name}: ball in the picture {s['ballInPicture'] * 100:.1f}% of {s['frames']} "
+                f"frames; yaw error mean {e['mean']:.1f}, median {e['median']:.1f}, 95% "
+                f"{e['p95']:.1f}, max {e['max']:.1f} deg")
+        brain, reco = out["truth"]["Ball"], out["truth"]["RecoBallMode"]
+        check(brain["ballInPicture"] >= 0.97, "Follow the ball keeps the ball in the picture")
+        check(brain["ballInPicture"] >= reco["ballInPicture"]
+              and brain["yawErrorDeg"]["median"] < reco["yawErrorDeg"]["median"],
+              "better than Reco's ball mode on the same recording")
+        # The camera's own yaw against the true ball, frame by frame (the
+        # CSV's truth columns): close, apart from where the picture runs out
+        # at the far ends.
+        err = sorted(abs(float(r["yaw"]) - float(r["truth_yaw"])) for r in rows if r["truth_yaw"])
+        log(f"camera yaw vs the true ball: median {math.degrees(err[len(err) // 2]):.1f} deg")
+        check(math.degrees(err[len(err) // 2]) < 3.0, "the camera aims at the ball")
+        b = out["truth"]["RecoBroadcast"]
+        log(f"for comparison, Broadcast keeps the ball in the picture {b['ballInPicture'] * 100:.0f}%"
+            f" of the time ({out['truth']['RecoBroadcastWithBrainBall']['ballInPicture'] * 100:.0f}%"
+            f" with the brain's ball track)")
+    check(max(max_diff(broadcast, path)) > 0.05, "Follow the ball is not Broadcast")
+    log(f"TIMINGS Follow the ball: AI pass {full_secs:.1f} s, quick re-runs {broadcast_secs:.1f} s "
+        f"(broadcast) / {quick_secs:.1f} s (ball), dev script {out['seconds']:.2f} s")
+    request("DELETE", f"/api/projects/{pid}")
 
 
 def framemd5(video):
@@ -854,7 +978,13 @@ def natural_look(args):
     check(max_natural <= max_wide <= cap["wide"] + 1e-3, f"Wide: at most 44 deg ({max_wide:.2f})")
     request("PATCH", f"/api/projects/{pid}", {"widestView": "natural", "style": "ball"})
     p, _, _ = run_timed(args, pid, quick=True)
-    check({round(f, 3) for _, _, f in ai_path(pid, n)} == {34.0}, "Follow the ball: fixed at 34 deg")
+    ball_fov = max(f for _, _, f in ai_path(pid, n))
+    check(ball_fov <= cap["natural"] + 1e-3, f"Follow the ball: at most 34 deg ({ball_fov:.2f})")
+    request("PATCH", f"/api/projects/{pid}", {"widestView": "wide"})
+    p, _, _ = run_timed(args, pid, quick=True)
+    ball_wide = max(f for _, _, f in ai_path(pid, n))
+    check(ball_wide <= cap["wide"] + 1e-3, f"Follow the ball, Wide: at most 44 deg ({ball_wide:.2f})")
+    request("PATCH", f"/api/projects/{pid}", {"widestView": "natural"})
     request("PATCH", f"/api/projects/{pid}", {"style": "broadcast"})
     p, _, _ = run_timed(args, pid, quick=True)
     check(max(max_diff(ai_path(pid, n), natural_full)) == 0.0, "back to broadcast: the same path")

@@ -25,10 +25,15 @@ a video is still arriving, and it supports `POST /api/projects/:id/swap` and
 get the Natural widest view, while the example match has none (made before
 the setting, so the editor offers its tip); a re-run that can reuse what
 the AI saw is quick, and `ai-path.bin` is the fixture path limited to the
-widest view the AI ran with (docs/veoclone/DESIGN.md 4.12).
+widest view the AI ran with (docs/veoclone/DESIGN.md 4.12). New matches are
+"Follow the ball"; a processed match gets the same pretend ball numbers
+(`aiRun.ball`: seen 23 %, followed 61 %, 2,202 sightings ignored), the
+example match none (an older VeoClone), and `GET /api/projects/:id/ai-report`
+sends a small zip with its settings (404 without `aiSeen`; `PATCH` with
+`{"mockNoSeen": true}` removes it), like the real helper (DESIGN.md 4.13).
 `GET /__mock/state` shows what the editor sent (edits, last export with a
 summary of the camera path incl. its widest frame, the "Straighten picture" angles and the text PNGs, "Show in folder" calls,
-swaps, AI path downloads); like the real helper it checks the text PNGs (size, times) and adds
+swaps, AI path downloads, AI reports); like the real helper it checks the text PNGs (size, times) and adds
 an "Adding text" step to exports with text. `POST /__mock/reset`
 (`?seed` for the example match) forgets everything.
 

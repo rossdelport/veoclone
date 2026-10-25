@@ -45,6 +45,8 @@ import { I } from "./icons";
 import { changeLens } from "./lens";
 import type { Page, PageContext } from "./page";
 import { STYLES, WIDEST, WIDEST_HELP, widestPicker } from "./newMatch";
+import { aiReportButton } from "./aiReport";
+import { AI_REPORT_HELP, ballWords } from "./ballWords";
 import { markPitchDialog } from "./pitchTool";
 import { editableTitle, returnToEditorAfterRun } from "./project";
 import { cutOut, cutParts, isKept, keep, nextKept, setEnd, setStart } from "./segments";
@@ -138,7 +140,6 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   let ovDirty = true;
   let lastOverview = 0;
   let videoReady = false;
-  let hintDone = false; // the user has moved the camera once
   let textShown = ""; // what the text canvas shows
   let peek: LookSide | null = null; // "Look left / centre / right": preview only
 
@@ -154,12 +155,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   });
   const badge = h("div", { class: "view-badge" });
   const viewerMsg = h("div", { class: "viewer-msg" }, h("div", { class: "spinner", "aria-hidden": "true" }), h("p", null, "Loading the preview…"));
-  const hint = h("div", { class: "viewer-hint" }, "Drag or scroll to fix the camera here · Whole video: Camera › Zoom");
   // Text boxes, drawn by the same function as the export (DESIGN.md 5.4).
   const textCanvas = h("canvas", { class: "text-canvas", "aria-hidden": "true", "data-testid": "text-canvas" });
   // Thin level lines over the picture while a Straighten slider moves.
   const guides = h("div", { class: "level-guides", "aria-hidden": "true", "data-testid": "level-guides" }, [1, 2, 3, 4].map(() => h("span", null)));
-  const viewerBox = h("div", { class: "viewer-box", "data-testid": "camera-view" }, camCanvas, textCanvas, guides, badge, hint, viewerMsg);
+  const viewerBox = h("div", { class: "viewer-box", "data-testid": "camera-view" }, camCanvas, textCanvas, guides, badge, viewerMsg);
   const video = h("video", { class: "proxy-video", preload: "auto", playsInline: true, crossOrigin: "anonymous", "aria-hidden": "true" });
 
   // The whole pitch: a small map in the corner of the picture. Bigger on
@@ -327,9 +327,11 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const straightenHint = h("div", { class: "tip-host" });
   const pitchHint = h("div", { class: "tip-host" });
   const naturalHint = h("div", { class: "tip-host" });
+  const ballHint = h("div", { class: "tip-host" });
   const notes = h("div", { class: "tip-host editor-notes" });
   const widestHost = h("div", { class: "widest-host" });
   const widestNote = h("div", { class: "widest-note", "aria-live": "polite", "data-testid": "widest-note" });
+  const ballHost = h("div", { class: "ball-words", "data-testid": "ball-words" });
   const pitchRow = h("div", { class: "pitch-row-side", "data-testid": "pitch-status" });
   const fixList = h("div", { class: "fix-list" });
   const keptInfo = h("div", { class: "kept-info" });
@@ -355,7 +357,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   const group = (title: string | null, ...body: Child[]) => h("div", { class: "tool-group" }, title ? h("h3", { class: "group-title" }, title) : null, body);
 
   // Tips: anything VeoClone noticed, one-time tips, the keyboard shortcuts.
-  const tipHosts = [notes, naturalHint, pitchHint, straightenHint];
+  const tipHosts = [notes, ballHint, naturalHint, pitchHint, straightenHint];
   const tipsBadge = h("span", { class: "rail-badge", "aria-hidden": "true" });
   const tipsEmpty = h(
     "div",
@@ -389,16 +391,22 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
         group(null, cameraSliders),
         group(
           null,
-          h("div", { class: "widest", "data-testid": "widest-view" }, h("h3", { class: "group-title" }, "Widest view"), h("p", { class: "muted small" }, WIDEST_HELP), widestHost, widestNote),
-        ),
-        group(
-          null,
           h(
             "p",
             { class: "style-line" },
             `Camera style: ${STYLES.find((s) => s.id === project.style)?.name ?? project.style} · `,
             h("a", { href: `#/project/${id}` }, "Change (runs the AI again)"),
           ),
+          ballHost,
+          h("p", { class: "muted small" }, AI_REPORT_HELP),
+          aiReportButton(() => latest),
+        ),
+        group(
+          null,
+          h("div", { class: "widest", "data-testid": "widest-view" }, h("h3", { class: "group-title" }, "Widest view"), h("p", { class: "muted small" }, WIDEST_HELP), widestHost, widestNote),
+        ),
+        group(
+          null,
           h(
             "p",
             { class: "small muted" },
@@ -784,8 +792,6 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     const w = Math.round(textCanvas.clientWidth * dpr);
     const hh = Math.round(textCanvas.clientHeight * dpr);
     const shown = store.edits.overlays.filter((o) => o.text.trim() && shownFrame >= o.start && shownFrame < o.end);
-    // The hint would sit on top of text at the bottom.
-    hint.classList.toggle("hidden", hintDone || shown.length > 0);
     const key = JSON.stringify([w, hh, shown]);
     if (key === textShown) return;
     textShown = key;
@@ -916,7 +922,6 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     livePose = null;
     selected = f;
     picked = "fix";
-    hintDone = true;
     renderSide();
     requestDraw();
   }
@@ -1446,6 +1451,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       exportPanel.update(p);
       updateExportButton(p);
       renderNotes(p);
+      renderBall(p);
       syncWidest(p);
       if (pitchChanged) {
         renderPitch();
@@ -1485,6 +1491,19 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     setChildren(notes, box);
   }
   renderNotes(project);
+
+  // How often the AI saw the ball (DESIGN.md 4.13).
+  function renderBall(p: ProjectMeta) {
+    const words = ballWords(p.aiRun);
+    const key = JSON.stringify(words);
+    if (ballHost.dataset.key === key) return;
+    ballHost.dataset.key = key;
+    setChildren(
+      ballHost,
+      words.length ? words.map((w) => h("p", { class: "small" }, w)) : h("p", { class: "muted small" }, "Run the AI again to see how often it saw the ball."),
+    );
+  }
+  renderBall(project);
 
   // ---------------------------------------------------------------------
   // Mark the pitch (DESIGN.md 4.8)
@@ -1600,6 +1619,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   let aiMadeWith = JSON.stringify(project.aiRun ?? null); // what store.aiPath was made with
   let loadingAi = false;
   let widestRun: WidestView | null = null; // our own re-run is making this
+  let ballRun = false; // our own re-run for the new Follow the ball is running
   let widestShown: WidestView | null = null;
   let widestSending = false; // saving the choice / starting the run
   const processing = (p: ProjectMeta) => p.status === "queued" || p.status === "processing" || p.job?.kind === "process";
@@ -1616,6 +1636,7 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
     for (const input of widestHost.querySelectorAll("input")) input.disabled = widestBusy();
     renderWidestNote();
     renderNaturalHint();
+    renderBallHint();
   }
 
   function renderWidestNote() {
@@ -1723,17 +1744,19 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
   async function refreshAiPath(p: ProjectMeta) {
     if (processing(p) || loadingAi) return;
     if (p.status !== "ready") {
-      if (widestRun) {
+      if (widestRun || ballRun) {
         widestRun = null;
+        ballRun = false;
         toast("The AI could not run again. Open the match page to see why.", "error", 8000);
       }
       return;
     }
     const key = JSON.stringify(p.aiRun ?? null);
     if (key === aiMadeWith) {
-      if (widestRun) {
+      if (widestRun || ballRun) {
         // The run ended without a new AI path (it failed or was stopped; the note at the top says why).
         widestRun = null;
+        ballRun = false;
         toast("The AI camera could not be updated. Press Run the AI again to try once more.", "error", 6000);
         renderWidest();
       }
@@ -1752,11 +1775,82 @@ function build(ctx: PageContext, id: string, project: ProjectMeta, calib: CalibI
       aiMadeWith = key;
       store.setAiPath(next);
       if (widestRun) toast(`Done: the AI camera now uses “${widestName(widestRun)}”.`, "success", 3000);
+      else if (ballRun) toast("Done: the camera now follows the ball the new way.", "success", 3000);
       widestRun = null;
+      ballRun = false;
     } catch {
       // The next poll tries again.
     } finally {
       loadingAi = false;
+      if (!disposedFlag) renderWidest();
+    }
+  }
+
+  // Follow the ball made by an older VeoClone (Reco's ball mode: no ball
+  // numbers): offer the new tracking brain (DESIGN.md 4.13), in seconds from
+  // what the AI saw.
+  const oldBallCamera = (p: ProjectMeta) => p.style === "ball" && p.aiRun?.style === "ball" && !p.aiRun.ball;
+  const ballHintKey = `veoclone.hint.ballbrain.${id}`;
+  const ballHintDismissed = () => {
+    try {
+      return localStorage.getItem(ballHintKey) === "dismissed";
+    } catch {
+      return false;
+    }
+  };
+  function renderBallHint() {
+    if (!oldBallCamera(latest) || ballRun || ballHintDismissed()) return setChildren(ballHint);
+    if (ballHint.firstChild) return;
+    const box = notice(
+      "info",
+      "New: Follow the ball is smarter.",
+      h(
+        "p",
+        { class: "small" },
+        "It ignores things on the grass that look like a ball but never move, keeps the players around the ball in the picture instead of looking down at the grass, and follows the players while the ball can't be seen. ",
+        rerunTime(latest),
+      ),
+      button("Update the camera", () => void updateBallCamera(), { variant: "secondary", class: "btn-small", icon: I.sparkle }),
+    );
+    box.dataset.testid = "ball-hint";
+    box.append(
+      iconButton(I.x, "Hide this tip", () => {
+        try {
+          localStorage.setItem(ballHintKey, "dismissed");
+        } catch {
+          // Private mode: hidden until the editor opens again.
+        }
+        setChildren(ballHint);
+      }, "btn-ghost btn-small"),
+    );
+    setChildren(ballHint, box);
+  }
+
+  /** Run the AI again for the new Follow the ball: in seconds here, or the long way on the match page. */
+  async function updateBallCamera() {
+    pause();
+    if (widestBusy()) return;
+    if (!quickRerun(latest)) {
+      const run = await confirmDialog({
+        title: "Run the AI again?",
+        text: [h("p", null, "To use the new Follow the ball, the AI needs to run again."), h("p", { class: "small" }, rerunTime(latest), " Your trims, camera fixes and text are kept.")],
+        confirm: "Run the AI again",
+        dismiss: "Later",
+      });
+      if (run && !disposedFlag) await rerunAi();
+      return;
+    }
+    showTool("camera"); // the progress shows there, under Widest view
+    widestSending = true;
+    renderWidest();
+    try {
+      latest = await api.process(id);
+      ballRun = true;
+      watch.refresh();
+    } catch (e) {
+      toast(describeError(e).message, "error", 6000);
+    } finally {
+      widestSending = false;
       if (!disposedFlag) renderWidest();
     }
   }

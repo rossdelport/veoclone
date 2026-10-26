@@ -9,11 +9,11 @@ sleeve_wall = 8;    // sleeve wall thickness
 height      = 30;   // collar height = ear height
 
 legs        = 3;    // number of ears
-leg_width   = 20;   // gap between the two tabs (the leg end fits here)  <-- MEASURE
+leg_width   = 13.5; // gap between the two tabs: 13 mm leg end + 0.5 mm clearance
 tab         = 6;    // thickness of each tab
 ear_reach   = 28;   // how far the ears stick out past the sleeve
 bolt        = 6.5;  // bolt hole (6.5 suits an M6 bolt)                  <-- MEASURE
-bolt_from_tip = 9;  // bolt hole centre, measured in from the ear's tip
+bolt_from_tip = height / 2; // bolt hole centre: middle of the rounded ear end
 
 clamp_bolt  = 6.5;  // clamp screw hole (M6)
 clamp_nut   = 11.5; // hex nut pocket across flats (M6 nut is 10 mm + clearance)

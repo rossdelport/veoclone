@@ -9,7 +9,7 @@ sleeve_wall = 8;    // sleeve wall thickness
 height      = 30;   // collar height = ear height
 
 legs        = 3;    // number of ears
-leg_width   = 13.5; // gap between the two tabs: 13 mm leg end + 0.5 mm clearance
+leg_width   = 15;   // gap between the two tabs: 13 mm leg end + 2 mm clearance
 tab         = 6;    // thickness of each tab
 ear_reach   = 28;   // how far the ears stick out past the sleeve
 bolt        = 6.5;  // bolt hole (6.5 suits an M6 bolt)                  <-- MEASURE
@@ -18,6 +18,9 @@ bolt_from_tip = height / 2; // bolt hole centre: middle of the rounded ear end
 clamp_bolt  = 6.5;  // clamp screw hole (M6)
 clamp_nut   = 11.5; // hex nut pocket across flats (M6 nut is 10 mm + clearance)
 clamp_nut_depth = 6;
+
+brim        = 8;    // built-in brim: flat skirt around the base to hold it down
+brim_height = 0.4;  // two layers; cut or peel it off after printing (0 = none)
 
 $fn = 120;
 r_out = pole_hole / 2 + sleeve_wall;
@@ -38,6 +41,7 @@ module ear() {
   }
 }
 
+module collar() {
 difference() {
   union() {
     cylinder(h = height, r = r_out);
@@ -54,3 +58,13 @@ difference() {
       cylinder(h = 20, d = clamp_nut / cos(30), $fn = 6);
   }
 }
+}
+
+collar();
+// Built-in brim: the collar's footprint, grown outwards, two layers thick.
+if (brim > 0)
+  linear_extrude(height = brim_height)
+    difference() {
+      offset(r = brim) projection(cut = true) translate([0, 0, -0.1]) collar();
+      circle(d = pole_hole - 2);
+    }

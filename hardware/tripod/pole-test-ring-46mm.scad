@@ -1,9 +1,9 @@
 // Test rings to find the right hole size for the 45 mm pole.
-// Three rings: 1 notch = 45.5 mm, 2 notches = 46.0 mm, 3 notches = 46.5 mm.
-// Print in PLA, 0.2 mm layers, no supports. Slide each onto the pole and
-// pick the one that slides on easily without wobbling.
+// One 46 mm ring (one notch on the outside edge).
+// Print in PLA, 0.2 mm layers, no supports. Slide it onto the pole:
+// it should slide on easily without wobbling.
 
-holes  = [45.5, 46.0, 46.5]; // inner diameters, mm
+holes  = [46.0];             // inner diameter, mm
 wall   = 4;                  // ring wall thickness, mm
 height = 5;                  // ring height, mm
 gap    = 8;                  // space between rings, mm

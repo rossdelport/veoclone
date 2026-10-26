@@ -4,7 +4,7 @@
 // All sizes in mm. Print standing up (sleeve axis vertical), PETG,
 // 4 walls, 40% gyroid infill, glue stick on the bed.
 
-pole_hole   = 50;   // sleeve inner diameter (from the test ring)
+pole_hole   = 48;   // sleeve inner diameter (48 mm test ring fitted perfectly)
 sleeve_wall = 8;    // sleeve wall thickness
 height      = 30;   // collar height = ear height
 
